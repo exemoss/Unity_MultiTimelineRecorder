@@ -98,22 +98,103 @@ namespace Unity.MultiTimelineRecorder
 
             var settings = ScriptableObject.CreateInstance<ImageRecorderSettings>();
             settings.name    = "ImageRecorderSettings";
-            settings.Enabled = true;
-            settings.RecordMode = UnityEditor.Recorder.RecordMode.Manual;
+            ApplyImageSettings(
+                settings,
+                item,
+                effectiveWidth,
+                effectiveHeight,
+                effectiveFrameRate,
+                resolvedCamera,
+                resolvedRenderTexture,
+                outputFile,
+                fallbackToGameViewOnMissingRef);
+            return settings;
+        }
+
+        /// <summary>
+        /// Applies recorder configuration fields from <paramref name="item"/> to an
+        /// <em>existing</em> <see cref="ImageRecorderSettings"/> instance (<paramref name="target"/>)
+        /// in-place, without creating a new ScriptableObject.
+        ///
+        /// This is the mutation counterpart of <see cref="BuildImageSettings"/>.
+        /// Use it when the target settings object is already a persistent sub-asset of a
+        /// TimelineAsset (baked by the sample factory).  Mutating a persistent sub-asset
+        /// ensures the Recorder sees the settings during Play Mode — transient (non-persisted)
+        /// ScriptableObjects are not reliably serialized across the Play Mode boundary.
+        ///
+        /// The caller is responsible for:
+        ///  - Calling <see cref="UnityEditor.EditorUtility.SetDirty"/> on the target if it
+        ///    needs to be flushed to disk (not required for in-memory worker runs).
+        ///  - Restoring original values if the job must leave the timeline asset unchanged after
+        ///    recording (the distributed worker exits Play Mode and expects clean state).
+        ///
+        /// All field assignments mirror <see cref="BuildImageSettings"/> exactly.
+        /// </summary>
+        /// <param name="target">
+        /// Existing <see cref="ImageRecorderSettings"/> to mutate.  Must not be null.
+        /// </param>
+        /// <param name="item">
+        /// Recorder config item supplying format, source type, quality, etc.
+        /// Must have <c>recorderType == RecorderSettingsType.Image</c>.
+        /// </param>
+        /// <param name="effectiveWidth">Output width in pixels.</param>
+        /// <param name="effectiveHeight">Output height in pixels.</param>
+        /// <param name="effectiveFrameRate">Capture frame rate in fps.</param>
+        /// <param name="resolvedCamera">
+        /// Pre-resolved Camera for TargetCamera source, or null.
+        /// </param>
+        /// <param name="resolvedRenderTexture">
+        /// Pre-resolved RenderTexture for RenderTexture source, or null.
+        /// </param>
+        /// <param name="outputFile">
+        /// Full output file path template (may contain Recorder wildcards).
+        /// </param>
+        /// <param name="fallbackToGameViewOnMissingRef">
+        /// When <c>true</c> (default), missing Camera / RenderTexture falls back to GameView.
+        /// When <c>false</c>, throws <see cref="InvalidOperationException"/>.
+        /// </param>
+        /// <exception cref="ArgumentNullException">Thrown when target or item is null.</exception>
+        /// <exception cref="NotSupportedException">
+        /// Thrown when item.recorderType is not Image.
+        /// </exception>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when a required Camera / RenderTexture is null and fallback is disabled.
+        /// </exception>
+        public static void ApplyImageSettings(
+            ImageRecorderSettings target,
+            MultiRecorderConfig.RecorderConfigItem item,
+            int    effectiveWidth,
+            int    effectiveHeight,
+            double effectiveFrameRate,
+            Camera resolvedCamera,
+            RenderTexture resolvedRenderTexture,
+            string outputFile,
+            bool   fallbackToGameViewOnMissingRef = true)
+        {
+            if (target == null)
+                throw new ArgumentNullException(nameof(target));
+            if (item == null)
+                throw new ArgumentNullException(nameof(item));
+            if (item.recorderType != RecorderSettingsType.Image)
+                throw new NotSupportedException(
+                    $"RecorderSettingsBuilderShared.ApplyImageSettings only supports RecorderSettingsType.Image. Got: {item.recorderType}");
+
+            target.Enabled    = true;
+            target.RecordMode = UnityEditor.Recorder.RecordMode.Manual;
 
             // --- Output format -------------------------------------------------------
-            settings.OutputFormat = item.imageFormat;
-            settings.CaptureAlpha = item.captureAlpha;
+            target.OutputFormat = item.imageFormat;
+            target.CaptureAlpha = item.captureAlpha;
 
             if (item.imageFormat == ImageRecorderSettings.ImageRecorderOutputFormat.JPEG)
-                settings.JpegQuality = item.jpegQuality;
+                target.JpegQuality = item.jpegQuality;
             else if (item.imageFormat == ImageRecorderSettings.ImageRecorderOutputFormat.EXR)
-                settings.EXRCompression = item.exrCompression;
+                target.EXRCompression = item.exrCompression;
 
             // --- Frame rate ----------------------------------------------------------
-            settings.FrameRate             = (float)Math.Max(1.0, effectiveFrameRate);
-            settings.FrameRatePlayback     = FrameRatePlayback.Constant;
-            settings.CapFrameRate          = true;
+            target.FrameRate         = (float)Math.Max(1.0, effectiveFrameRate);
+            target.FrameRatePlayback = FrameRatePlayback.Constant;
+            target.CapFrameRate      = true;
 
             // --- Input source --------------------------------------------------------
             int w = Math.Max(1, effectiveWidth);
@@ -122,13 +203,13 @@ namespace Unity.MultiTimelineRecorder
             switch (item.imageSourceType)
             {
                 case ImageRecorderSourceType.GameView:
-                    settings.imageInputSettings = new GameViewInputSettings
+                    target.imageInputSettings = new GameViewInputSettings
                     {
                         OutputWidth  = w,
                         OutputHeight = h
                     };
                     // GameView does not support transparency.
-                    settings.CaptureAlpha = false;
+                    target.CaptureAlpha = false;
                     break;
 
                 case ImageRecorderSourceType.TargetCamera:
@@ -136,10 +217,10 @@ namespace Unity.MultiTimelineRecorder
                     {
                         var camInput = new CameraInputSettings
                         {
-                            OutputWidth    = w,
-                            OutputHeight   = h,
+                            OutputWidth     = w,
+                            OutputHeight    = h,
                             FlipFinalOutput = false,
-                            CaptureUI      = false
+                            CaptureUI       = false
                         };
                         // Use Reflection to set the Camera property, mirroring MTR's own approach
                         // (CameraInputSettings.Camera is not a public settable property in Recorder 5.1.2).
@@ -152,7 +233,7 @@ namespace Unity.MultiTimelineRecorder
                                 "[RecorderSettingsBuilderShared] CameraInputSettings.Camera property not found. " +
                                 "The camera may not be set correctly.");
 
-                        settings.imageInputSettings = camInput;
+                        target.imageInputSettings = camInput;
                     }
                     else
                     {
@@ -163,19 +244,19 @@ namespace Unity.MultiTimelineRecorder
 
                         Debug.LogWarning(
                             "[RecorderSettingsBuilderShared] TargetCamera is null – falling back to GameView.");
-                        settings.imageInputSettings = new GameViewInputSettings
+                        target.imageInputSettings = new GameViewInputSettings
                         {
                             OutputWidth  = w,
                             OutputHeight = h
                         };
-                        settings.CaptureAlpha = false;
+                        target.CaptureAlpha = false;
                     }
                     break;
 
                 case ImageRecorderSourceType.RenderTexture:
                     if (resolvedRenderTexture != null)
                     {
-                        settings.imageInputSettings = new RenderTextureInputSettings
+                        target.imageInputSettings = new RenderTextureInputSettings
                         {
                             RenderTexture   = resolvedRenderTexture,
                             FlipFinalOutput = false
@@ -190,30 +271,28 @@ namespace Unity.MultiTimelineRecorder
 
                         Debug.LogWarning(
                             "[RecorderSettingsBuilderShared] RenderTexture is null – falling back to GameView.");
-                        settings.imageInputSettings = new GameViewInputSettings
+                        target.imageInputSettings = new GameViewInputSettings
                         {
                             OutputWidth  = w,
                             OutputHeight = h
                         };
-                        settings.CaptureAlpha = false;
+                        target.CaptureAlpha = false;
                     }
                     break;
 
                 default:
-                    settings.imageInputSettings = new GameViewInputSettings
+                    target.imageInputSettings = new GameViewInputSettings
                     {
                         OutputWidth  = w,
                         OutputHeight = h
                     };
-                    settings.CaptureAlpha = false;
+                    target.CaptureAlpha = false;
                     break;
             }
 
             // --- Output file path ---------------------------------------------------
             if (!string.IsNullOrEmpty(outputFile))
-                settings.OutputFile = outputFile.Replace('\\', '/');
-
-            return settings;
+                target.OutputFile = outputFile.Replace('\\', '/');
         }
 #endif // UNITY_RECORDER
     }
