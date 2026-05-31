@@ -13,48 +13,44 @@ using UnityEditor.Recorder.Input;
 using UnityEditor.Recorder.Timeline;
 #endif
 
-// NOTE: MtrRecorderClipBuilder lives in the same assembly (DistributedRecorder.Editor)
-// and handles the UNITY_RECORDER guard internally, so no conditional using is needed here.
-
 namespace DistributedRecorder.Worker
 {
     /// <summary>
-    /// Executes a <see cref="JobRequest"/> on the Worker using Timeline-driven recording (v2).
+    /// Executes a <see cref="JobRequest"/> on the Worker using Timeline-driven recording (v3,
+    /// worker-recorder-redesign §A/§B).
     ///
-    /// v2 design: recording lifecycle is fully delegated to the Timeline / RecorderClip.
-    /// RecorderController is not used. The sequence is:
+    /// v3 design — single-source, fresh-build recording path:
     ///   1. Preflight (Edit Mode):
     ///      a) Open scene via EditorSceneManager.OpenScene.
-    ///      b) Find PlayableDirector in the loaded scene [A3].
-    ///      c) Verify Timeline contains RecorderTrack / RecorderClip / clip.settings [A4].
-    ///      d) Override RecorderClip.settings.OutputFile to Recordings/{jobId}/frame_&lt;Frame&gt;
-    ///         (in-memory only, asset is NOT saved — avoids polluting the sample asset).
-    ///      e) Estimate totalFrames from Timeline duration × frameRate.
+    ///      b) Find PlayableDirector in the scene [A3].
+    ///      c) Validate recorderConfigJson is present [A4].
+    ///      d) Build fresh <see cref="ImageRecorderSettings"/> via
+    ///         <see cref="FidelityBuilderRegistry.OnBuildImageSettings"/>
+    ///         (delegates to <c>DistributedWorkerBridge → RecorderSettingsBuilderShared</c>).
+    ///      e) Create a persistent temp <see cref="TimelineAsset"/> under
+    ///         <c>Assets/_DistRecorder_Temp/</c> with the settings embedded as a sub-asset
+    ///         via <see cref="WorkerRenderTimelineFactory.Create"/>.
+    ///         This makes the settings survive the Play Mode domain boundary.
+    ///      f) Bind the temp timeline to the director.
+    ///      g) Estimate totalFrames from Timeline duration × frameRate.
     ///   2. EditorApplication.EnterPlaymode().
     ///   3. After Play Mode entry (EnteredPlayMode state change):
-    ///      - Re-acquire PlayableDirector from scene (no static UnityObject cross-mode ref).
-    ///      - Subscribe to director.stopped event.
-    ///      - Call director.Play() (playOnAwake may already start it; Play() is idempotent).
-    ///      - RecorderClip.CreatePlayable → OnBehaviourPlay starts recording automatically.
-    ///   4. Poll via EditorApplication.update:
-    ///      - Update progress from director.time / director.duration.
-    ///      - Complete when director.stopped fires or state != Playing (fallback).
+    ///      - Re-acquire PlayableDirector from scene.
+    ///      - Subscribe to director.stopped.
+    ///      - Call director.Play().
+    ///   4. Poll via EditorApplication.update (progress + completion detection).
     ///   5. ExitPlaymode() after director stops.
-    ///   6. After returning to Edit Mode: record JobStore.Completed.
+    ///   6. Edit Mode restored: delete temp timeline via
+    ///      <see cref="WorkerRenderTimelineFactory.Delete"/> (always, success or failure).
+    ///      Record JobStore.Completed.
     ///
-    /// Why this eliminates v1 bugs:
-    ///   - No RecorderControllerSettings held in a static field across Play Mode.
-    ///   - No manual PrepareRecording / StartRecording / StopRecording calls.
-    ///   - No IsRecording() polling; PlayableDirector.stopped is the completion event.
-    ///   - Domain Reload OFF kept for fast Play Mode entry (but no longer required for
-    ///     correctness — state lives in the scene, not in static UnityObject fields).
+    /// Why baked RecorderClip is no longer needed:
+    ///   - Settings are built entirely from <see cref="JobRequest.recorderConfigJson"/>
+    ///     (single source of truth shared with MTR local recording via RecorderSettingsBuilderShared).
+    ///   - The temp timeline is deleted after every job so the source Timeline is never mutated.
     ///
-    /// Object lifetime rule: all UnityEngine.Object references (PlayableDirector,
-    /// RecorderClip.settings) are fetched AFTER Play Mode is entered. Nothing is stored
-    /// in static fields across the Play Mode boundary.
-    ///
-    /// batchmode guard: EnterPlaymode is guarded in TryStartJob with an error that
-    /// mentions GameView initialisation. batchmode recording is [N5] Stretch only.
+    /// Object lifetime rule: UnityEngine.Object references are fetched AFTER Play Mode entry.
+    /// Nothing is stored in static fields across the Play Mode boundary.
     ///
     /// MUST be called from the Unity main thread.
     /// </summary>
@@ -96,6 +92,11 @@ namespace DistributedRecorder.Worker
         // Director name captured at preflight so Play Mode handler can re-find it.
         // When empty, the legacy "find any director" search is used.
         private string _preflightDirectorName;
+
+        // Project-relative path of the temp render timeline created by WorkerRenderTimelineFactory.
+        // Null when no temp timeline has been created for the current job.
+        // Deleted (unconditionally) in the WaitingForEditMode handler / FailJob path.
+        private string _tempTimelineAssetPath;
 
         // Play Mode timeout (configurable; HDRP shader compile can be slow)
         private const double PlayModeTimeoutSeconds  = 60.0;
@@ -272,164 +273,83 @@ namespace DistributedRecorder.Worker
                 return;
             }
 
-            // ----- Preflight A4: RecorderTrack / RecorderClip / settings? ---
-            var timelineAsset = preflightDirector.playableAsset as TimelineAsset;
+            // ----- Preflight A4: recorderConfigJson required (§E worker-recorder-redesign) -----
+            var sourceTimeline = preflightDirector.playableAsset as TimelineAsset;
 
-            RecorderClip preflightRecorderClip = null;
-
-            if (isMtrPath && request.recorderConfig != null)
+            if (isMtrPath && string.IsNullOrEmpty(request.recorderConfigJson))
             {
-                // MTR path: apply recorder settings to the Timeline's pre-baked persistent RecorderClip.
-                //
-                // Root cause of the "zero frames" bug (distributed fidelity path only):
-                //   The previous implementation created a NEW transient (non-persisted)
-                //   ImageRecorderSettings ScriptableObject and attached it to a NEW RecorderTrack.
-                //   Transient ScriptableObjects are NOT reliably serialized across the Play Mode
-                //   boundary even with Domain Reload OFF, so the Recorder never started.
-                //
-                // Fix (this block):
-                //   1. Find the pre-existing baked RecorderClip (persistent sub-asset produced by
-                //      MtrMultiTimelineSampleFactory.AddRecorderClip).
-                //   2. Mutate its persistent settings in-place via OnApplyImageSettings
-                //      (DistributedWorkerBridge.ApplyImageSettingsFromRequest →
-                //       RecorderSettingsBuilderShared.ApplyImageSettings).
-                //   3. Only override OutputFile to the per-job path.
-                //   This mirrors the legacy path (SampleOrbitScene) that is proven to record.
-                //
-                // Fallback:
-                //   When no pre-baked clip exists (e.g. custom scene without the factory clip),
-                //   fall back to the previous BuildAndApply DTO path with a warning.
-                //   The transient path may not record in that case, but we preserve the behaviour
-                //   rather than hard-failing.
+                FailJob(request.jobId,
+                    "[A4] recorderConfigJson が空です。" +
+                    "MTR ウィンドウで Image Recorder を設定してから分散実行してください。");
+                return;
+            }
 
-                // GetOutputDirectory creates and returns the ABSOLUTE per-job directory (this is
-                // also what the /files endpoint serves recursively). However, Unity Recorder's
-                // ImageRecorderSettings keeps its output Root = Project, so OutputFile must be a
-                // PROJECT-RELATIVE, forward-slash path. Passing an absolute path makes the Recorder
-                // prepend the project root to it, fail to resolve, and dump frames at the project
-                // root instead (the observed bug). So derive the project-relative form here.
-                // GetOutputDirectory already scopes by jobId (".../Recordings/{jobId}"), so do NOT
-                // append request.outputSubDir (which the Master also sets to the jobId) — that
-                // produced a redundant ".../Recordings/{jobId}/{jobId}" double nesting.
-                string absOutputDir = _store.GetOutputDirectory(request.jobId);
+            // ----- Compute per-job output file path ----------------------------------------
+            // GetOutputDirectory returns the ABSOLUTE per-job directory.
+            // ImageRecorderSettings.OutputFile must be PROJECT-RELATIVE (Root = Project).
+            string absOutputDir = _store.GetOutputDirectory(request.jobId);
+            string projRoot     = ProjectPaths.ProjectRoot.Replace('\\', '/').TrimEnd('/');
+            string baseOutputDir = absOutputDir.Replace('\\', '/');
+            if (baseOutputDir.StartsWith(projRoot + "/", StringComparison.OrdinalIgnoreCase))
+                baseOutputDir = baseOutputDir.Substring(projRoot.Length + 1); // -> "Recordings/{jobId}/..."
 
-                string projRoot = ProjectPaths.ProjectRoot.Replace('\\', '/').TrimEnd('/');
-                string baseOutputDir = absOutputDir.Replace('\\', '/');
-                if (baseOutputDir.StartsWith(projRoot + "/", StringComparison.OrdinalIgnoreCase))
-                    baseOutputDir = baseOutputDir.Substring(projRoot.Length + 1); // -> "Recordings/{jobId}/..."
-
-                // Compute the per-job output file path (same logic as before).
-                string outputFile;
-                if (!string.IsNullOrEmpty(request.resolvedOutputRelativePath))
-                {
-                    // resolvedOutputRelativePath may contain <Frame>/<Take> wildcards ('<','>'
-                    // are illegal path chars on Windows), so Path.Combine would throw
-                    // "Illegal characters in path". Join manually with '/'.
-                    outputFile = baseOutputDir.Replace('\\', '/').TrimEnd('/')
-                        + "/" + request.resolvedOutputRelativePath.Replace('\\', '/').TrimStart('/');
-                }
-                else
-                {
-                    // Fallback: use the legacy fileNameTemplate from recorderConfig.
-                    outputFile = MtrRecorderClipBuilder.ResolveOutputFilePath(
-                        baseOutputDir, request.recorderConfig);
-                }
-
-                // --- MTR-fidelity path: mutate the pre-baked persistent RecorderClip ---
-                bool usedFidelityPath = false;
-
-                if (!string.IsNullOrEmpty(request.recorderConfigJson) &&
-                    FidelityBuilderRegistry.OnApplyImageSettings != null)
-                {
-                    // Find the pre-baked clip first.
-                    preflightRecorderClip = FindRecorderClip(timelineAsset);
-
-                    if (preflightRecorderClip != null && preflightRecorderClip.settings != null)
-                    {
-                        // Mutate the persistent sub-asset in-place.
-                        bool applyOk = FidelityBuilderRegistry.OnApplyImageSettings(
-                            request, preflightRecorderClip.settings, outputFile, out string applyError);
-
-                        if (!applyOk)
-                        {
-                            FailJob(request.jobId,
-                                $"[A4] MTRフィデリティ設定の適用に失敗しました: {applyError}");
-                            return;
-                        }
-
-                        // Remove any OTHER RecorderTracks so only this job's (mutated) recorder runs.
-                        // An older code version could have baked a second "[DistributedRecorder]"
-                        // track into the timeline; left in place it records a second time (e.g. at
-                        // its old resolution, to the project root). Keep only the track that owns the
-                        // clip we just mutated.
-                        UnityEngine.Timeline.TrackAsset keepTrack = null;
-                        var allRecorderTracks = new System.Collections.Generic.List<UnityEngine.Timeline.TrackAsset>();
-                        foreach (var track in timelineAsset.GetOutputTracks())
-                        {
-                            if (!(track is RecorderTrack)) continue;
-                            allRecorderTracks.Add(track);
-                            foreach (var tc in track.GetClips())
-                                if (tc.asset == preflightRecorderClip) keepTrack = track;
-                        }
-                        foreach (var t in allRecorderTracks)
-                            if (t != keepTrack) timelineAsset.DeleteTrack(t);
-
-                        // Adjust the TimelineClip range when a sub-range is specified.
-                        if (request.startTime >= 0.0 && request.endTime > request.startTime)
-                        {
-                            // Find the TimelineClip that wraps our RecorderClip and apply range.
-                            foreach (var track in timelineAsset.GetOutputTracks())
-                            {
-                                if (!(track is RecorderTrack)) continue;
-                                foreach (var tc in track.GetClips())
-                                {
-                                    if (tc.asset == preflightRecorderClip)
-                                    {
-                                        tc.start    = request.startTime;
-                                        tc.duration = request.endTime - request.startTime;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        AppendE2ELog(
-                            $"[JobRunner] MTRフィデリティパス（永続クリップ mutate）: {outputFile}");
-                        usedFidelityPath = true;
-                    }
-                    else
-                    {
-                        // Pre-baked clip not found — fall through to the legacy DTO path with warning.
-                        Debug.LogWarning(
-                            "[JobRunner] [A4] 焼き込み済み RecorderClip が Timeline に見つかりませんでした。" +
-                            "Legacy DTO パスにフォールバックします（transient 設定のため録画されない可能性があります）。" +
-                            "DistributedRecorder > Create MTR Multi-Timeline Sample でサンプルを再生成してください。");
-                    }
-                }
-
-                // --- Legacy DTO path: recorderConfig only, OR fidelity fallback ---
-                if (!usedFidelityPath)
-                {
-                    try
-                    {
-                        preflightRecorderClip = MtrRecorderClipBuilder.BuildAndApply(
-                            request.recorderConfig, outputFile, timelineAsset,
-                            request.startTime, request.endTime);
-                    }
-                    catch (Exception ex)
-                    {
-                        FailJob(request.jobId,
-                            $"[A4] MtrRecorderClipBuilder でRecorderClipの構築に失敗しました: {ex.Message}");
-                        return;
-                    }
-
-                    AppendE2ELog($"[JobRunner] Legacy DTOパスでRecorderClipを構築しました: {outputFile}");
-                }
+            // resolvedOutputRelativePath may contain <Frame>/<Take> wildcards that are
+            // illegal as Path.Combine arguments on Windows; join with '/' manually.
+            string outputFile;
+            if (!string.IsNullOrEmpty(request.resolvedOutputRelativePath))
+            {
+                outputFile = baseOutputDir.TrimEnd('/')
+                    + "/" + request.resolvedOutputRelativePath.Replace('\\', '/').TrimStart('/');
             }
             else
             {
-                // Legacy path: find existing RecorderClip embedded in the Timeline.
-                preflightRecorderClip = FindRecorderClip(timelineAsset);
+                outputFile = baseOutputDir.TrimEnd('/') + "/frame_<Frame>";
+            }
+
+            // ----- A4: Build fresh ImageRecorderSettings from recorderConfigJson -------------
+            // Single-source path: RecorderSettingsBuilderShared via DistributedWorkerBridge.
+            // Camera/RT resolution failure → hard fail (no GameView fallback per §F-4).
+            ImageRecorderSettings builtSettings = null;
+
+            if (isMtrPath)
+            {
+                if (FidelityBuilderRegistry.OnBuildImageSettings == null)
+                {
+                    FailJob(request.jobId,
+                        "[A4] FidelityBuilderRegistry.OnBuildImageSettings が未登録です。" +
+                        "DistributedWorkerBridge の InitializeOnLoad が完了しているか確認してください。");
+                    return;
+                }
+
+                bool buildOk = FidelityBuilderRegistry.OnBuildImageSettings(
+                    request, outputFile, out object settingsObj, out string buildError);
+
+                if (!buildOk || settingsObj == null)
+                {
+                    FailJob(request.jobId,
+                        $"[A4] ImageRecorderSettings の構築に失敗しました: {buildError}");
+                    return;
+                }
+
+                builtSettings = settingsObj as ImageRecorderSettings;
+                if (builtSettings == null)
+                {
+                    FailJob(request.jobId,
+                        "[A4] OnBuildImageSettings が ImageRecorderSettings 以外の型を返しました。" +
+                        "com.unity.recorder のバージョンを確認してください。");
+                    return;
+                }
+
+                AppendE2ELog($"[JobRunner] ImageRecorderSettings を構築しました: outputFile={outputFile}");
+            }
+
+            // ----- A4 (legacy path): find existing RecorderClip in the scene Timeline --------
+            // Only used when timelineAssetPath is not set (pre-MTR legacy scenes).
+            RecorderClip preflightRecorderClip = null;
+
+            if (!isMtrPath)
+            {
+                preflightRecorderClip = FindRecorderClip(sourceTimeline);
 
                 if (preflightRecorderClip == null)
                 {
@@ -446,23 +366,72 @@ namespace DistributedRecorder.Worker
                         "[A4] RecorderClip.settings が null です。Timeline を再生成してください。");
                     return;
                 }
+
+                // Legacy path: set output file on the existing settings.
+                string outputDir     = _store.GetOutputDirectory(request.jobId);
+                string outputTemplate = outputDir.Replace('\\', '/').TrimEnd('/') + "/frame_<Frame>";
+                preflightRecorderClip.settings.OutputFile = outputTemplate;
+                AppendE2ELog($"[JobRunner] 出力先を設定 (legacy): {outputTemplate}");
             }
 
-            // ----- Estimate total frames from Timeline ----------------------
-            // timeline.duration is in seconds; frameRate is the Timeline editor rate.
-            double durationSec  = timelineAsset.duration;
+            // ----- B: Create persistent temp render timeline (MTR path only) ----------------
+            // The settings ScriptableObject must be a persistent sub-asset before Play Mode so
+            // the Timeline Recorder can drive it reliably (transient objects are unreliable
+            // across the domain boundary – the root cause of the "0 frames" bug).
+            // The temp timeline is bound to the director IN PLACE OF the source timeline, so
+            // the source timeline is never mutated. It is deleted unconditionally after recording.
+            if (isMtrPath && builtSettings != null)
+            {
+                double duration = sourceTimeline != null ? sourceTimeline.duration : 5.0;
+                try
+                {
+                    _tempTimelineAssetPath = WorkerRenderTimelineFactory.Create(
+                        builtSettings, duration,
+                        request.startTime, request.endTime,
+                        request.jobId);
+                }
+                catch (Exception ex)
+                {
+                    // builtSettings ownership passed to factory; may be partially embedded.
+                    // Attempt cleanup before failing.
+                    if (!string.IsNullOrEmpty(_tempTimelineAssetPath))
+                    {
+                        WorkerRenderTimelineFactory.Delete(_tempTimelineAssetPath);
+                        _tempTimelineAssetPath = null;
+                    }
+                    FailJob(request.jobId,
+                        $"[B] temp render timeline の作成に失敗しました: {ex.Message}");
+                    return;
+                }
 
-            // For the MTR path, prefer effectiveFrameRate (resolved by Master from MTR global settings);
-            // fall back to recorderConfig.frameRate, then to the Timeline's own frame rate.
+                // Load the newly created temp timeline and bind it to the director.
+                var tempTimeline = AssetDatabase.LoadAssetAtPath<TimelineAsset>(_tempTimelineAssetPath);
+                if (tempTimeline == null)
+                {
+                    WorkerRenderTimelineFactory.Delete(_tempTimelineAssetPath);
+                    _tempTimelineAssetPath = null;
+                    FailJob(request.jobId,
+                        $"[B] 作成した temp timeline を再ロードできませんでした: {_tempTimelineAssetPath}");
+                    return;
+                }
+
+                preflightDirector.playableAsset = tempTimeline;
+                AppendE2ELog($"[JobRunner] temp render timeline をディレクターにバインド: {_tempTimelineAssetPath}");
+            }
+
+            // ----- Estimate total frames from source Timeline ---------------------------------
+            // Use source timeline duration (pre-binding) so frame count is correct even when
+            // the temp timeline has the same duration but was created independently.
+            double durationSec = sourceTimeline != null ? sourceTimeline.duration : 0.0;
+
+            // Prefer effectiveFrameRate (resolved by Master); fall back to timeline rate.
             double fps;
             if (isMtrPath && request.effectiveFrameRate > 0)
                 fps = request.effectiveFrameRate;
-            else if (isMtrPath && request.recorderConfig != null && request.recorderConfig.frameRate > 0)
-                fps = request.recorderConfig.frameRate;
             else
-                fps = timelineAsset.editorSettings.frameRate;
+                fps = (sourceTimeline != null ? sourceTimeline.editorSettings.frameRate : 0);
 
-            _recordingFps         = fps > 0 ? fps : 30.0;   // stored to avoid circular recalc in progress update
+            _recordingFps         = fps > 0 ? fps : 30.0;
             _recordingTotalFrames = (fps > 0 && durationSec > 0)
                 ? Mathf.Max(1, Mathf.RoundToInt((float)(durationSec * fps)))
                 : 0;
@@ -472,20 +441,6 @@ namespace DistributedRecorder.Worker
                 s.state       = JobState.Running;
                 s.totalFrames = _recordingTotalFrames;
             });
-
-            // ----- Override output directory (legacy path only) --------------------------------
-            // For the MTR path, MtrRecorderClipBuilder has already set OutputFile above.
-            // For the legacy path, override here as before.
-            if (!isMtrPath)
-            {
-                string outputDir = _store.GetOutputDirectory(request.jobId);
-                // Use Recorder wildcard <Frame> for per-frame numbering.
-                string outputTemplate = outputDir.Replace('\\', '/').TrimEnd('/') + "/frame_<Frame>";
-                // Normalize slashes for Recorder (it accepts forward slashes on Windows too)
-                outputTemplate = outputTemplate.Replace('\\', '/');
-                preflightRecorderClip.settings.OutputFile = outputTemplate;
-                AppendE2ELog($"[JobRunner] 出力先を設定 (legacy): {outputTemplate}");
-            }
 
             // Store reference so Play Mode state handler can re-acquire the director by name/path.
             _preflightDirectorName = preflightDirector.name;
@@ -771,6 +726,11 @@ namespace DistributedRecorder.Worker
             // job does not hit the "[Time.captureFramerate] conflicting value" recorder error.
             UnityEngine.Time.captureFramerate = 0;
             UnsubscribeAll();
+
+            // Clean up the temp render timeline (always, success path).
+            // Failure path cleanup is handled by FailJob → ResetState.
+            CleanupTempTimeline();
+
             FinalizeCompletedJob(_runningJobId);
         }
 
@@ -916,6 +876,9 @@ namespace DistributedRecorder.Worker
         {
             _phase = RecordingPhase.Idle;
 
+            // Clean up temp timeline when present (failure path).
+            CleanupTempTimeline();
+
             Debug.LogError($"[JobRunner] ジョブ '{jobId}' 失敗: {error}");
 
             var result = new JobResult
@@ -949,13 +912,14 @@ namespace DistributedRecorder.Worker
             // This must be set here (not only in FailJob) so that
             // FinalizeCompletedJob → ResetState also leaves the runner in
             // a startable state for consecutive jobs [B4].
-            _phase                = RecordingPhase.Idle;
-            _runningJobId         = null;
-            _recordingTotalFrames = 0;
-            _recordingFps         = 0;
-            _lastKnownFrame       = 0;
-            _stallCheckStartUtc   = 0;
+            _phase                 = RecordingPhase.Idle;
+            _runningJobId          = null;
+            _recordingTotalFrames  = 0;
+            _recordingFps          = 0;
+            _lastKnownFrame        = 0;
+            _stallCheckStartUtc    = 0;
             _preflightDirectorName = null;
+            _tempTimelineAssetPath = null;
 #if UNITY_RECORDER
             if (_director != null)
             {
@@ -983,6 +947,38 @@ namespace DistributedRecorder.Worker
             if (_store.TryGetEntry(jobId, out var entry))
                 return DateTimeOffset.UtcNow.ToUnixTimeSeconds() - entry.Status.startedAtUtc;
             return 0;
+        }
+
+        // ------------------------------------------------------------------
+        // Temp render timeline cleanup (worker-recorder-redesign §B)
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// Deletes the temp render timeline created by <see cref="WorkerRenderTimelineFactory"/>
+        /// for the current job, then clears the stored path.
+        ///
+        /// Safe to call multiple times (no-op when path is already null/empty).
+        /// Called both on success (WaitingForEditMode) and failure (FailJob).
+        /// </summary>
+        private void CleanupTempTimeline()
+        {
+            if (string.IsNullOrEmpty(_tempTimelineAssetPath))
+                return;
+
+            string pathToDelete    = _tempTimelineAssetPath;
+            _tempTimelineAssetPath = null;    // clear first to prevent double-delete
+
+#if UNITY_RECORDER
+            try
+            {
+                WorkerRenderTimelineFactory.Delete(pathToDelete);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning(
+                    $"[JobRunner] temp render timeline の削除中に例外が発生しました ({pathToDelete}): {ex.Message}");
+            }
+#endif
         }
 
         // ------------------------------------------------------------------

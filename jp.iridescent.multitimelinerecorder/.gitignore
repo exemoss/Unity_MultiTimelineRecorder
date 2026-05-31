@@ -25,3 +25,6 @@
 ehthumbs.db
 Thumbs.db
 Desktop.ini
+# Worker temp render timelines (WorkerRenderTimelineFactory - worker-recorder-redesign)
+_DistRecorder_Temp/
+_DistRecorder_Temp.meta

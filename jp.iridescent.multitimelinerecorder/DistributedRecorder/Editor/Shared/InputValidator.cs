@@ -214,7 +214,18 @@ namespace DistributedRecorder.Shared
                 }
             }
 
-            // recorderConfigJson – optional; validated only when non-empty
+            // recorderConfigJson – REQUIRED when timelineAssetPath is set (worker-recorder-redesign §E).
+            // The Worker's new fresh-build path builds ImageRecorderSettings exclusively from
+            // recorderConfigJson; there is no baked-clip fallback any more.
+            if (!string.IsNullOrEmpty(request.timelineAssetPath))
+            {
+                if (string.IsNullOrEmpty(request.recorderConfigJson))
+                {
+                    reason = "recorderConfigJson is required when timelineAssetPath is set.";
+                    return false;
+                }
+            }
+
             if (!string.IsNullOrEmpty(request.recorderConfigJson))
             {
                 if (Encoding.UTF8.GetByteCount(request.recorderConfigJson) > MaxRecorderConfigJsonBytes)
@@ -235,13 +246,6 @@ namespace DistributedRecorder.Shared
                     return false;
                 }
             }
-
-            // Require at least one of recorderConfigJson or recorderSettingsAssetPath
-            // when timelineAssetPath is set (recording target must have a config source).
-            // (recorderSettingsAssetPath is validated above; recorderConfigJson is checked here)
-            // Note: The earlier check already requires timelineAssetPath when recorderSettingsAssetPath
-            // is empty. This complementary check ensures the fidelity path has config data.
-            // We intentionally do NOT make recorderConfigJson mandatory to preserve backward compat.
 
             // targetCameraHierarchyPath – optional
             if (!string.IsNullOrEmpty(request.targetCameraHierarchyPath))
