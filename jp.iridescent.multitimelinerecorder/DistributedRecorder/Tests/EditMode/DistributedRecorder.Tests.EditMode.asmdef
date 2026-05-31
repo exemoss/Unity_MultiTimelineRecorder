@@ -4,6 +4,7 @@
     "references": [
         "DistributedRecorder.Editor",
         "DistributedRecorder.Editor.Setup",
+        "Unity.MultiTimelineRecorder.Editor",
         "Unity.Recorder.Editor",
         "Unity.Timeline",
         "UnityEngine.TestRunner",
