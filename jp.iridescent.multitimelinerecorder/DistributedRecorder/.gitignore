@@ -1,0 +1,2 @@
+# Vendored Unity module: keep ALL .meta (GUID stability for assets referencing scripts)
+!*.meta
