@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading.Tasks;
 using DistributedRecorder.Master;
 using DistributedRecorder.Shared;
@@ -18,8 +19,8 @@ namespace Unity.MultiTimelineRecorder
     /// Appended as a partial class so that the MTR core file is not modified
     /// beyond the single <c>DrawDistributedSection()</c> call-site hook.
     ///
-    /// Supports M4 (MTR seam) and M5 (distributed button + round-robin dispatch).
-    /// Progress collection and result retrieval are deferred to M6.
+    /// Supports M4 (MTR seam), M5 (dispatch), and M6 (progress monitoring +
+    /// result download + hash/version override dialog).
     /// </summary>
     public partial class MultiTimelineRecorder
     {
@@ -36,12 +37,31 @@ namespace Unity.MultiTimelineRecorder
         /// </summary>
         private WorkerRegistryAsset _distWorkerRegistry;
 
-        /// <summary>Per-job dispatch summary recorded for M6 progress collection.</summary>
-        private readonly List<DistributedJobRecord> _dispatchedJobs = new List<DistributedJobRecord>();
+        /// <summary>
+        /// Per-job view models for progress display and result tracking.
+        /// Replaces the M5 <c>DistributedJobRecord</c> list with a richer model.
+        /// </summary>
+        private readonly List<MtrJobViewModel> _dispatchedJobs = new List<MtrJobViewModel>();
+
+        /// <summary>
+        /// Scroll position for the job list in DrawDistributedSection.
+        /// </summary>
+        private Vector2 _distJobScrollPos;
+
+        /// <summary>
+        /// When true, hash/version mismatch "Send anyway" is applied to all
+        /// subsequent jobs in the current dispatch batch without asking again.
+        /// Reset to false at the start of each dispatch batch.
+        /// </summary>
+        private bool _sessionSkipHashCheck;
+        private bool _sessionSkipVersionCheck;
 
         // EditorPrefs keys (MTR window scope)
         private const string PrefKeyDistMode     = "MTR.DistributedMode";
         private const string PrefKeyDistRegistry = "MTR.DistributedRegistryGuid";
+
+        // Default relative output root (relative to project root)
+        private const string DistOutputRelRoot = "Recordings/Distributed";
 
         // -----------------------------------------------------------------------
         // UI hook (called from MultiTimelineRecorder.cs DrawRecordControls area)
@@ -116,8 +136,11 @@ namespace Unity.MultiTimelineRecorder
             // ── Collect render targets for button state ────────────────────
             var targets = CollectRenderTargets();
             int imageTargetCount = targets.Count;
+
+            bool isDispatching = IsAnyJobActive();
             bool canDispatch = imageTargetCount > 0 && enabledWorkerCount > 0
-                               && currentState == RecordState.Idle;
+                               && currentState == RecordState.Idle
+                               && !isDispatching;
 
             if (imageTargetCount == 0 && selectedDirectorIndices.Count > 0)
             {
@@ -142,17 +165,97 @@ namespace Unity.MultiTimelineRecorder
                 GUI.backgroundColor = orig;
             }
 
-            // ── Recent dispatch log (single-line summary) ───────────────────
+            // ── Job progress list ────────────────────────────────────────────
             if (_dispatchedJobs.Count > 0)
             {
-                EditorGUILayout.Space(2);
-                var last = _dispatchedJobs[_dispatchedJobs.Count - 1];
-                EditorGUILayout.LabelField(
-                    $"最終: {last.JobId.Substring(0, 8)}... → {last.WorkerName} [{(last.Accepted ? "OK" : "NG")}]",
-                    EditorStyles.miniLabel);
+                EditorGUILayout.Space(4);
+                DrawDistributedJobList();
             }
 
             EditorGUILayout.EndVertical();
+        }
+
+        // -----------------------------------------------------------------------
+        // Job progress UI
+        // -----------------------------------------------------------------------
+
+        private void DrawDistributedJobList()
+        {
+            // Summary line
+            int total     = _dispatchedJobs.Count;
+            int completed = CountJobsByState(JobState.Completed);
+            int failed    = CountJobsByState(JobState.Failed);
+            int active    = total - completed - failed;
+
+            string summary = active > 0
+                ? $"実行中: {active} / 完了: {completed} / 失敗: {failed}"
+                : $"完了: {completed} / 失敗: {failed} (合計 {total})";
+
+            EditorGUILayout.LabelField(summary, EditorStyles.miniLabel);
+
+            // All-complete notice with output path
+            if (active == 0 && total > 0)
+            {
+                string outRoot = Path.Combine(ProjectPaths.ProjectRoot, DistOutputRelRoot);
+                EditorGUILayout.LabelField(
+                    $"回収先: {outRoot}",
+                    EditorStyles.miniLabel);
+            }
+
+            // Scrollable job list (max 150px)
+            _distJobScrollPos = EditorGUILayout.BeginScrollView(
+                _distJobScrollPos, GUILayout.Height(Mathf.Min(150, _dispatchedJobs.Count * 36 + 4)));
+
+            foreach (var vm in _dispatchedJobs)
+                DrawMtrJobRow(vm);
+
+            EditorGUILayout.EndScrollView();
+        }
+
+        private static void DrawMtrJobRow(MtrJobViewModel vm)
+        {
+            EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
+
+            // Job ID short + Timeline name + Worker
+            string idShort = vm.JobId.Length >= 8 ? vm.JobId.Substring(0, 8) : vm.JobId;
+            EditorGUILayout.LabelField(
+                $"[{vm.State}] {idShort}… {vm.TimelineName} → {vm.WorkerName}",
+                GUILayout.Width(280));
+
+            // Progress bar
+            float progress = vm.TotalFrames > 0
+                ? (float)vm.CurrentFrame / vm.TotalFrames
+                : (vm.State == JobState.Running ? 0.5f : 1f);
+
+            string barLabel;
+            switch (vm.State)
+            {
+                case JobState.Completed:
+                    barLabel = vm.DownloadState == DownloadState.Done   ? "Done+DL"
+                             : vm.DownloadState == DownloadState.Failed ? "Done/DL失敗"
+                             : "Done";
+                    break;
+                case JobState.Failed:
+                    barLabel = "Failed";
+                    break;
+                default:
+                    barLabel = $"{vm.CurrentFrame}/{vm.TotalFrames}";
+                    break;
+            }
+
+            EditorGUI.ProgressBar(
+                EditorGUILayout.GetControlRect(GUILayout.Width(120), GUILayout.Height(16)),
+                progress, barLabel);
+
+            // "Open" button for completed+downloaded jobs
+            if (vm.State == JobState.Completed && vm.DownloadState == DownloadState.Done
+                && !string.IsNullOrEmpty(vm.LocalOutputDir))
+            {
+                if (GUILayout.Button("開く", GUILayout.Width(40)))
+                    EditorUtility.RevealInFinder(vm.LocalOutputDir);
+            }
+
+            EditorGUILayout.EndHorizontal();
         }
 
         // -----------------------------------------------------------------------
@@ -375,7 +478,71 @@ namespace Unity.MultiTimelineRecorder
         }
 
         // -----------------------------------------------------------------------
-        // Dispatch
+        // Job state aggregation helpers (public static for hermetic tests)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Returns true when all jobs in <paramref name="vms"/> have reached a
+        /// terminal state (Completed, Failed, Cancelled, or Unreachable).
+        ///
+        /// Made <c>public static</c> for hermetic tests.
+        /// </summary>
+        public static bool AreAllJobsTerminal(IReadOnlyList<MtrJobViewModel> vms)
+        {
+            if (vms == null || vms.Count == 0) return true;
+            foreach (var vm in vms)
+            {
+                if (!IsTerminalState(vm.State))
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Counts the number of jobs in <paramref name="vms"/> with the given
+        /// <paramref name="state"/>.
+        ///
+        /// Made <c>public static</c> for hermetic tests.
+        /// </summary>
+        public static int CountJobsInState(IReadOnlyList<MtrJobViewModel> vms, JobState state)
+        {
+            if (vms == null) return 0;
+            int count = 0;
+            foreach (var vm in vms)
+            {
+                if (vm.State == state) count++;
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// Builds the local output directory path for a job, ensuring no ".." traversal.
+        /// Format: <c>{projectRoot}/Recordings/Distributed/{jobId}</c>
+        ///
+        /// Made <c>public static</c> for hermetic tests; accepts
+        /// <paramref name="projectRoot"/> explicitly to avoid
+        /// <see cref="Application.dataPath"/> dependency in tests.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="jobId"/> contains ".." or path separators.
+        /// </exception>
+        public static string BuildResultOutputDir(string projectRoot, string jobId)
+        {
+            if (string.IsNullOrEmpty(projectRoot))
+                throw new ArgumentNullException(nameof(projectRoot));
+            if (string.IsNullOrEmpty(jobId))
+                throw new ArgumentNullException(nameof(jobId));
+
+            // Reject path traversal in jobId
+            if (jobId.Contains("..") || jobId.Contains('/') || jobId.Contains('\\'))
+                throw new ArgumentException(
+                    $"jobId contains path traversal or separators: '{jobId}'", nameof(jobId));
+
+            return Path.Combine(projectRoot, DistOutputRelRoot, jobId);
+        }
+
+        // -----------------------------------------------------------------------
+        // Dispatch entry point
         // -----------------------------------------------------------------------
 
         private async void StartDistributedRecordingAsync(List<DistributedTimelineJob> targets)
@@ -406,23 +573,53 @@ namespace Unity.MultiTimelineRecorder
                 return;
             }
 
-            var auth       = new HmacAuthenticator(keyBytes);
-            var transport  = new HttpTransport(auth);
+            var auth      = new HmacAuthenticator(keyBytes);
+            var transport = new HttpTransport(auth);
             var dispatcher = new JobDispatcher(transport, ProjectPaths.ProjectRoot);
+
+            // Reset session-wide skip flags for this batch
+            _sessionSkipHashCheck    = false;
+            _sessionSkipVersionCheck = false;
 
             // Round-robin assignment
             var assignments = AssignRoundRobin(targets, workers);
 
             Debug.Log($"[DistributedRecorder] {assignments.Count} ジョブを {workers.Count} Worker に round-robin で投入します。");
 
-            var tasks = new List<Task>();
+            // Build view models first (before async dispatch) so UI shows them immediately
+            var vmsForBatch = new List<MtrJobViewModel>();
             foreach (var (job, worker) in assignments)
             {
                 string jobId = Guid.NewGuid().ToString("N");
+                string outDir = BuildResultOutputDir(ProjectPaths.ProjectRoot, jobId);
+
+                var vm = new MtrJobViewModel
+                {
+                    JobId          = jobId,
+                    TimelineName   = job.DirectorObjectName,
+                    WorkerName     = worker.displayName,
+                    State          = JobState.Pending,
+                    DownloadState  = DownloadState.NotStarted,
+                    LocalOutputDir = outDir,
+                    Worker         = worker
+                };
+                _dispatchedJobs.Add(vm);
+                vmsForBatch.Add(vm);
+            }
+
+            Repaint();
+
+            // Dispatch sequentially so dialog responses can influence subsequent jobs.
+            // Using sequential rather than parallel because EditorUtility.DisplayDialog
+            // must be called from the main thread and we want per-batch skip flags.
+            for (int i = 0; i < assignments.Count; i++)
+            {
+                var (job, worker) = assignments[i];
+                var vm            = vmsForBatch[i];
 
                 var request = new JobRequest
                 {
-                    jobId                  = jobId,
+                    jobId                  = vm.JobId,
                     scenePath              = job.ScenePath,
                     timelineAssetPath      = job.TimelineAssetPath,
                     directorObjectName     = job.DirectorObjectName,
@@ -430,85 +627,302 @@ namespace Unity.MultiTimelineRecorder
                     recorderConfig         = job.JobConfig,
                     startTime              = job.StartTime,
                     endTime                = job.EndTime,
-                    outputSubDir           = jobId
+                    outputSubDir           = vm.JobId
                 };
 
-                var record = new DistributedJobRecord
+                bool accepted = await DispatchOneWithOverrideAsync(
+                    dispatcher, auth, worker, request, vm);
+
+                if (accepted)
                 {
-                    JobId      = jobId,
-                    WorkerName = worker.displayName,
-                    Accepted   = false
-                };
-                _dispatchedJobs.Add(record);
+                    // Start progress monitor (fire-and-forget; events repaint the window)
+                    StartProgressMonitor(auth, worker, vm);
+                }
 
-                // Capture for async lambda
-                var capturedRecord   = record;
-                var capturedWorker   = worker;
-                var capturedJobId    = jobId;
-
-                tasks.Add(DispatchOneAsync(dispatcher, capturedWorker, request,
-                    capturedRecord, capturedJobId));
+                Repaint();
             }
 
-            await Task.WhenAll(tasks);
             transport.Dispose();
-
             Repaint();
         }
 
-        private static async Task DispatchOneAsync(
+        // -----------------------------------------------------------------------
+        // Single-job dispatch with hash/version override dialog
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Dispatches one job, handling hash/version mismatch dialogs in-line.
+        /// Returns true when the job was accepted by the Worker.
+        /// </summary>
+        private async Task<bool> DispatchOneWithOverrideAsync(
             JobDispatcher dispatcher,
+            HmacAuthenticator auth,
             WorkerInfo worker,
             JobRequest request,
-            DistributedJobRecord record,
-            string jobId)
+            MtrJobViewModel vm)
         {
+            string jobIdShort = request.jobId.Length >= 8
+                ? request.jobId.Substring(0, 8) : request.jobId;
+
             DispatchResult result;
             try
             {
-                result = await dispatcher.DispatchAsync(worker, request);
+                result = await dispatcher.DispatchAsync(worker, request,
+                    skipVersionCheck: _sessionSkipVersionCheck,
+                    skipHashCheck:    _sessionSkipHashCheck);
             }
             catch (Exception ex)
             {
+                vm.State = JobState.Failed;
                 Debug.LogError(
-                    $"[DistributedRecorder] ジョブ {jobId.Substring(0, 8)}... → " +
-                    $"{worker.displayName}: 例外が発生しました: {ex.Message}");
-                record.Accepted = false;
-                return;
+                    $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
+                    $"例外が発生しました: {ex.Message}");
+                return false;
             }
 
             if (result.Success)
             {
-                record.Accepted = true;
+                vm.State = JobState.Running;
                 Debug.Log(
-                    $"[DistributedRecorder] ジョブ {jobId.Substring(0, 8)}... → " +
-                    $"{worker.displayName}: 投入完了");
+                    $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: 投入完了");
+                return true;
             }
-            else
+
+            // ── Handle failures ──────────────────────────────────────────────
+            switch (result.FailReason)
             {
-                record.Accepted = false;
-                switch (result.FailReason)
+                case DispatchFailReason.VersionMismatch:
                 {
-                    case DispatchFailReason.Unreachable:
-                        Debug.LogWarning(
-                            $"[DistributedRecorder] ジョブ {jobId.Substring(0, 8)}... → " +
-                            $"{worker.displayName}: Worker に到達できません。スキップします。\n{result.ErrorMessage}");
-                        break;
+                    bool proceed = _sessionSkipVersionCheck || EditorUtility.DisplayDialog(
+                        "バージョン不一致",
+                        $"{result.ErrorMessage}\n\n続行しますか？",
+                        "はい、送信する（Send anyway）", "キャンセル");
 
-                    case DispatchFailReason.VersionMismatch:
-                    case DispatchFailReason.HashMismatch:
+                    if (proceed)
+                    {
+                        _sessionSkipVersionCheck = true;
                         Debug.LogWarning(
-                            $"[DistributedRecorder] ジョブ {jobId.Substring(0, 8)}... → " +
-                            $"{worker.displayName}: バージョン/ハッシュ不一致 ({result.FailReason})。" +
-                            " Send-anyway 連携は M6 で実装予定です。スキップします。\n{result.ErrorMessage}");
-                        break;
+                            $"[DistributedRecorder] バージョン不一致のため上書き送信: ジョブ {jobIdShort}…");
 
-                    default:
-                        Debug.LogWarning(
-                            $"[DistributedRecorder] ジョブ {jobId.Substring(0, 8)}... → " +
-                            $"{worker.displayName}: 拒否されました ({result.FailReason})。\n{result.ErrorMessage}");
-                        break;
+                        DispatchResult retryResult;
+                        try
+                        {
+                            retryResult = await dispatcher.DispatchAsync(worker, request,
+                                skipVersionCheck: true,
+                                skipHashCheck:    _sessionSkipHashCheck);
+                        }
+                        catch (Exception ex)
+                        {
+                            vm.State = JobState.Failed;
+                            Debug.LogError(
+                                $"[DistributedRecorder] 上書き再送失敗 ジョブ {jobIdShort}…: {ex.Message}");
+                            return false;
+                        }
+
+                        if (!retryResult.Success)
+                        {
+                            vm.State = JobState.Failed;
+                            Debug.LogError(
+                                $"[DistributedRecorder] 上書き再送が拒否されました ジョブ {jobIdShort}…: " +
+                                retryResult.ErrorMessage);
+                            EditorUtility.DisplayDialog("送信失敗",
+                                retryResult.ErrorMessage, "OK");
+                            return false;
+                        }
+
+                        vm.State = JobState.Running;
+                        Debug.Log(
+                            $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
+                            "バージョン上書き送信完了");
+                        return true;
+                    }
+
+                    vm.State = JobState.Failed;
+                    return false;
                 }
+
+                case DispatchFailReason.HashMismatch:
+                {
+                    // Extract short hashes for dialog body (same helper as DistributedRecorderWindow)
+                    string masterShort = ExtractHashShort(result.ErrorMessage, "master=");
+                    string localShort  = ExtractHashShort(result.ErrorMessage, "local=");
+
+                    bool proceed = _sessionSkipHashCheck || EditorUtility.DisplayDialog(
+                        "プロジェクトハッシュ不一致",
+                        "Master と Worker のプロジェクト内容が異なります（hash mismatch）。\n" +
+                        "Worker は自分のローカル版プロジェクトで録画します。続行しますか？\n\n" +
+                        $"Master: {masterShort}\nWorker: {localShort}",
+                        "上書き送信（Send anyway）", "キャンセル");
+
+                    if (proceed)
+                    {
+                        _sessionSkipHashCheck = true;
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] ハッシュ不一致のため上書き送信: ジョブ {jobIdShort}…");
+
+                        DispatchResult retryResult;
+                        try
+                        {
+                            retryResult = await dispatcher.DispatchAsync(worker, request,
+                                skipVersionCheck: _sessionSkipVersionCheck,
+                                skipHashCheck:    true);
+                        }
+                        catch (Exception ex)
+                        {
+                            vm.State = JobState.Failed;
+                            Debug.LogError(
+                                $"[DistributedRecorder] ハッシュ上書き再送失敗 ジョブ {jobIdShort}…: {ex.Message}");
+                            return false;
+                        }
+
+                        if (!retryResult.Success)
+                        {
+                            vm.State = JobState.Failed;
+                            Debug.LogError(
+                                $"[DistributedRecorder] ハッシュ上書き再送が拒否されました ジョブ {jobIdShort}…: " +
+                                retryResult.ErrorMessage);
+                            EditorUtility.DisplayDialog("送信失敗",
+                                retryResult.ErrorMessage, "OK");
+                            return false;
+                        }
+
+                        vm.State = JobState.Running;
+                        Debug.Log(
+                            $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
+                            "ハッシュ上書き送信完了");
+                        return true;
+                    }
+
+                    vm.State = JobState.Failed;
+                    return false;
+                }
+
+                case DispatchFailReason.Unreachable:
+                    vm.State = JobState.Unreachable;
+                    Debug.LogWarning(
+                        $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
+                        $"Worker に到達できません。\n{result.ErrorMessage}");
+                    return false;
+
+                default:
+                    vm.State = JobState.Failed;
+                    Debug.LogWarning(
+                        $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
+                        $"拒否されました ({result.FailReason})。\n{result.ErrorMessage}");
+                    return false;
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Progress monitoring
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Starts a <see cref="ProgressMonitor"/> for the given job.
+        /// Events are delivered on a background thread; state updates are posted
+        /// via <see cref="EditorApplication.update"/> to marshal to the main thread.
+        /// </summary>
+        private void StartProgressMonitor(
+            HmacAuthenticator auth,
+            WorkerInfo worker,
+            MtrJobViewModel vm)
+        {
+            var monitor = new ProgressMonitor(auth);
+
+            monitor.OnProgress += evt =>
+            {
+                // ProgressMonitor fires events on a background thread.
+                // Marshal the state update to the main thread via EditorApplication.update.
+                var capturedEvt = evt;
+
+                // Use an Action variable so the delegate can remove itself (self-unregistering).
+                EditorCallbackOnce(() =>
+                {
+                    vm.State        = capturedEvt.state;
+                    vm.CurrentFrame = capturedEvt.currentFrame;
+                    vm.TotalFrames  = capturedEvt.totalFrames;
+
+                    if (!string.IsNullOrEmpty(capturedEvt.message))
+                        Debug.Log($"[DistributedRecorder] {vm.JobId.Substring(0, 8)}… {capturedEvt.message}");
+
+                    if (capturedEvt.state == JobState.Completed)
+                        DownloadResultsAsync(worker, vm);
+                    else if (capturedEvt.state == JobState.Failed)
+                        Debug.LogError($"[DistributedRecorder] ジョブ {vm.JobId.Substring(0, 8)}… が失敗しました。");
+
+                    Repaint();
+                });
+            };
+
+            monitor.OnError += err =>
+            {
+                var capturedErr = err;
+                EditorCallbackOnce(() =>
+                {
+                    Debug.LogError($"[DistributedRecorder] 進捗ストリームエラー: {capturedErr}");
+                    Repaint();
+                });
+            };
+
+            monitor.Start(worker.BaseUrl, vm.JobId);
+
+            // Note: monitor is not stored; the background Task keeps it alive.
+            // It disposes itself when the stream closes (terminal state or error).
+        }
+
+        // -----------------------------------------------------------------------
+        // Result download
+        // -----------------------------------------------------------------------
+
+        private async void DownloadResultsAsync(WorkerInfo worker, MtrJobViewModel vm)
+        {
+            vm.DownloadState = DownloadState.InProgress;
+            Repaint();
+
+            Debug.Log(
+                $"[DistributedRecorder] ジョブ {vm.JobId.Substring(0, 8)}… の結果を回収します。" +
+                $" 保存先: {vm.LocalOutputDir}");
+
+            // Re-use shared transport (shared HttpClient; safe to reuse for download)
+            if (!SharedKeyLoader.TryLoad(out byte[] keyBytes, out string keyError))
+            {
+                Debug.LogError($"[DistributedRecorder] 結果回収: 共有キーのロードに失敗: {keyError}");
+                vm.DownloadState = DownloadState.Failed;
+                Repaint();
+                return;
+            }
+
+            var auth      = new HmacAuthenticator(keyBytes);
+            var transport = new HttpTransport(auth);
+
+            try
+            {
+                var downloader = new ResultDownloader(transport);
+                var result = await downloader.DownloadAsync(
+                    worker.BaseUrl,
+                    vm.JobId,
+                    vm.LocalOutputDir,
+                    (name, cur, total) =>
+                        Debug.Log($"[DistributedRecorder]  [{cur}/{total}] {name}"));
+
+                if (result.Success)
+                {
+                    vm.DownloadState = DownloadState.Done;
+                    Debug.Log(
+                        $"[DistributedRecorder] 回収完了: {result.Files.Count} ファイル → {vm.LocalOutputDir}");
+                }
+                else
+                {
+                    vm.DownloadState = DownloadState.Failed;
+                    Debug.LogError(
+                        $"[DistributedRecorder] 回収失敗 ジョブ {vm.JobId.Substring(0, 8)}…: " +
+                        result.ErrorMessage);
+                }
+            }
+            finally
+            {
+                transport.Dispose();
+                Repaint();
             }
         }
 
@@ -516,10 +930,51 @@ namespace Unity.MultiTimelineRecorder
         // Helpers
         // -----------------------------------------------------------------------
 
+        private bool IsAnyJobActive()
+        {
+            foreach (var vm in _dispatchedJobs)
+            {
+                if (!IsTerminalState(vm.State) || vm.DownloadState == DownloadState.InProgress)
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool IsTerminalState(JobState state)
+        {
+            return state == JobState.Completed
+                || state == JobState.Failed
+                || state == JobState.Cancelled
+                || state == JobState.Unreachable;
+        }
+
+        private int CountJobsByState(JobState state)
+            => CountJobsInState(_dispatchedJobs, state);
+
+        /// <summary>
+        /// Posts <paramref name="action"/> to <see cref="EditorApplication.update"/> so
+        /// it executes exactly once on the next Editor main-thread tick, then removes itself.
+        ///
+        /// Using an <c>EditorApplication.CallbackFunction</c> variable ensures the same delegate
+        /// instance is used for both <c>+=</c> and <c>-=</c>, which is required for correct
+        /// self-removal.  (C# local functions generate a new delegate instance on each
+        /// conversion, so <c>-= localFunctionName</c> would fail to unregister.)
+        /// </summary>
+        private static void EditorCallbackOnce(Action action)
+        {
+            EditorApplication.CallbackFunction callback = null;
+            callback = () =>
+            {
+                EditorApplication.update -= callback;
+                action();
+            };
+            EditorApplication.update += callback;
+        }
+
         private static string BuildHierarchyPath(GameObject go)
         {
             if (go == null) return string.Empty;
-            var parts = new System.Text.StringBuilder();
+            var parts   = new System.Text.StringBuilder();
             var current = go.transform;
             while (current != null)
             {
@@ -529,6 +984,27 @@ namespace Unity.MultiTimelineRecorder
                 current = current.parent;
             }
             return parts.ToString();
+        }
+
+        /// <summary>
+        /// Extracts the first 8 characters of a hash value from a reason string.
+        /// Looks for <paramref name="key"/> (e.g. "master=") and returns the 8 chars
+        /// immediately following it, or "????????" if not found.
+        /// Matches the same helper used in <c>DistributedRecorderWindow</c>.
+        /// </summary>
+        private static string ExtractHashShort(string reason, string key)
+        {
+            if (string.IsNullOrEmpty(reason) || string.IsNullOrEmpty(key))
+                return "????????";
+
+            int idx = reason.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return "????????";
+
+            int start = idx + key.Length;
+            if (start >= reason.Length) return "????????";
+
+            int len = Math.Min(8, reason.Length - start);
+            return reason.Substring(start, len) + "…";
         }
     }
 
@@ -569,12 +1045,47 @@ namespace Unity.MultiTimelineRecorder
     }
 
     /// <summary>
-    /// Lightweight record of a dispatched job for UI display and M6 progress collection.
+    /// State of the result download phase for a dispatched job.
     /// </summary>
-    internal class DistributedJobRecord
+    public enum DownloadState
     {
+        NotStarted,
+        InProgress,
+        Done,
+        Failed
+    }
+
+    /// <summary>
+    /// View model for a dispatched distributed job.
+    /// Replaces the M5 <c>DistributedJobRecord</c> with richer progress/download state.
+    /// </summary>
+    public class MtrJobViewModel
+    {
+        /// <summary>Unique job ID (GUID, no hyphens).</summary>
         public string JobId;
+
+        /// <summary>Human-readable Timeline (director GameObject) name for UI display.</summary>
+        public string TimelineName;
+
+        /// <summary>Human-readable Worker name for UI display.</summary>
         public string WorkerName;
-        public bool   Accepted;
+
+        /// <summary>Worker endpoint (used by ProgressMonitor and ResultDownloader).</summary>
+        public WorkerInfo Worker;
+
+        /// <summary>Current lifecycle state reported by the Worker.</summary>
+        public JobState State;
+
+        /// <summary>Most recent frame number from the Worker's progress stream.</summary>
+        public int CurrentFrame;
+
+        /// <summary>Total expected frames from the Worker's progress stream.</summary>
+        public int TotalFrames;
+
+        /// <summary>State of the result download phase.</summary>
+        public DownloadState DownloadState;
+
+        /// <summary>Absolute local directory where downloaded files are written.</summary>
+        public string LocalOutputDir;
     }
 }
