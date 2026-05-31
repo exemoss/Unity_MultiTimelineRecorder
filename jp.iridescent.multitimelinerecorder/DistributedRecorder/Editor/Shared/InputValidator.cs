@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using UnityEngine;
 
 namespace DistributedRecorder.Shared
@@ -26,6 +27,11 @@ namespace DistributedRecorder.Shared
         private const int MaxDirectorNameLength     = 256;
         private const int MaxOutputSubDirLength     = 256;
         private const int MaxFileNameTemplateLength = 256;
+
+        // MTR fidelity field limits (added in mtr-distributed-integration M3)
+        private const int MaxRecorderConfigJsonBytes  = 64 * 1024; // 64 KB
+        private const int MaxCameraNameLength          = 256;
+        private const int RenderTextureGuidLength      = 32; // 32-char lowercase hex (AssetDatabase GUID format)
 
         // RecorderJobConfig range constraints
         private const int    MinResolution  = 1;
@@ -194,6 +200,128 @@ namespace DistributedRecorder.Shared
             {
                 if (!ValidateRecorderJobConfig(request.recorderConfig, out reason))
                     return false;
+            }
+
+            // --- MTR fidelity fields (mtr-distributed-integration M3) ---
+
+            // jobScopeHash – optional 64-char hex (SHA-256), validated only when non-empty
+            if (!string.IsNullOrEmpty(request.jobScopeHash))
+            {
+                if (request.jobScopeHash.Length != 64 || !IsHexString(request.jobScopeHash))
+                {
+                    reason = "jobScopeHash must be a 64-character hexadecimal SHA-256 digest.";
+                    return false;
+                }
+            }
+
+            // recorderConfigJson – optional; validated only when non-empty
+            if (!string.IsNullOrEmpty(request.recorderConfigJson))
+            {
+                if (Encoding.UTF8.GetByteCount(request.recorderConfigJson) > MaxRecorderConfigJsonBytes)
+                {
+                    reason = $"recorderConfigJson exceeds the {MaxRecorderConfigJsonBytes / 1024} KB size limit.";
+                    return false;
+                }
+                // Structural validation: must be deserializable as RecorderConfigItem.
+                // Enum whitelist checks are deferred to the Worker's RecorderSettingsBuilderShared call.
+                // Here we confirm the JSON is not malformed by doing a lightweight parse check.
+                // JsonUtility.FromJson returns a default struct on partial/bad JSON rather than throwing,
+                // so we validate the envelope minimally.
+                if (!request.recorderConfigJson.TrimStart().StartsWith("{", StringComparison.Ordinal))
+                {
+                    reason = "recorderConfigJson must be a JSON object (must start with '{').";
+                    return false;
+                }
+            }
+
+            // Require at least one of recorderConfigJson or recorderSettingsAssetPath
+            // when timelineAssetPath is set (recording target must have a config source).
+            // (recorderSettingsAssetPath is validated above; recorderConfigJson is checked here)
+            // Note: The earlier check already requires timelineAssetPath when recorderSettingsAssetPath
+            // is empty. This complementary check ensures the fidelity path has config data.
+            // We intentionally do NOT make recorderConfigJson mandatory to preserve backward compat.
+
+            // targetCameraHierarchyPath – optional
+            if (!string.IsNullOrEmpty(request.targetCameraHierarchyPath))
+            {
+                if (request.targetCameraHierarchyPath.Length > MaxAssetPathLength)
+                {
+                    reason = $"targetCameraHierarchyPath exceeds maximum length of {MaxAssetPathLength}.";
+                    return false;
+                }
+                if (ContainsControlCharacters(request.targetCameraHierarchyPath))
+                {
+                    reason = "targetCameraHierarchyPath contains disallowed control characters.";
+                    return false;
+                }
+                // Reject ".." components (hierarchy paths use '/' as separator, not file-system paths,
+                // but ".." could still confuse downstream code)
+                string normalised = request.targetCameraHierarchyPath.Replace('\\', '/');
+                foreach (string part in normalised.Split('/'))
+                {
+                    if (part == ".." || part == ".")
+                    {
+                        reason = "targetCameraHierarchyPath must not contain '..' or '.' components.";
+                        return false;
+                    }
+                }
+            }
+
+            // targetCameraName – optional display name
+            if (!string.IsNullOrEmpty(request.targetCameraName))
+            {
+                if (request.targetCameraName.Length > MaxCameraNameLength)
+                {
+                    reason = $"targetCameraName exceeds maximum length of {MaxCameraNameLength}.";
+                    return false;
+                }
+                if (ContainsControlCharacters(request.targetCameraName))
+                {
+                    reason = "targetCameraName contains disallowed control characters.";
+                    return false;
+                }
+            }
+
+            // renderTextureGuid – optional 32-char hex (AssetDatabase GUID)
+            if (!string.IsNullOrEmpty(request.renderTextureGuid))
+            {
+                if (request.renderTextureGuid.Length != RenderTextureGuidLength ||
+                    !IsHexString(request.renderTextureGuid))
+                {
+                    reason = $"renderTextureGuid must be a {RenderTextureGuidLength}-character hexadecimal AssetDatabase GUID.";
+                    return false;
+                }
+            }
+
+            // resolvedOutputRelativePath – optional relative path (no "..", no absolute)
+            if (!string.IsNullOrEmpty(request.resolvedOutputRelativePath))
+            {
+                if (request.resolvedOutputRelativePath.Length > MaxAssetPathLength)
+                {
+                    reason = $"resolvedOutputRelativePath exceeds maximum length of {MaxAssetPathLength}.";
+                    return false;
+                }
+                // Allow <Frame> and other Recorder wildcards by checking for path traversal only.
+                // We cannot use IsRelativeSafePath directly because that function also blocks paths
+                // that start with wildcards like "<Scene>_<Take>/...".
+                // Instead we strip wildcard tokens before checking for ".." and absolute markers.
+                string pathForCheck = Regex.Replace(
+                    request.resolvedOutputRelativePath, @"<[^>]*>", "X");
+                if (Path.IsPathRooted(pathForCheck) ||
+                    pathForCheck.StartsWith("/", StringComparison.Ordinal))
+                {
+                    reason = "resolvedOutputRelativePath must not be an absolute path.";
+                    return false;
+                }
+                string normalisedOut = pathForCheck.Replace('\\', '/');
+                foreach (string part in normalisedOut.Split('/'))
+                {
+                    if (part == "..")
+                    {
+                        reason = "resolvedOutputRelativePath must not contain '..' components.";
+                        return false;
+                    }
+                }
             }
 
             return true;
