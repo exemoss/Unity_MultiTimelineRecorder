@@ -2203,9 +2203,29 @@ namespace Unity.MultiTimelineRecorder
             if (GUILayout.Button(recordContent, GUILayout.Height(30), GUILayout.Width(200)))
             {
                 if (isDistMode)
-                    StartDistributedRecordingAsync(CollectRenderTargets());
+                {
+                    // Guard: building render targets resolves paths/dependencies and can throw.
+                    // An exception escaping here during OnGUI would corrupt the GUILayout stack
+                    // ("Invalid GUILayout state"), so catch it and surface a dialog instead.
+                    try
+                    {
+                        var distTargets = CollectRenderTargets();
+                        StartDistributedRecordingAsync(distTargets);
+                    }
+                    catch (System.Exception ex)
+                    {
+                        MultiTimelineRecorderLogger.LogError(
+                            $"[Distributed] 分散実行の準備に失敗しました: {ex}");
+                        EditorUtility.DisplayDialog(
+                            "分散実行エラー",
+                            $"分散レンダリングの準備中にエラーが発生しました:\n{ex.Message}",
+                            "OK");
+                    }
+                }
                 else
+                {
                     StartRecording();
+                }
             }
             
             // Stop button with icon

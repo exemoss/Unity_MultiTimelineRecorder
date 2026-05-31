@@ -1202,8 +1202,16 @@ namespace Unity.MultiTimelineRecorder
             processed = processed.Replace('\\', '/').TrimStart('/');
 
             // Safety: reject absolute paths or ".." (should not happen after wildcard
-            // processing, but defend-in-depth)
-            if (Path.IsPathRooted(processed) || processed.StartsWith("/", StringComparison.Ordinal))
+            // processing, but defend-in-depth).
+            // NOTE: `processed` may still contain the <Frame> wildcard (and '<','>' are
+            // illegal path chars on Windows), so we MUST NOT call System.IO.Path APIs
+            // here — Path.IsPathRooted throws "Illegal characters in path". Detect an
+            // absolute/rooted path manually instead (leading slash, drive letter, or UNC).
+            bool isRooted = processed.Length > 0
+                && (processed[0] == '/' || processed[0] == '\\'
+                    || (processed.Length >= 2 && processed[1] == ':')
+                    || processed.StartsWith("\\\\", StringComparison.Ordinal));
+            if (isRooted)
             {
                 Debug.LogWarning(
                     $"[DistributedRecorder] resolvedOutputRelativePath was absolute after processing; " +
