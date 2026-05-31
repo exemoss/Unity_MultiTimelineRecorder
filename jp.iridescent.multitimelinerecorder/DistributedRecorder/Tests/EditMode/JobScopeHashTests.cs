@@ -185,6 +185,7 @@ namespace DistributedRecorder.Tests
     public class InputValidatorFidelityFieldTests
     {
         // A minimal valid request for the MTR path (timelineAssetPath + projectHash).
+        // recorderConfigJson is required when timelineAssetPath is set (worker-recorder-redesign §E).
         private static JobRequest MakeValidRequest()
         {
             return new JobRequest
@@ -195,7 +196,8 @@ namespace DistributedRecorder.Tests
                 timelineAssetPath       = "Assets/Timelines/Shot01.playable",
                 projectHash             = new string('a', 64),
                 masterUnityVersion      = "6000.2.10f1",
-                masterRecorderVersion   = "5.1.2"
+                masterRecorderVersion   = "5.1.2",
+                recorderConfigJson      = "{\"name\":\"Image\",\"enabled\":true}"
             };
         }
 
@@ -241,12 +243,15 @@ namespace DistributedRecorder.Tests
         // recorderConfigJson
         // -----------------------------------------------------------------------
 
+        // recorderConfigJson is required when timelineAssetPath is set (worker-recorder-redesign §E).
+        // An empty value must be rejected.
         [Test]
-        public void Validate_EmptyRecorderConfigJson_IsAccepted()
+        public void Validate_EmptyRecorderConfigJson_IsRejected()
         {
             var req = MakeValidRequest();
             req.recorderConfigJson = string.Empty;
-            Assert.IsTrue(InputValidator.Validate(req, out _));
+            Assert.IsFalse(InputValidator.Validate(req, out string reason));
+            StringAssert.Contains("recorderConfigJson", reason);
         }
 
         [Test]
@@ -413,6 +418,7 @@ namespace DistributedRecorder.Tests
     public class InputValidatorEffectiveSizeTests
     {
         // MTR fidelity path request (timelineAssetPath present).
+        // recorderConfigJson is required when timelineAssetPath is set (worker-recorder-redesign §E).
         private static JobRequest MakeValidMtrRequest()
         {
             return new JobRequest
@@ -424,6 +430,7 @@ namespace DistributedRecorder.Tests
                 projectHash             = new string('a', 64),
                 masterUnityVersion      = "6000.2.10f1",
                 masterRecorderVersion   = "5.1.2",
+                recorderConfigJson      = "{\"name\":\"Image\",\"enabled\":true}",
                 effectiveWidth          = 1920,
                 effectiveHeight         = 1080,
                 effectiveFrameRate      = 24.0
