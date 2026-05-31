@@ -1,7 +1,8 @@
-# Unity generated
-*.meta
-!*.asmdef.meta
-!package.json.meta
+# Unity meta files are committed in full.
+# A UPM package installed via a git URL is treated as immutable; if any .meta is
+# missing Unity regenerates it inside the read-only cache and raises
+# "immutable packages were unexpectedly altered", which destabilises the package
+# (Editor menus fail to register). Tracking every .meta keeps git installs clean.
 
 # Visual Studio / MonoDevelop generated
 .vs/
