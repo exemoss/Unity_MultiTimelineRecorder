@@ -1,0 +1,207 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace DistributedRecorder.Shared
+{
+    // ---------------------------------------------------------------------------
+    // Enumerations
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Lifecycle state of a dispatched job.
+    /// </summary>
+    public enum JobState
+    {
+        Pending,
+        Running,
+        Completed,
+        Failed,
+        Cancelled,
+        Unreachable
+    }
+
+    // ---------------------------------------------------------------------------
+    // Job Request / Ack
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Sent by Master → Worker to dispatch a recording job.
+    /// All path fields that arrive from the network are sanitized by
+    /// <see cref="InputValidator"/> before being consumed by JobRunner.
+    /// </summary>
+    [Serializable]
+    public class JobRequest
+    {
+        /// <summary>Unique job identifier (GUID string).</summary>
+        public string jobId = string.Empty;
+
+        /// <summary>
+        /// Asset path of the RecorderControllerSettings inside the Worker's
+        /// local project copy.  Must be relative (e.g.
+        /// "Assets/Recordings/MyRecorder.asset").
+        ///
+        /// As of recording-drive v2 (Timeline Recorder Clip method), this field is
+        /// <em>optional</em> (may be empty).  When empty, JobRunner uses the
+        /// RecorderClip embedded in the scene's Timeline.  When non-empty the field
+        /// is preserved for backward compatibility with older Masters, but JobRunner
+        /// v2 ignores it and always drives recording via the Timeline RecorderClip.
+        /// Do not delete this field — removing it would be a breaking protocol change.
+        /// </summary>
+        public string recorderSettingsAssetPath = string.Empty;
+
+        /// <summary>
+        /// Scene asset path to open before recording.
+        /// Must be relative to Assets/.
+        /// </summary>
+        public string scenePath = string.Empty;
+
+        /// <summary>SHA-256 hex digest of the project snapshot sent by Master.</summary>
+        public string projectHash = string.Empty;
+
+        /// <summary>Master's Unity version string (e.g. "6000.2.10f1").</summary>
+        public string masterUnityVersion = string.Empty;
+
+        /// <summary>Master's com.unity.recorder package version string.</summary>
+        public string masterRecorderVersion = string.Empty;
+
+        /// <summary>Arbitrary metadata for extensibility.  Max 1 MB total JSON.</summary>
+        public string metaJson = string.Empty;
+
+        /// <summary>
+        /// When <c>true</c> the Worker skips the project-hash equality check and
+        /// executes the job using its own local project copy.
+        ///
+        /// This flag is set by the Master only after the user has explicitly approved
+        /// the hash-mismatch override via the "Send anyway" dialog (hash-mismatch
+        /// override flow, analogous to <c>skipVersionCheck</c> in
+        /// <see cref="JobDispatcher"/>).
+        ///
+        /// Security note: HMAC authentication always runs first regardless of this
+        /// flag.  The hash check is a project-sync guard, not an authentication gate.
+        /// Overriding it means the Worker may produce output based on a different
+        /// project state than the Master intended — the user is informed of this in
+        /// the dialog before they click "Send anyway".
+        ///
+        /// Do not remove this field — removing it would be a breaking protocol change.
+        /// </summary>
+        public bool skipHashCheck;
+    }
+
+    /// <summary>
+    /// Worker's synchronous acknowledgement after receiving a JobRequest.
+    /// </summary>
+    [Serializable]
+    public class JobAck
+    {
+        public string jobId = string.Empty;
+        public bool   accepted;
+        public string reason  = string.Empty; // populated on rejection
+    }
+
+    // ---------------------------------------------------------------------------
+    // Job Status / Result
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Polling model: Master may GET /jobs/{id} to check current state.
+    /// </summary>
+    [Serializable]
+    public class JobStatus
+    {
+        public string   jobId          = string.Empty;
+        public JobState state          = JobState.Pending;
+        public int      currentFrame;
+        public int      totalFrames;
+        public string   message        = string.Empty;
+        public long     startedAtUtc;   // Unix epoch seconds
+        public long     updatedAtUtc;   // Unix epoch seconds
+    }
+
+    /// <summary>
+    /// Final summary sent when a job reaches Completed or Failed state.
+    /// </summary>
+    [Serializable]
+    public class JobResult
+    {
+        public string jobId      = string.Empty;
+        public bool   success;
+        public int    exitCode;
+        public string logTail   = string.Empty; // last N lines of Editor.log
+        public string errorText = string.Empty;
+        public long   durationSeconds;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Health / Discovery
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Response from GET /health.
+    /// </summary>
+    [Serializable]
+    public class WorkerHealth
+    {
+        public bool   alive = true;
+        public string unityVersion      = string.Empty;
+        public string recorderVersion   = string.Empty;
+        public string currentJobId      = string.Empty; // empty if idle
+        public JobState currentJobState = JobState.Pending;
+        public int    jobsProcessed;
+        public long   uptimeSeconds;
+    }
+
+    // ---------------------------------------------------------------------------
+    // File listing (for result pull)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Response from GET /jobs/{id}/files.
+    /// </summary>
+    [Serializable]
+    public class FileListResponse
+    {
+        public string jobId = string.Empty;
+        public List<FileEntry> files = new List<FileEntry>();
+    }
+
+    [Serializable]
+    public class FileEntry
+    {
+        /// <summary>Filename only (no directory component).</summary>
+        public string name     = string.Empty;
+        public long   sizeBytes;
+        public string mimeType = string.Empty;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Progress (WebSocket push)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Pushed over WebSocket /jobs/{id}/progress as line-delimited JSON.
+    /// </summary>
+    [Serializable]
+    public class ProgressEvent
+    {
+        public string   jobId        = string.Empty;
+        public JobState state        = JobState.Running;
+        public int      currentFrame;
+        public int      totalFrames;
+        public string   message      = string.Empty;
+        public long     timestampUtc; // Unix epoch seconds
+    }
+
+    // ---------------------------------------------------------------------------
+    // Serialization helpers
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Thin wrapper around JsonUtility for protocol DTO serialization.
+    /// </summary>
+    public static class ProtocolSerializer
+    {
+        public static string Serialize<T>(T obj)   => JsonUtility.ToJson(obj);
+        public static T      Deserialize<T>(string json) => JsonUtility.FromJson<T>(json);
+    }
+}

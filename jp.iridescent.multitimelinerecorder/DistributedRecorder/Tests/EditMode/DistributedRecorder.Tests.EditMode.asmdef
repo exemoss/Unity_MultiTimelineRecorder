@@ -1,0 +1,25 @@
+{
+    "name": "DistributedRecorder.Tests.EditMode",
+    "rootNamespace": "DistributedRecorder.Tests",
+    "references": [
+        "DistributedRecorder.Editor",
+        "DistributedRecorder.Editor.Setup",
+        "Unity.Recorder.Editor",
+        "Unity.Timeline",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
