@@ -4,6 +4,9 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using UnityEngine;
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
 
 namespace DistributedRecorder.Shared
 {
@@ -85,6 +88,122 @@ namespace DistributedRecorder.Shared
             }
 
             return BytesToHex(accum.Finalise());
+        }
+
+        // -----------------------------------------------------------------------
+        // Job-scope hash  (timeline + dependencies + scene only)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Computes a deterministic SHA-256 hash of the recording-relevant assets
+        /// for a <em>specific Timeline job</em>: the Timeline asset itself, the scene
+        /// file, and all transitive non-script dependencies of those two files as
+        /// reported by <c>AssetDatabase.GetDependencies</c>.
+        ///
+        /// Script dependencies (.cs / .dll) are excluded because they are managed by
+        /// the package and should be identical across machines when the same package
+        /// version is installed.  Changes to code that do not affect the recorded
+        /// output should not invalidate the hash.
+        ///
+        /// Excluded extensions: .cs, .dll, .pdb, .mdb, .xml (documentation).
+        /// Included: .playable, .unity, .anim, .mat, .asset, .png, .jpg, .jpeg,
+        ///           .exr, .tga, .hdr, .tiff, .psd, .wav, .mp3, .ogg, .fbx,
+        ///           .obj, .prefab, .shader, .hlsl, .cginc, .shadergraph,
+        ///           .spriteatlas, .mask, .controller, .overrideController,
+        ///           .renderTexture, .flare, .guiskin, .fontsettings, .cubemap,
+        ///           .giparams (and any unknown extension not in the exclude list).
+        ///
+        /// This method is Editor-only (requires AssetDatabase).
+        /// </summary>
+        /// <param name="timelineAssetPath">Project-relative path, e.g. "Assets/Shot01.playable".</param>
+        /// <param name="scenePath">Project-relative scene path, e.g. "Assets/Scenes/Main.unity".</param>
+        /// <returns>64-char lowercase hex SHA-256 digest.</returns>
+#if UNITY_EDITOR
+        public static string ComputeJobScope(string timelineAssetPath, string scenePath)
+        {
+            if (string.IsNullOrEmpty(timelineAssetPath))
+                throw new ArgumentException("timelineAssetPath must not be empty.", nameof(timelineAssetPath));
+            if (string.IsNullOrEmpty(scenePath))
+                throw new ArgumentException("scenePath must not be empty.", nameof(scenePath));
+
+            // Collect seed paths
+            var seeds = new[] { timelineAssetPath, scenePath };
+
+            // Gather all transitive dependencies for each seed
+            var allDeps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string seed in seeds)
+            {
+                allDeps.Add(seed);
+                foreach (string dep in AssetDatabase.GetDependencies(seed, recursive: true))
+                    allDeps.Add(dep);
+            }
+
+            // Exclude script-code files (they are identical across machines given the same package)
+            var filteredPaths = new List<string>();
+            foreach (string dep in allDeps)
+            {
+                if (!IsScriptDependency(dep))
+                    filteredPaths.Add(dep);
+            }
+
+            // Convert project-relative paths ("Assets/...") to absolute paths
+            string projectRoot = System.IO.Path.GetDirectoryName(Application.dataPath);
+            var absolutePaths = new List<string>();
+            foreach (string rel in filteredPaths)
+            {
+                // AssetDatabase paths are already project-relative (e.g. "Assets/foo.playable")
+                // Combine with projectRoot to get the absolute path.
+                string abs = System.IO.Path.Combine(projectRoot, rel).Replace('\\', '/');
+                if (System.IO.File.Exists(abs))
+                    absolutePaths.Add(abs);
+            }
+
+            return ComputeFromPaths(absolutePaths, projectRoot);
+        }
+#endif
+
+        /// <summary>
+        /// Internal overload for unit testing: accepts the dependency paths directly
+        /// (no AssetDatabase call) so tests can be fully hermetic.
+        /// </summary>
+        /// <param name="dependencyPaths">
+        /// Absolute file paths that constitute the job scope.
+        /// Corresponds to the filtered dependency set that would be collected by
+        /// <see cref="ComputeJobScope"/> in production code.
+        /// </param>
+        /// <param name="baseRoot">
+        /// Root used to compute relative path keys (for sort stability).
+        /// </param>
+        internal static string ComputeJobScopeFromPaths(
+            IEnumerable<string> dependencyPaths, string baseRoot)
+        {
+            return ComputeFromPaths(dependencyPaths, baseRoot);
+        }
+
+        /// <summary>
+        /// Returns <c>true</c> when <paramref name="assetPath"/> is a script or
+        /// compiled binary that should be excluded from the job-scope hash.
+        ///
+        /// Excluded: .cs, .dll, .pdb, .mdb, .xml (standalone documentation files).
+        /// </summary>
+        internal static bool IsScriptDependency(string assetPath)
+        {
+            if (string.IsNullOrEmpty(assetPath)) return false;
+            string ext = System.IO.Path.GetExtension(assetPath);
+            if (string.IsNullOrEmpty(ext)) return false;
+            switch (ext.ToLowerInvariant())
+            {
+                case ".cs":
+                case ".dll":
+                case ".pdb":
+                case ".mdb":
+                // .asmdef files define assembly layout, not recording input
+                case ".asmdef":
+                case ".asmref":
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         // --- helpers ------------------------------------------------------------
