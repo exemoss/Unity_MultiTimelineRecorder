@@ -396,4 +396,274 @@ namespace DistributedRecorder.Tests
                 $"Full fidelity request should be accepted. Reason: {reason}");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // InputValidator: effectiveWidth / effectiveHeight / effectiveFrameRate
+    //                 range validation (Major 2 fix)
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Covers the range checks added for effectiveWidth, effectiveHeight and
+    /// effectiveFrameRate (review iteration 3, Major 2).
+    ///
+    /// Sentinel value 0 means "use recorderConfigJson value" and must pass.
+    /// Non-zero values outside the accepted range must be rejected.
+    /// </summary>
+    [TestFixture]
+    public class InputValidatorEffectiveSizeTests
+    {
+        // MTR fidelity path request (timelineAssetPath present).
+        private static JobRequest MakeValidMtrRequest()
+        {
+            return new JobRequest
+            {
+                jobId                   = "abc123",
+                recorderSettingsAssetPath = string.Empty,
+                scenePath               = "Assets/Scenes/Main.unity",
+                timelineAssetPath       = "Assets/Timelines/Shot01.playable",
+                projectHash             = new string('a', 64),
+                masterUnityVersion      = "6000.2.10f1",
+                masterRecorderVersion   = "5.1.2",
+                effectiveWidth          = 1920,
+                effectiveHeight         = 1080,
+                effectiveFrameRate      = 24.0
+            };
+        }
+
+        // --- effectiveWidth -------------------------------------------------
+
+        [Test]
+        public void Validate_EffectiveWidth_NominalValue_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveWidth = 1920;
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveWidth_SentinelZero_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveWidth = 0; // 0 = use recorderConfigJson value
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveWidth_MinBoundary_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveWidth = 1;
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveWidth_MaxBoundary_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveWidth = 16384;
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveWidth_TooLarge_IsRejected()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveWidth = 16385;
+            Assert.IsFalse(InputValidator.Validate(req, out string reason));
+            StringAssert.Contains("effectiveWidth", reason);
+        }
+
+        [Test]
+        public void Validate_EffectiveWidth_Negative_IsRejected()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveWidth = -1;
+            Assert.IsFalse(InputValidator.Validate(req, out string reason));
+            StringAssert.Contains("effectiveWidth", reason);
+        }
+
+        // --- effectiveHeight ------------------------------------------------
+
+        [Test]
+        public void Validate_EffectiveHeight_NominalValue_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveHeight = 1080;
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveHeight_SentinelZero_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveHeight = 0;
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveHeight_TooLarge_IsRejected()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveHeight = 16385;
+            Assert.IsFalse(InputValidator.Validate(req, out string reason));
+            StringAssert.Contains("effectiveHeight", reason);
+        }
+
+        [Test]
+        public void Validate_EffectiveHeight_Negative_IsRejected()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveHeight = -1;
+            Assert.IsFalse(InputValidator.Validate(req, out string reason));
+            StringAssert.Contains("effectiveHeight", reason);
+        }
+
+        // --- effectiveFrameRate ---------------------------------------------
+
+        [Test]
+        public void Validate_EffectiveFrameRate_NominalValue_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveFrameRate = 24.0;
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveFrameRate_SentinelZero_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveFrameRate = 0.0; // 0 = use recorderConfigJson value
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveFrameRate_MaxBoundary_IsAccepted()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveFrameRate = 240.0;
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_EffectiveFrameRate_TooHigh_IsRejected()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveFrameRate = 241.0;
+            Assert.IsFalse(InputValidator.Validate(req, out string reason));
+            StringAssert.Contains("effectiveFrameRate", reason);
+        }
+
+        [Test]
+        public void Validate_EffectiveFrameRate_Negative_IsRejected()
+        {
+            var req = MakeValidMtrRequest();
+            req.effectiveFrameRate = -1.0;
+            Assert.IsFalse(InputValidator.Validate(req, out string reason));
+            StringAssert.Contains("effectiveFrameRate", reason);
+        }
+
+        // --- non-MTR path: effective fields are NOT validated ---------------
+
+        [Test]
+        public void Validate_NonMtrPath_OversizedEffectiveWidth_IsAccepted()
+        {
+            // When timelineAssetPath and recorderConfigJson are both empty,
+            // effectiveWidth/Height/FrameRate are not validated.
+            var req = new JobRequest
+            {
+                jobId                     = "abc123",
+                recorderSettingsAssetPath = "Assets/Recorders/MyRecorder.asset",
+                scenePath                 = "Assets/Scenes/Main.unity",
+                projectHash               = new string('a', 64),
+                masterUnityVersion        = "6000.2.10f1",
+                masterRecorderVersion     = "5.1.2",
+                effectiveWidth            = 99999 // would be rejected on MTR path
+            };
+            Assert.IsTrue(InputValidator.Validate(req, out _));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // InputValidator: imageFormat restored enum whitelist (Minor fix)
+    // These tests cover the DistributedWorkerBridge whitelist gate which runs
+    // on the Worker side after JsonUtility.FromJson.  Since that gate is in
+    // UNITY_RECORDER guarded code we cannot call it from an Edit-Mode hermetic
+    // test.  We instead verify the ValidateRecorderJobConfig path (which uses
+    // DistImageFormat) and document the DistributedWorkerBridge expectation.
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Covers the <c>imageFormat</c> / <c>recorderType</c> enum whitelist
+    /// validation in <see cref="InputValidator.ValidateRecorderJobConfig"/>.
+    ///
+    /// The parallel whitelist in <see cref="DistributedWorkerBridge"/> (for
+    /// the restored <c>RecorderConfigItem.imageFormat</c>) is exercised by
+    /// the existing <c>RecorderSettingsBuilderSharedTests</c> (UNITY_RECORDER).
+    /// </summary>
+    [TestFixture]
+    public class InputValidatorEnumWhitelistTests
+    {
+        private static RecorderJobConfig MakeValidImageConfig()
+        {
+            return new RecorderJobConfig
+            {
+                recorderType  = DistRecorderType.Image,
+                imageFormat   = DistImageFormat.PNG, // known valid
+                width         = 1920,
+                height        = 1080,
+                frameRate     = 24.0,
+                takeNumber    = 0
+            };
+        }
+
+        // --- recorderType ---------------------------------------------------
+
+        [Test]
+        public void ValidateRecorderJobConfig_KnownRecorderType_IsAccepted()
+        {
+            var cfg = MakeValidImageConfig();
+            cfg.recorderType = DistRecorderType.Image;
+            Assert.IsTrue(InputValidator.ValidateRecorderJobConfig(cfg, out _));
+        }
+
+        [Test]
+        public void ValidateRecorderJobConfig_UnknownRecorderType_IsRejected()
+        {
+            var cfg = MakeValidImageConfig();
+            cfg.recorderType = (DistRecorderType)9999; // not in enum
+            Assert.IsFalse(InputValidator.ValidateRecorderJobConfig(cfg, out string reason));
+            StringAssert.Contains("recorderType", reason);
+        }
+
+        // --- imageFormat ----------------------------------------------------
+
+        [Test]
+        public void ValidateRecorderJobConfig_KnownImageFormat_IsAccepted()
+        {
+            var cfg = MakeValidImageConfig();
+            cfg.imageFormat = DistImageFormat.JPEG;
+            Assert.IsTrue(InputValidator.ValidateRecorderJobConfig(cfg, out _));
+        }
+
+        [Test]
+        public void ValidateRecorderJobConfig_UnknownImageFormat_IsRejected()
+        {
+            var cfg = MakeValidImageConfig();
+            cfg.imageFormat = (DistImageFormat)9999; // not in enum
+            Assert.IsFalse(InputValidator.ValidateRecorderJobConfig(cfg, out string reason));
+            StringAssert.Contains("imageFormat", reason);
+        }
+
+        [Test]
+        public void ValidateRecorderJobConfig_ImageFormatUnknown_OnImageType_IsRejected()
+        {
+            // imageFormat whitelist must be checked when recorderType == Image.
+            // This verifies that an unknown imageFormat (on the Image path) is rejected.
+            var cfg = MakeValidImageConfig();
+            cfg.recorderType = DistRecorderType.Image;
+            cfg.imageFormat  = (DistImageFormat)9999; // unknown value, must fail
+            Assert.IsFalse(InputValidator.ValidateRecorderJobConfig(cfg, out string reason));
+            StringAssert.Contains("imageFormat", reason);
+        }
+    }
 }
