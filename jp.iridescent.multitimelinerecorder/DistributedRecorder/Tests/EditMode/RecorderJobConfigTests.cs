@@ -437,6 +437,7 @@ namespace DistributedRecorder.Tests
             timelineAssetPath         = "Assets/Timelines/Shot01.playable",
             directorObjectName        = "ShotDirector",
             outputSubDir              = "shot01",
+            recorderConfigJson        = "{\"name\":\"Image\",\"enabled\":true}",
             recorderConfig            = new RecorderJobConfig
             {
                 recorderType     = DistRecorderType.Image,
@@ -481,6 +482,7 @@ namespace DistributedRecorder.Tests
                 startTime                 = 1.0,
                 endTime                   = 5.0,
                 outputSubDir              = "a1b2c3d4e5f64a3b8c9d0e1f2a3b4c5d",
+                recorderConfigJson        = "{\"name\":\"Image\",\"enabled\":true}",
                 recorderConfig            = new RecorderJobConfig
                 {
                     recorderType     = DistRecorderType.Image,
