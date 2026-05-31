@@ -226,6 +226,94 @@ namespace DistributedRecorder.Tests
         }
 
         // -----------------------------------------------------------------------
+        // InputValidator – dispatchTimestamp (worker-recording-fix)
+        // -----------------------------------------------------------------------
+
+        [Test]
+        public void Validate_DispatchTimestamp_ValidFormat_Passes()
+        {
+            var req = MakeValidRequest();
+            req.dispatchTimestamp = "20260101120000"; // 14 decimal digits
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsTrue(ok, reason);
+        }
+
+        [Test]
+        public void Validate_DispatchTimestamp_Empty_Passes()
+        {
+            // Empty = legacy path; should pass validation
+            var req = MakeValidRequest();
+            req.dispatchTimestamp = string.Empty;
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsTrue(ok, reason);
+        }
+
+        [Test]
+        public void Validate_DispatchTimestamp_WrongLength_Fails()
+        {
+            var req = MakeValidRequest();
+            req.dispatchTimestamp = "202601011200"; // only 12 chars
+            Assert.IsFalse(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_DispatchTimestamp_ContainsNonDigit_Fails()
+        {
+            var req = MakeValidRequest();
+            req.dispatchTimestamp = "2026010112000a"; // 'a' is not a digit
+            Assert.IsFalse(InputValidator.Validate(req, out _));
+        }
+
+        [Test]
+        public void Validate_DispatchTimestamp_ContainsPathSeparator_Fails()
+        {
+            var req = MakeValidRequest();
+            req.dispatchTimestamp = "20260101120/00"; // '/' is a path separator, not a digit
+            Assert.IsFalse(InputValidator.Validate(req, out _));
+        }
+
+        // -----------------------------------------------------------------------
+        // SanitizeTimelineName tests (worker-recording-fix)
+        // -----------------------------------------------------------------------
+
+        [Test]
+        [TestCase("Director_A",          "Director_A")]
+        [TestCase("Shot 01",             "Shot 01")]
+        [TestCase("../traversal",        ".._traversal")] // slash replaced with '_', dots preserved
+        [TestCase("bad/path",            "bad_path")]     // slash replaced
+        [TestCase("bad\\path",           "bad_path")]     // backslash replaced
+        [TestCase("bad:name",            "bad_name")]     // colon replaced
+        [TestCase("",                    "Timeline")]     // empty fallback
+        [TestCase("   ",                 "Timeline")]     // whitespace-only fallback
+        [TestCase("..",                  "__")]           // exact ".." replaced
+        [TestCase(".",                   "__")]           // exact "." replaced
+        public void SanitizeTimelineName_Various(string input, string expected)
+        {
+            // Test via the Master-side helper (public static)
+            string result = Unity.MultiTimelineRecorder.MultiTimelineRecorder.SanitizeTimelineName(input);
+            Assert.AreEqual(expected, result, $"input='{input}'");
+        }
+
+        // -----------------------------------------------------------------------
+        // JobStore.SanitiseTimelineName matches Master.SanitizeTimelineName
+        // -----------------------------------------------------------------------
+
+        [Test]
+        [TestCase("Director_A")]
+        [TestCase("Shot 01")]
+        [TestCase("bad/path")]
+        [TestCase("")]
+        [TestCase("..")]
+        public void SanitiseTimelineName_WorkerAndMasterProduceSameResult(string input)
+        {
+            // Both sides must produce identical output for F7 (output path consistency)
+            string master = Unity.MultiTimelineRecorder.MultiTimelineRecorder.SanitizeTimelineName(input);
+            string worker = DistributedRecorder.Worker.JobStore.SanitiseTimelineName(input);
+            Assert.AreEqual(master, worker,
+                $"input='{input}': Master='{master}' Worker='{worker}'");
+        }
+
+        // -----------------------------------------------------------------------
         // Helpers
         // -----------------------------------------------------------------------
 
