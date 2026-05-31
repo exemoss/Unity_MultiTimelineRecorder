@@ -330,6 +330,13 @@ namespace DistributedRecorder.Setup
             if (mat != null)
                 cube.GetComponent<Renderer>().sharedMaterial = mat;
 
+            // An AnimationTrack drives its bound GameObject through an Animator. Without an
+            // Animator the track cannot be previewed/scrubbed in the Timeline window (and in
+            // Play Mode Unity would only auto-create one implicitly). Attach it explicitly so
+            // the sample plays both in the editor preview and during recording.
+            if (cube.GetComponent<Animator>() == null)
+                cube.AddComponent<Animator>();
+
             // PlayableDirector
             var dirGo    = new GameObject(directorName);
             var director = dirGo.AddComponent<PlayableDirector>();
