@@ -155,6 +155,18 @@ namespace DistributedRecorder.Worker
                 clipDuration = timeline.duration > 0.0 ? timeline.duration : 1.0;
             }
 
+            // Remove any pre-existing RecorderTracks first. Sample timelines ship with a
+            // baked RecorderClip (e.g. MtrMultiTimelineSampleFactory writes one whose
+            // OutputFile is the fixed "Recordings/_mtr_sample/..."), and leaving it in place
+            // means TWO recorders run during Play Mode: the baked one writes to its own path
+            // while this job's output never lands where the Master collects it. Strip them so
+            // only this job's recorder runs and writes to the per-job output path.
+            var tracksToRemove = new System.Collections.Generic.List<UnityEngine.Timeline.TrackAsset>();
+            foreach (var existing in timeline.GetOutputTracks())
+                if (existing is RecorderTrack) tracksToRemove.Add(existing);
+            foreach (var t in tracksToRemove)
+                timeline.DeleteTrack(t);
+
             // Create a dedicated RecorderTrack for this distributed job.
             // Naming convention makes it identifiable for cleanup / debugging.
             var recorderTrack = timeline.CreateTrack<RecorderTrack>(null, "[DistributedRecorder]");
