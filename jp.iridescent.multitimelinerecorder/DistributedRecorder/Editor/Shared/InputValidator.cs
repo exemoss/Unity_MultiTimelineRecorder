@@ -28,11 +28,10 @@ namespace DistributedRecorder.Shared
         private const int MaxFileNameTemplateLength = 256;
 
         // RecorderJobConfig range constraints
-        private const int   MinResolution   = 1;
-        private const int   MaxResolution   = 16384;
-        private const double MinFrameRate   = double.Epsilon;  // > 0
+        private const int    MinResolution  = 1;
+        private const int    MaxResolution  = 16384;
         private const double MaxFrameRate   = 240.0;
-        private const int   MinTakeNumber   = 0;
+        private const int    MinTakeNumber  = 0;
 
         /// <summary>
         /// Validates a <see cref="JobRequest"/>.
@@ -60,13 +59,33 @@ namespace DistributedRecorder.Shared
             }
 
             // recorderSettingsAssetPath
-            if (!ValidateRequiredString(request.recorderSettingsAssetPath,
-                    "recorderSettingsAssetPath", MaxAssetPathLength, out reason))
-                return false;
-            if (!IsRelativeSafePath(request.recorderSettingsAssetPath))
+            // Optional on the MTR path (recorderConfig is used instead).
+            // - When non-empty: must be a valid relative path (backward compat with legacy Masters).
+            // - When empty: allowed only when recorderConfig is provided (MTR path).
+            //   If both recorderSettingsAssetPath AND recorderConfig.timelineAssetPath are absent,
+            //   the recording target is unknown — reject.
+            if (!string.IsNullOrEmpty(request.recorderSettingsAssetPath))
             {
-                reason = "recorderSettingsAssetPath must be a relative path inside the project and must not contain '..'.";
-                return false;
+                if (request.recorderSettingsAssetPath.Length > MaxAssetPathLength)
+                {
+                    reason = $"Field 'recorderSettingsAssetPath' exceeds maximum length of {MaxAssetPathLength}.";
+                    return false;
+                }
+                if (!IsRelativeSafePath(request.recorderSettingsAssetPath))
+                {
+                    reason = "recorderSettingsAssetPath must be a relative path inside the project and must not contain '..'.";
+                    return false;
+                }
+            }
+            else
+            {
+                // recorderSettingsAssetPath is empty: require timelineAssetPath (MTR path) to be
+                // non-empty so we know the recording target.
+                if (string.IsNullOrEmpty(request.timelineAssetPath))
+                {
+                    reason = "Either 'recorderSettingsAssetPath' or 'timelineAssetPath' must be provided — recording target is unknown.";
+                    return false;
+                }
             }
 
             // scenePath
