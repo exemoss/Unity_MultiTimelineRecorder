@@ -275,7 +275,7 @@ namespace DistributedRecorder.Worker
             // ----- Preflight A4: RecorderTrack / RecorderClip / settings? ---
             var timelineAsset = preflightDirector.playableAsset as TimelineAsset;
 
-            RecorderClip preflightRecorderClip;
+            RecorderClip preflightRecorderClip = null;
 
             if (isMtrPath && request.recorderConfig != null)
             {
