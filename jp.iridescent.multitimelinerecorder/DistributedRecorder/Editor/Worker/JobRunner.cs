@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using DistributedRecorder.Shared;
 using UnityEditor;
@@ -108,6 +109,20 @@ namespace DistributedRecorder.Worker
         // Timeline frame rate stored at preflight to avoid circular re-calculation
         // in HandleDirectorPlayback (WARN: progress fps re-computation).
         private double _recordingFps;
+
+        // ---- worker-recording-fix: MTR headless pipeline state ----
+
+        // When true, the current job uses the MTR headless render pipeline
+        // (RenderingData + PlayModeTimelineRenderer + STR_* EditorPrefs).
+        // Completion is detected via STR_IsRenderingComplete polling rather than
+        // director.stopped (MTR creates a dynamic RenderingDirector in Play Mode
+        // that the Worker cannot reference from Edit Mode context).
+        private bool _isHeadlessPath;
+
+        // Preflight state for other-director suppression (requirement B).
+        // Saved so we can restore in cleanup regardless of success/failure.
+        private Dictionary<PlayableDirector, bool> _savedPlayOnAwakeValues;
+        private List<(TrackAsset track, bool wasMuted)> _savedRecorderTrackMutes;
 
         // ------------------------------------------------------------------
         // Constructor
@@ -374,51 +389,6 @@ namespace DistributedRecorder.Worker
                 AppendE2ELog($"[JobRunner] 出力先を設定 (legacy): {outputTemplate}");
             }
 
-            // ----- B: Create persistent temp render timeline (MTR path only) ----------------
-            // The settings ScriptableObject must be a persistent sub-asset before Play Mode so
-            // the Timeline Recorder can drive it reliably (transient objects are unreliable
-            // across the domain boundary – the root cause of the "0 frames" bug).
-            // The temp timeline is bound to the director IN PLACE OF the source timeline, so
-            // the source timeline is never mutated. It is deleted unconditionally after recording.
-            if (isMtrPath && builtSettings != null)
-            {
-                double duration = sourceTimeline != null ? sourceTimeline.duration : 5.0;
-                try
-                {
-                    _tempTimelineAssetPath = WorkerRenderTimelineFactory.Create(
-                        builtSettings, duration,
-                        request.startTime, request.endTime,
-                        request.jobId);
-                }
-                catch (Exception ex)
-                {
-                    // builtSettings ownership passed to factory; may be partially embedded.
-                    // Attempt cleanup before failing.
-                    if (!string.IsNullOrEmpty(_tempTimelineAssetPath))
-                    {
-                        WorkerRenderTimelineFactory.Delete(_tempTimelineAssetPath);
-                        _tempTimelineAssetPath = null;
-                    }
-                    FailJob(request.jobId,
-                        $"[B] temp render timeline の作成に失敗しました: {ex.Message}");
-                    return;
-                }
-
-                // Load the newly created temp timeline and bind it to the director.
-                var tempTimeline = AssetDatabase.LoadAssetAtPath<TimelineAsset>(_tempTimelineAssetPath);
-                if (tempTimeline == null)
-                {
-                    WorkerRenderTimelineFactory.Delete(_tempTimelineAssetPath);
-                    _tempTimelineAssetPath = null;
-                    FailJob(request.jobId,
-                        $"[B] 作成した temp timeline を再ロードできませんでした: {_tempTimelineAssetPath}");
-                    return;
-                }
-
-                preflightDirector.playableAsset = tempTimeline;
-                AppendE2ELog($"[JobRunner] temp render timeline をディレクターにバインド: {_tempTimelineAssetPath}");
-            }
-
             // ----- Estimate total frames from source Timeline ---------------------------------
             // Use source timeline duration (pre-binding) so frame count is correct even when
             // the temp timeline has the same duration but was created independently.
@@ -446,6 +416,72 @@ namespace DistributedRecorder.Worker
             _preflightDirectorName = preflightDirector.name;
             Debug.Log($"[JobRunner] ジョブ '{request.jobId}' — Play Mode に入ります。director='{preflightDirector.name}'");
 
+            // ----- B: MTR headless pipeline OR legacy temp render timeline ---------------
+
+            if (isMtrPath && builtSettings != null &&
+                FidelityBuilderRegistry.OnStartHeadlessRender != null)
+            {
+                // worker-recording-fix: use MTR headless render pipeline
+                // (ControlTrack + RenderingData/PlayModeTimelineRenderer = same pipeline as local MTR)
+
+                // B-1: Suppress other directors and mute stray RecorderTracks (requirement B)
+                SuppressOtherDirectorsAndMuteRecorderTracks(preflightDirector, allDirectors);
+
+                // B-2: Start MTR headless render (builds temp timeline, injects scene components,
+                //      enters Play Mode). The delegate sets EditorApplication.isPlaying = true.
+                _isHeadlessPath = true;
+                _tempTimelineAssetPath = FidelityBuilderRegistry.OnStartHeadlessRender(
+                    preflightDirector, builtSettings, durationSec, _recordingFps,
+                    out string headlessError);
+
+                if (string.IsNullOrEmpty(_tempTimelineAssetPath))
+                {
+                    RestoreDirectorAndTrackState();
+                    FailJob(request.jobId,
+                        $"[B] MTR headless render の開始に失敗しました: {headlessError}");
+                    return;
+                }
+
+                AppendE2ELog($"[JobRunner] MTR headless render 開始。tempAsset='{_tempTimelineAssetPath}'");
+            }
+            else if (isMtrPath && builtSettings != null)
+            {
+                // Fallback: legacy WorkerRenderTimelineFactory (no ControlTrack; kept for safety)
+                _isHeadlessPath = false;
+                double duration = sourceTimeline != null ? sourceTimeline.duration : 5.0;
+                try
+                {
+                    _tempTimelineAssetPath = WorkerRenderTimelineFactory.Create(
+                        builtSettings, duration,
+                        request.startTime, request.endTime,
+                        request.jobId);
+                }
+                catch (Exception ex)
+                {
+                    if (!string.IsNullOrEmpty(_tempTimelineAssetPath))
+                    {
+                        WorkerRenderTimelineFactory.Delete(_tempTimelineAssetPath);
+                        _tempTimelineAssetPath = null;
+                    }
+                    FailJob(request.jobId,
+                        $"[B] temp render timeline の作成に失敗しました: {ex.Message}");
+                    return;
+                }
+
+                var tempTimeline = AssetDatabase.LoadAssetAtPath<TimelineAsset>(_tempTimelineAssetPath);
+                if (tempTimeline == null)
+                {
+                    WorkerRenderTimelineFactory.Delete(_tempTimelineAssetPath);
+                    _tempTimelineAssetPath = null;
+                    FailJob(request.jobId,
+                        $"[B] 作成した temp timeline を再ロードできませんでした: {_tempTimelineAssetPath}");
+                    return;
+                }
+
+                preflightDirector.playableAsset = tempTimeline;
+                AppendE2ELog($"[JobRunner] temp render timeline をディレクターにバインド: {_tempTimelineAssetPath}");
+            }
+
             // ----- Subscribe to state change and enter Play Mode ------------
             _phase             = RecordingPhase.WaitingForPlayMode;
             _playModeEnteredAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -460,11 +496,18 @@ namespace DistributedRecorder.Worker
             // and the recording fails. Reset to 0 so each job starts from a clean state.
             UnityEngine.Time.captureFramerate = 0;
 
-            // playModeStateChanged fires for EnteredPlayMode so we can re-acquire director.
+            // For the headless path, EditorApplication.isPlaying is set inside OnStartHeadlessRender.
+            // For the legacy path, we call EnterPlaymode here.
+            // Either way, playModeStateChanged fires for EnteredPlayMode.
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             EditorApplication.update               += OnUpdate;
 
-            EditorApplication.EnterPlaymode();
+            if (!_isHeadlessPath)
+            {
+                // Legacy / fallback path: enter Play Mode explicitly.
+                EditorApplication.EnterPlaymode();
+            }
+            // Note: headless path already called EditorApplication.isPlaying = true inside the delegate.
 #else
             FailJob(request.jobId,
                 "com.unity.recorder パッケージがインストールされていません。");
@@ -480,9 +523,28 @@ namespace DistributedRecorder.Worker
         {
             if (state == PlayModeStateChange.EnteredPlayMode)
             {
-                // Re-acquire PlayableDirector from the scene.
-                // NEVER use the reference from preflight — Unity Objects may be
-                // invalid after the Play Mode domain boundary even with Reload OFF.
+                if (_isHeadlessPath)
+                {
+                    // MTR headless path: PlayModeTimelineRenderer drives recording.
+                    // We only need to confirm Play Mode entry and transition to polling.
+                    // Do NOT call director.Play() — PlayModeTimelineRenderer.Start() does it.
+                    _phase              = RecordingPhase.DirectorPlayback;
+                    _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    _lastKnownFrame     = 0;
+
+                    AppendE2ELog("[JobRunner] Play Mode に入りました（MTR headless）。STR_* ポーリング開始。");
+
+                    _progress.Push(new ProgressEvent
+                    {
+                        jobId        = _runningJobId,
+                        state        = JobState.Running,
+                        message      = "Play Mode 突入 — MTR headless 録画開始",
+                        timestampUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                    });
+                    return;
+                }
+
+                // Legacy / fallback path: re-acquire PlayableDirector and call Play().
                 var directors = UnityEngine.Object.FindObjectsByType<PlayableDirector>(
                     FindObjectsInactive.Include, FindObjectsSortMode.None);
 
@@ -619,6 +681,14 @@ namespace DistributedRecorder.Worker
 
         private void HandleDirectorPlayback()
         {
+            if (_isHeadlessPath)
+            {
+                HandleHeadlessPlayback();
+                return;
+            }
+
+            // ---- Legacy / fallback path: director.stopped event-based ----
+
             if (_director == null)
             {
                 UnsubscribeAll();
@@ -674,6 +744,79 @@ namespace DistributedRecorder.Worker
                         $"[A5] 録画フレームが {StallTimeoutSeconds}秒間進みませんでした。" +
                         "GameView が初期化されていない可能性があります。" +
                         "batchmode では GameView が初期化されないためフレームを取得できません。");
+                    EditorApplication.ExitPlaymode();
+                    return;
+                }
+            }
+
+            _store.UpdateStatus(_runningJobId, s =>
+            {
+                s.state        = JobState.Running;
+                s.currentFrame = currentFrame;
+                s.totalFrames  = _recordingTotalFrames;
+            });
+
+            _progress.Push(new ProgressEvent
+            {
+                jobId        = _runningJobId,
+                state        = JobState.Running,
+                currentFrame = currentFrame,
+                totalFrames  = _recordingTotalFrames,
+                timestampUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            });
+        }
+
+        /// <summary>
+        /// Handles the DirectorPlayback phase for the MTR headless render path.
+        ///
+        /// Instead of polling <c>director.stopped</c> (which is a dynamic object created
+        /// by <c>PlayModeTimelineRenderer</c> and not accessible from Edit Mode context),
+        /// this method polls the <c>STR_IsRenderingComplete</c> EditorPref written by
+        /// <c>PlayModeTimelineRenderer.OnRenderingComplete</c>.
+        ///
+        /// Progress is read from <c>STR_Progress</c> (0..1 float).
+        /// Play Mode exit is handled by <c>PlayModeTimelineRenderer</c> itself
+        /// (via <c>STR_AutoExitPlayMode=true</c>); we just wait for isPlaying==false
+        /// in <see cref="HandleWaitingForEditMode"/>.
+        /// </summary>
+        private void HandleHeadlessPlayback()
+        {
+            // Check for completion signal written by PlayModeTimelineRenderer
+            bool isComplete = EditorPrefs.GetBool("STR_IsRenderingComplete", false);
+            if (isComplete)
+            {
+                Debug.Log($"[JobRunner] STR_IsRenderingComplete=true を検出。MTR 録画完了 '{_runningJobId}'。");
+                AppendE2ELog("[JobRunner] MTR headless 録画完了（STR ポーリング）。Play Mode 退出を待ちます。");
+
+                // PlayModeTimelineRenderer will exit Play Mode via STR_AutoExitPlayMode.
+                // Transition to WaitingForEditMode so HandleWaitingForEditMode picks up
+                // the Edit Mode restore and finalizes the job.
+                _phase             = RecordingPhase.WaitingForEditMode;
+                _playModeEnteredAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                return;
+            }
+
+            // Read progress from STR_Progress (0..1)
+            float strProgress = EditorPrefs.GetFloat("STR_Progress", 0f);
+            int currentFrame = Mathf.Clamp(
+                Mathf.RoundToInt(strProgress * _recordingTotalFrames),
+                0, _recordingTotalFrames);
+
+            if (currentFrame != _lastKnownFrame)
+            {
+                _lastKnownFrame     = currentFrame;
+                _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            }
+            else if (_recordingTotalFrames > 0)
+            {
+                // Stall detection (same timeout as legacy path)
+                long stallElapsed = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - _stallCheckStartUtc;
+                if (stallElapsed > (long)StallTimeoutSeconds)
+                {
+                    UnsubscribeAll();
+                    FailJob(_runningJobId,
+                        $"[A5] MTR headless 録画フレームが {StallTimeoutSeconds}秒間進みませんでした。" +
+                        "GameView が初期化されていない可能性があります。");
                     EditorApplication.ExitPlaymode();
                     return;
                 }
@@ -920,6 +1063,7 @@ namespace DistributedRecorder.Worker
             _stallCheckStartUtc    = 0;
             _preflightDirectorName = null;
             _tempTimelineAssetPath = null;
+            _isHeadlessPath        = false;
 #if UNITY_RECORDER
             if (_director != null)
             {
@@ -928,6 +1072,10 @@ namespace DistributedRecorder.Worker
             }
 #endif
             _directorStopped = false;
+
+            // worker-recording-fix: clear preflight suppression state
+            _savedPlayOnAwakeValues  = null;
+            _savedRecorderTrackMutes = null;
         }
 
         private void UnsubscribeAll()
@@ -962,6 +1110,9 @@ namespace DistributedRecorder.Worker
         /// </summary>
         private void CleanupTempTimeline()
         {
+            // worker-recording-fix: restore director/track state before cleaning up asset
+            RestoreDirectorAndTrackState();
+
             if (string.IsNullOrEmpty(_tempTimelineAssetPath))
                 return;
 
@@ -971,7 +1122,20 @@ namespace DistributedRecorder.Worker
 #if UNITY_RECORDER
             try
             {
-                WorkerRenderTimelineFactory.Delete(pathToDelete);
+                if (_isHeadlessPath)
+                {
+                    // Headless path: use AssetDatabase.DeleteAsset directly
+                    // (same as WorkerRenderTimelineFactory.Delete but for the MTR temp folder path)
+                    if (AssetDatabase.LoadAssetAtPath<UnityEngine.Timeline.TimelineAsset>(pathToDelete) != null)
+                    {
+                        AssetDatabase.DeleteAsset(pathToDelete);
+                        Debug.Log($"[JobRunner] MTR headless temp timeline deleted: '{pathToDelete}'");
+                    }
+                }
+                else
+                {
+                    WorkerRenderTimelineFactory.Delete(pathToDelete);
+                }
             }
             catch (Exception ex)
             {
@@ -979,6 +1143,89 @@ namespace DistributedRecorder.Worker
                     $"[JobRunner] temp render timeline の削除中に例外が発生しました ({pathToDelete}): {ex.Message}");
             }
 #endif
+        }
+
+        // ------------------------------------------------------------------
+        // worker-recording-fix: preflight suppression helpers (requirement B)
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// Saves and suppresses all directors except <paramref name="targetDirector"/>
+        /// (sets <c>playOnAwake=false</c> and calls <c>Stop()</c> on non-targets),
+        /// and mutes all existing <see cref="UnityEditor.Recorder.Timeline.RecorderTrack"/>s
+        /// in every Timeline in the scene (to prevent stray outputs from baked Recorder clips).
+        ///
+        /// The saved state is restored by <see cref="RestoreDirectorAndTrackState"/>.
+        /// All changes are in-memory only; scene assets are not saved.
+        /// </summary>
+        private void SuppressOtherDirectorsAndMuteRecorderTracks(
+            PlayableDirector   targetDirector,
+            PlayableDirector[] allDirectors)
+        {
+            _savedPlayOnAwakeValues  = new Dictionary<PlayableDirector, bool>();
+            _savedRecorderTrackMutes = new List<(TrackAsset, bool)>();
+
+            foreach (var d in allDirectors)
+            {
+                if (d == null) continue;
+
+                // Save and suppress playOnAwake for all directors
+                _savedPlayOnAwakeValues[d] = d.playOnAwake;
+
+                if (d != targetDirector)
+                {
+                    d.playOnAwake = false;
+                    // Stop any that are currently playing (in Edit Mode this is a no-op but safe)
+                    try { d.Stop(); } catch { }
+                }
+
+                // Mute all RecorderTracks in this director's Timeline (in-memory only)
+                if (d.playableAsset is UnityEngine.Timeline.TimelineAsset tl)
+                {
+                    foreach (var track in tl.GetOutputTracks())
+                    {
+#if UNITY_RECORDER
+                        if (track is UnityEditor.Recorder.Timeline.RecorderTrack)
+                        {
+                            _savedRecorderTrackMutes.Add((track, track.muted));
+                            track.muted = true;
+                        }
+#endif
+                    }
+                }
+            }
+
+            Debug.Log(
+                $"[JobRunner] Suppressed {allDirectors.Length - 1} other director(s) and " +
+                $"muted {_savedRecorderTrackMutes.Count} RecorderTrack(s). Target='{targetDirector.name}'");
+        }
+
+        /// <summary>
+        /// Restores the director <c>playOnAwake</c> and RecorderTrack <c>muted</c> state
+        /// saved by <see cref="SuppressOtherDirectorsAndMuteRecorderTracks"/>.
+        /// Safe to call when no suppression state was saved (no-op).
+        /// </summary>
+        private void RestoreDirectorAndTrackState()
+        {
+            if (_savedPlayOnAwakeValues != null)
+            {
+                foreach (var kv in _savedPlayOnAwakeValues)
+                {
+                    if (kv.Key != null)
+                        kv.Key.playOnAwake = kv.Value;
+                }
+                _savedPlayOnAwakeValues = null;
+            }
+
+            if (_savedRecorderTrackMutes != null)
+            {
+                foreach (var (track, wasMuted) in _savedRecorderTrackMutes)
+                {
+                    if (track != null)
+                        track.muted = wasMuted;
+                }
+                _savedRecorderTrackMutes = null;
+            }
         }
 
         // ------------------------------------------------------------------
