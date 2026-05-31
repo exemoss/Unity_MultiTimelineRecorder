@@ -13,6 +13,9 @@ using UnityEditor.Recorder.Input;
 using UnityEditor.Recorder.Timeline;
 #endif
 
+// NOTE: MtrRecorderClipBuilder lives in the same assembly (DistributedRecorder.Editor)
+// and handles the UNITY_RECORDER guard internally, so no conditional using is needed here.
+
 namespace DistributedRecorder.Worker
 {
     /// <summary>
@@ -89,6 +92,10 @@ namespace DistributedRecorder.Worker
 
         // Flag set by the director.stopped event handler (may fire off the update pump).
         private bool _directorStopped;
+
+        // Director name captured at preflight so Play Mode handler can re-find it.
+        // When empty, the legacy "find any director" search is used.
+        private string _preflightDirectorName;
 
         // Play Mode timeout (configurable; HDRP shader compile can be slow)
         private const double PlayModeTimeoutSeconds  = 60.0;
@@ -199,16 +206,61 @@ namespace DistributedRecorder.Worker
             }
 
             // ----- Preflight A3: PlayableDirector exists? -------------------
-            var directors = UnityEngine.Object.FindObjectsByType<PlayableDirector>(
+            //
+            // MTR integration path (M2/M3):
+            //   When request.timelineAssetPath is set, we look for the director
+            //   specified by directorHierarchyPath or directorObjectName and bind
+            //   the specified Timeline to it.
+            //
+            // Legacy fallback path:
+            //   When timelineAssetPath is empty, the original "find any director
+            //   with a TimelineAsset" behavior is preserved (backward compat).
+
+            var allDirectors = UnityEngine.Object.FindObjectsByType<PlayableDirector>(
                 FindObjectsInactive.Include, FindObjectsSortMode.None);
 
             PlayableDirector preflightDirector = null;
-            foreach (var d in directors)
+
+            bool isMtrPath = !string.IsNullOrEmpty(request.timelineAssetPath);
+            if (isMtrPath)
             {
-                if (d != null && d.playableAsset is TimelineAsset)
+                preflightDirector = FindDirectorByRequest(request, allDirectors);
+                if (preflightDirector == null)
                 {
-                    preflightDirector = d;
-                    break;
+                    string hint = string.IsNullOrEmpty(request.directorHierarchyPath)
+                        ? $"directorObjectName='{request.directorObjectName}'"
+                        : $"directorHierarchyPath='{request.directorHierarchyPath}'";
+                    FailJob(request.jobId,
+                        $"[A3] 指定された PlayableDirector がシーンに見つかりません ({hint})。" +
+                        "directorObjectName / directorHierarchyPath が正しいか確認してください。");
+                    return;
+                }
+
+                // Load and bind the specified Timeline asset.
+                var specifiedTimeline = AssetDatabase.LoadAssetAtPath<TimelineAsset>(
+                    request.timelineAssetPath);
+                if (specifiedTimeline == null)
+                {
+                    FailJob(request.jobId,
+                        $"[A3] timelineAssetPath '{request.timelineAssetPath}' のTimelineAssetが見つかりません。" +
+                        "プロジェクトが同期されているか確認してください。");
+                    return;
+                }
+
+                // Bind the timeline to the director in-memory (does not save the scene).
+                preflightDirector.playableAsset = specifiedTimeline;
+                AppendE2ELog($"[JobRunner] TimelineAssetをバインドしました: {request.timelineAssetPath}");
+            }
+            else
+            {
+                // Legacy path: pick any director with a TimelineAsset.
+                foreach (var d in allDirectors)
+                {
+                    if (d != null && d.playableAsset is TimelineAsset)
+                    {
+                        preflightDirector = d;
+                        break;
+                    }
                 }
             }
 
@@ -222,29 +274,69 @@ namespace DistributedRecorder.Worker
 
             // ----- Preflight A4: RecorderTrack / RecorderClip / settings? ---
             var timelineAsset = preflightDirector.playableAsset as TimelineAsset;
-            RecorderClip preflightRecorderClip = FindRecorderClip(timelineAsset);
 
-            if (preflightRecorderClip == null)
+            RecorderClip preflightRecorderClip;
+
+            if (isMtrPath && request.recorderConfig != null)
             {
-                FailJob(request.jobId,
-                    "[A4] Timeline に RecorderTrack / RecorderClip が見つかりません。" +
-                    "DistributedRecorder > Create Sample Orbit Scene でサンプルシーンを再生成すると " +
-                    "RecorderClip が追加されます。");
-                return;
+                // MTR path: build RecorderClip from the normalized DTO.
+                // The clip is attached to the timeline in-memory; no asset save.
+                string baseOutputDir = _store.GetOutputDirectory(request.jobId);
+                if (!string.IsNullOrEmpty(request.outputSubDir))
+                    baseOutputDir = Path.Combine(baseOutputDir, request.outputSubDir);
+
+                string outputTemplate = MtrRecorderClipBuilder.ResolveOutputFilePath(
+                    baseOutputDir, request.recorderConfig);
+
+                try
+                {
+                    preflightRecorderClip = MtrRecorderClipBuilder.BuildAndApply(
+                        request.recorderConfig, outputTemplate, timelineAsset);
+                }
+                catch (Exception ex)
+                {
+                    FailJob(request.jobId,
+                        $"[A4] MtrRecorderClipBuilder でRecorderClipの構築に失敗しました: {ex.Message}");
+                    return;
+                }
+
+                AppendE2ELog($"[JobRunner] MtrRecorderClipBuilderでRecorderClipを構築しました: {outputTemplate}");
             }
-
-            if (preflightRecorderClip.settings == null)
+            else
             {
-                FailJob(request.jobId,
-                    "[A4] RecorderClip.settings が null です。Timeline を再生成してください。");
-                return;
+                // Legacy path: find existing RecorderClip embedded in the Timeline.
+                preflightRecorderClip = FindRecorderClip(timelineAsset);
+
+                if (preflightRecorderClip == null)
+                {
+                    FailJob(request.jobId,
+                        "[A4] Timeline に RecorderTrack / RecorderClip が見つかりません。" +
+                        "DistributedRecorder > Create Sample Orbit Scene でサンプルシーンを再生成すると " +
+                        "RecorderClip が追加されます。");
+                    return;
+                }
+
+                if (preflightRecorderClip.settings == null)
+                {
+                    FailJob(request.jobId,
+                        "[A4] RecorderClip.settings が null です。Timeline を再生成してください。");
+                    return;
+                }
             }
 
             // ----- Estimate total frames from Timeline ----------------------
             // timeline.duration is in seconds; frameRate is the Timeline editor rate.
             double durationSec  = timelineAsset.duration;
-            double fps          = timelineAsset.editorSettings.frameRate;
-            _recordingFps       = fps > 0 ? fps : 30.0;   // stored to avoid circular recalc in progress update
+
+            // For the MTR path, use recorderConfig.frameRate if provided (> 0);
+            // otherwise fall back to the Timeline's own editorSettings.frameRate.
+            double fps;
+            if (isMtrPath && request.recorderConfig != null && request.recorderConfig.frameRate > 0)
+                fps = request.recorderConfig.frameRate;
+            else
+                fps = timelineAsset.editorSettings.frameRate;
+
+            _recordingFps         = fps > 0 ? fps : 30.0;   // stored to avoid circular recalc in progress update
             _recordingTotalFrames = (fps > 0 && durationSec > 0)
                 ? Mathf.Max(1, Mathf.RoundToInt((float)(durationSec * fps)))
                 : 0;
@@ -255,18 +347,23 @@ namespace DistributedRecorder.Worker
                 s.totalFrames = _recordingTotalFrames;
             });
 
-            // ----- Override output directory --------------------------------
-            // Write to memory only; do NOT call AssetDatabase.SaveAssets() here.
-            // This avoids polluting the sample asset with a job-specific path.
-            string outputDir = _store.GetOutputDirectory(request.jobId);
-            // Use Recorder wildcard <Frame> for per-frame numbering.
-            string outputTemplate = outputDir.Replace('\\', '/').TrimEnd('/') + "/frame_<Frame>";
-            // Normalize slashes for Recorder (it accepts forward slashes on Windows too)
-            outputTemplate = outputTemplate.Replace('\\', '/');
-            preflightRecorderClip.settings.OutputFile = outputTemplate;
+            // ----- Override output directory (legacy path only) --------------------------------
+            // For the MTR path, MtrRecorderClipBuilder has already set OutputFile above.
+            // For the legacy path, override here as before.
+            if (!isMtrPath)
+            {
+                string outputDir = _store.GetOutputDirectory(request.jobId);
+                // Use Recorder wildcard <Frame> for per-frame numbering.
+                string outputTemplate = outputDir.Replace('\\', '/').TrimEnd('/') + "/frame_<Frame>";
+                // Normalize slashes for Recorder (it accepts forward slashes on Windows too)
+                outputTemplate = outputTemplate.Replace('\\', '/');
+                preflightRecorderClip.settings.OutputFile = outputTemplate;
+                AppendE2ELog($"[JobRunner] 出力先を設定 (legacy): {outputTemplate}");
+            }
 
-            AppendE2ELog($"[JobRunner] 出力先を設定: {outputTemplate}");
-            Debug.Log($"[JobRunner] ジョブ '{request.jobId}' — Play Mode に入ります。出力: {outputDir}");
+            // Store reference so Play Mode state handler can re-acquire the director by name/path.
+            _preflightDirectorName = preflightDirector.name;
+            Debug.Log($"[JobRunner] ジョブ '{request.jobId}' — Play Mode に入ります。director='{preflightDirector.name}'");
 
             // ----- Subscribe to state change and enter Play Mode ------------
             _phase             = RecordingPhase.WaitingForPlayMode;
@@ -302,12 +399,31 @@ namespace DistributedRecorder.Worker
                     FindObjectsInactive.Include, FindObjectsSortMode.None);
 
                 PlayableDirector found = null;
-                foreach (var d in directors)
+
+                // MTR path: try to find the director by the name captured at preflight.
+                if (!string.IsNullOrEmpty(_preflightDirectorName))
                 {
-                    if (d != null && d.playableAsset is TimelineAsset)
+                    foreach (var d in directors)
                     {
-                        found = d;
-                        break;
+                        if (d != null && d.name == _preflightDirectorName &&
+                            d.playableAsset is TimelineAsset)
+                        {
+                            found = d;
+                            break;
+                        }
+                    }
+                }
+
+                // Legacy fallback: find any director with a TimelineAsset.
+                if (found == null)
+                {
+                    foreach (var d in directors)
+                    {
+                        if (d != null && d.playableAsset is TimelineAsset)
+                        {
+                            found = d;
+                            break;
+                        }
                     }
                 }
 
@@ -523,6 +639,65 @@ namespace DistributedRecorder.Worker
         }
 
         // ------------------------------------------------------------------
+        // Preflight helper: find PlayableDirector by name or hierarchy path
+        // ------------------------------------------------------------------
+
+#if UNITY_RECORDER
+        /// <summary>
+        /// Finds the <see cref="PlayableDirector"/> specified by
+        /// <see cref="JobRequest.directorHierarchyPath"/> (preferred) or
+        /// <see cref="JobRequest.directorObjectName"/> (fallback).
+        ///
+        /// Returns null when no matching director is found.
+        /// </summary>
+        private static PlayableDirector FindDirectorByRequest(
+            JobRequest request,
+            PlayableDirector[] allDirectors)
+        {
+            // Prefer hierarchy path when available (more precise).
+            if (!string.IsNullOrEmpty(request.directorHierarchyPath))
+            {
+                foreach (var d in allDirectors)
+                {
+                    if (d == null) continue;
+                    string hierarchyPath = GetHierarchyPath(d.transform);
+                    if (hierarchyPath == request.directorHierarchyPath)
+                        return d;
+                }
+            }
+
+            // Fall back to matching by object name.
+            if (!string.IsNullOrEmpty(request.directorObjectName))
+            {
+                foreach (var d in allDirectors)
+                {
+                    if (d != null && d.name == request.directorObjectName)
+                        return d;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Returns the full Transform hierarchy path of the given <paramref name="t"/>
+        /// (e.g. "Root/Parent/Child"), using '/' as separator.
+        /// </summary>
+        private static string GetHierarchyPath(Transform t)
+        {
+            if (t == null) return string.Empty;
+            string path = t.name;
+            Transform current = t.parent;
+            while (current != null)
+            {
+                path    = current.name + "/" + path;
+                current = current.parent;
+            }
+            return path;
+        }
+#endif
+
+        // ------------------------------------------------------------------
         // Preflight helper: find RecorderClip in a TimelineAsset
         // ------------------------------------------------------------------
 
@@ -638,12 +813,13 @@ namespace DistributedRecorder.Worker
             // This must be set here (not only in FailJob) so that
             // FinalizeCompletedJob → ResetState also leaves the runner in
             // a startable state for consecutive jobs [B4].
-            _phase              = RecordingPhase.Idle;
-            _runningJobId       = null;
+            _phase                = RecordingPhase.Idle;
+            _runningJobId         = null;
             _recordingTotalFrames = 0;
-            _recordingFps       = 0;
-            _lastKnownFrame     = 0;
-            _stallCheckStartUtc = 0;
+            _recordingFps         = 0;
+            _lastKnownFrame       = 0;
+            _stallCheckStartUtc   = 0;
+            _preflightDirectorName = null;
 #if UNITY_RECORDER
             if (_director != null)
             {
