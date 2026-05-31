@@ -662,15 +662,6 @@ namespace Unity.MultiTimelineRecorder
                 return;
             }
 
-            // ── Pre-dispatch: warn if any target Timeline already has RecorderTracks ──
-            // Called synchronously here (before any await) so EditorUtility.DisplayDialog
-            // runs on the main thread without marshalling.
-            if (!ConfirmDispatchWithExistingRecorderTracks(targets))
-            {
-                Debug.Log("[DistributedRecorder] ユーザーがキャンセルしました。分散実行を中止します。");
-                return;
-            }
-
             // Build services (requires shared key)
             if (!SharedKeyLoader.TryLoad(out byte[] keyBytes, out string keyError))
             {
@@ -1039,92 +1030,6 @@ namespace Unity.MultiTimelineRecorder
                 transport.Dispose();
                 Repaint();
             }
-        }
-
-        // -----------------------------------------------------------------------
-        // Pre-dispatch RecorderTrack existence check
-        // -----------------------------------------------------------------------
-
-        /// <summary>
-        /// Counts the number of <see cref="UnityEditor.Recorder.Timeline.RecorderTrack"/>
-        /// instances on the given <paramref name="timelineAsset"/>.
-        ///
-        /// Made <c>public static</c> for hermetic EditMode tests.
-        /// Returns 0 when <paramref name="timelineAsset"/> is null.
-        /// </summary>
-        public static int CountRecorderTracksOnAsset(TimelineAsset timelineAsset)
-        {
-            if (timelineAsset == null)
-                return 0;
-
-            int count = 0;
-#if UNITY_RECORDER
-            foreach (var track in timelineAsset.GetOutputTracks())
-            {
-                if (track is UnityEditor.Recorder.Timeline.RecorderTrack)
-                    count++;
-            }
-#endif
-            return count;
-        }
-
-        /// <summary>
-        /// Inspects each <paramref name="targets"/> entry for existing
-        /// <see cref="UnityEditor.Recorder.Timeline.RecorderTrack"/> instances.
-        /// When at least one is found, shows a confirmation dialog.
-        ///
-        /// Must be called on the main thread (synchronously before any await) because
-        /// <see cref="EditorUtility.DisplayDialog"/> requires the main thread.
-        /// </summary>
-        /// <returns>
-        /// <c>true</c> if dispatch should continue (either no RecorderTracks found,
-        /// or the user chose "続行"); <c>false</c> if the user cancelled.
-        /// </returns>
-        private static bool ConfirmDispatchWithExistingRecorderTracks(
-            IReadOnlyList<DistributedTimelineJob> targets)
-        {
-            // Collect per-timeline Recorder counts
-            var warnings = new List<(string TimelineName, int TrackCount)>();
-
-            foreach (var job in targets)
-            {
-                if (job.Director == null)
-                    continue;
-
-                var timelineAsset = job.Director.playableAsset as TimelineAsset;
-                int trackCount = CountRecorderTracksOnAsset(timelineAsset);
-                if (trackCount > 0)
-                    warnings.Add((job.DirectorObjectName, trackCount));
-            }
-
-            // No pre-existing RecorderTracks → proceed silently
-            if (warnings.Count == 0)
-                return true;
-
-            // Build detail lines (cap at 10 to keep dialog manageable)
-            const int maxLines = 10;
-            var sb = new System.Text.StringBuilder();
-            for (int i = 0; i < warnings.Count && i < maxLines; i++)
-            {
-                sb.AppendLine($"  - {warnings[i].TimelineName}: Recorder {warnings[i].TrackCount} 個");
-            }
-            if (warnings.Count > maxLines)
-                sb.AppendLine($"  ...他 {warnings.Count - maxLines} 本");
-
-            string message =
-                "選択中の Timeline に既に Recorder トラックが存在します:\n\n" +
-                sb.ToString() +
-                "\n分散録画は各 Timeline の Recorder を 1 つ使用します。" +
-                "Recorder が複数ある場合、想定外の出力（重複・プロジェクト直下への出力）の原因になります。\n\n" +
-                "続行しますか？\n" +
-                "（キャンセルして DistributedRecorder > Create MTR Multi-Timeline Sample で" +
-                "サンプルを作り直すと、余分な Recorder を解消できます）";
-
-            return EditorUtility.DisplayDialog(
-                "既存の Recorder を検出",
-                message,
-                "続行",
-                "キャンセル");
         }
 
         // -----------------------------------------------------------------------

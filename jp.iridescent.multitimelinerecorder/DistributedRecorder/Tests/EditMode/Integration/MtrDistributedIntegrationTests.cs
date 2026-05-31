@@ -456,68 +456,8 @@ namespace DistributedRecorder.Tests.Integration
         }
     }
 
-    // -----------------------------------------------------------------------
-    // CountRecorderTracksOnAsset tests
-    // -----------------------------------------------------------------------
-
-    /// <summary>
-    /// Hermetic tests for <see cref="MultiTimelineRecorder.CountRecorderTracksOnAsset"/>.
-    /// Uses <see cref="ScriptableObject.CreateInstance"/> so no Assets are written to disk.
-    /// </summary>
-    [TestFixture]
-    public class CountRecorderTracksTests
-    {
-        private TimelineAsset _timeline;
-
-        [SetUp]
-        public void SetUp()
-        {
-            _timeline = ScriptableObject.CreateInstance<TimelineAsset>();
-        }
-
-        [TearDown]
-        public void TearDown()
-        {
-            if (_timeline != null)
-                UnityEngine.Object.DestroyImmediate(_timeline);
-        }
-
-        [Test]
-        public void CountRecorderTracksOnAsset_NullTimeline_ReturnsZero()
-        {
-            Assert.AreEqual(0, MultiTimelineRecorder.CountRecorderTracksOnAsset(null));
-        }
-
-        [Test]
-        public void CountRecorderTracksOnAsset_EmptyTimeline_ReturnsZero()
-        {
-            // A freshly-created TimelineAsset has no tracks
-            Assert.AreEqual(0, MultiTimelineRecorder.CountRecorderTracksOnAsset(_timeline));
-        }
-
-        [Test]
-        public void CountRecorderTracksOnAsset_OneRecorderTrack_ReturnsOne()
-        {
-            _timeline.CreateTrack<UnityEditor.Recorder.Timeline.RecorderTrack>(null, "RecorderTrack");
-            Assert.AreEqual(1, MultiTimelineRecorder.CountRecorderTracksOnAsset(_timeline));
-        }
-
-        [Test]
-        public void CountRecorderTracksOnAsset_TwoRecorderTracks_ReturnsTwo()
-        {
-            _timeline.CreateTrack<UnityEditor.Recorder.Timeline.RecorderTrack>(null, "Recorder_A");
-            _timeline.CreateTrack<UnityEditor.Recorder.Timeline.RecorderTrack>(null, "Recorder_B");
-            Assert.AreEqual(2, MultiTimelineRecorder.CountRecorderTracksOnAsset(_timeline));
-        }
-
-        [Test]
-        public void CountRecorderTracksOnAsset_MixedTracks_CountsOnlyRecorderTracks()
-        {
-            // Add one AnimationTrack (non-recorder) and two RecorderTracks
-            _timeline.CreateTrack<UnityEngine.Timeline.AnimationTrack>(null, "Animation");
-            _timeline.CreateTrack<UnityEditor.Recorder.Timeline.RecorderTrack>(null, "Recorder_1");
-            _timeline.CreateTrack<UnityEditor.Recorder.Timeline.RecorderTrack>(null, "Recorder_2");
-            Assert.AreEqual(2, MultiTimelineRecorder.CountRecorderTracksOnAsset(_timeline));
-        }
-    }
+    // NOTE: CountRecorderTracksTests removed (§D worker-recorder-redesign).
+    // CountRecorderTracksOnAsset and ConfirmDispatchWithExistingRecorderTracks were
+    // deleted because the new Worker design never touches the source Timeline's
+    // RecorderTracks, making the "existing Recorder warning" both misleading and harmful.
 }
