@@ -22,6 +22,18 @@ namespace DistributedRecorder.Shared
         private const int MaxMetaJsonLength         = 1024 * 1024; // 1 MB
         private const int MaxVersionStringLength    = 64;
 
+        // MTR integration field limits
+        private const int MaxDirectorNameLength     = 256;
+        private const int MaxOutputSubDirLength     = 256;
+        private const int MaxFileNameTemplateLength = 256;
+
+        // RecorderJobConfig range constraints
+        private const int   MinResolution   = 1;
+        private const int   MaxResolution   = 16384;
+        private const double MinFrameRate   = double.Epsilon;  // > 0
+        private const double MaxFrameRate   = 240.0;
+        private const int   MinTakeNumber   = 0;
+
         /// <summary>
         /// Validates a <see cref="JobRequest"/>.
         /// </summary>
@@ -88,6 +100,161 @@ namespace DistributedRecorder.Shared
             {
                 reason = $"metaJson exceeds the 1 MB limit.";
                 return false;
+            }
+
+            // --- MTR integration fields (all optional; validated only when non-empty) ---
+
+            // timelineAssetPath – optional relative path
+            if (!string.IsNullOrEmpty(request.timelineAssetPath))
+            {
+                if (request.timelineAssetPath.Length > MaxAssetPathLength)
+                {
+                    reason = $"timelineAssetPath exceeds maximum length of {MaxAssetPathLength}.";
+                    return false;
+                }
+                if (!IsRelativeSafePath(request.timelineAssetPath))
+                {
+                    reason = "timelineAssetPath must be a relative path inside the project and must not contain '..'.";
+                    return false;
+                }
+            }
+
+            // directorObjectName – optional display name
+            if (!string.IsNullOrEmpty(request.directorObjectName))
+            {
+                if (request.directorObjectName.Length > MaxDirectorNameLength)
+                {
+                    reason = $"directorObjectName exceeds maximum length of {MaxDirectorNameLength}.";
+                    return false;
+                }
+                if (ContainsControlCharacters(request.directorObjectName))
+                {
+                    reason = "directorObjectName contains disallowed control characters.";
+                    return false;
+                }
+            }
+
+            // directorHierarchyPath – optional relative hierarchy path
+            if (!string.IsNullOrEmpty(request.directorHierarchyPath))
+            {
+                if (request.directorHierarchyPath.Length > MaxAssetPathLength)
+                {
+                    reason = $"directorHierarchyPath exceeds maximum length of {MaxAssetPathLength}.";
+                    return false;
+                }
+                // Hierarchy paths use '/' as separator but are not file-system paths;
+                // still reject ".." components to prevent traversal confusion.
+                string normalised = request.directorHierarchyPath.Replace('\\', '/');
+                foreach (string part in normalised.Split('/'))
+                {
+                    if (part == ".." || part == ".")
+                    {
+                        reason = "directorHierarchyPath must not contain '..' or '.' components.";
+                        return false;
+                    }
+                }
+            }
+
+            // outputSubDir – optional relative path component
+            if (!string.IsNullOrEmpty(request.outputSubDir))
+            {
+                if (request.outputSubDir.Length > MaxOutputSubDirLength)
+                {
+                    reason = $"outputSubDir exceeds maximum length of {MaxOutputSubDirLength}.";
+                    return false;
+                }
+                if (!IsRelativeSafePath(request.outputSubDir))
+                {
+                    reason = "outputSubDir must be a relative path and must not contain '..'.";
+                    return false;
+                }
+            }
+
+            // recorderConfig – validate when timelineAssetPath is provided (MTR path)
+            if (!string.IsNullOrEmpty(request.timelineAssetPath) && request.recorderConfig != null)
+            {
+                if (!ValidateRecorderJobConfig(request.recorderConfig, out reason))
+                    return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Validates a <see cref="RecorderJobConfig"/> DTO.
+        /// </summary>
+        /// <param name="config">The config to validate (must not be null).</param>
+        /// <param name="reason">Human-readable failure reason when returning false.</param>
+        /// <returns>True when all fields are within accepted bounds.</returns>
+        public static bool ValidateRecorderJobConfig(RecorderJobConfig config, out string reason)
+        {
+            reason = string.Empty;
+
+            if (config == null)
+            {
+                reason = "recorderConfig is null.";
+                return false;
+            }
+
+            // recorderType enum whitelist
+            if (!Enum.IsDefined(typeof(DistRecorderType), config.recorderType))
+            {
+                reason = $"recorderConfig.recorderType value '{(int)config.recorderType}' is not in the allowed whitelist.";
+                return false;
+            }
+
+            // resolution
+            if (config.width < MinResolution || config.width > MaxResolution)
+            {
+                reason = $"recorderConfig.width must be between {MinResolution} and {MaxResolution}. Got: {config.width}.";
+                return false;
+            }
+            if (config.height < MinResolution || config.height > MaxResolution)
+            {
+                reason = $"recorderConfig.height must be between {MinResolution} and {MaxResolution}. Got: {config.height}.";
+                return false;
+            }
+
+            // frame rate
+            if (config.frameRate <= 0.0 || config.frameRate > MaxFrameRate)
+            {
+                reason = $"recorderConfig.frameRate must be > 0 and <= {MaxFrameRate}. Got: {config.frameRate}.";
+                return false;
+            }
+
+            // take number
+            if (config.takeNumber < MinTakeNumber)
+            {
+                reason = $"recorderConfig.takeNumber must be >= {MinTakeNumber}. Got: {config.takeNumber}.";
+                return false;
+            }
+
+            // fileNameTemplate – optional but validated for length and forbidden separators
+            if (!string.IsNullOrEmpty(config.fileNameTemplate))
+            {
+                if (config.fileNameTemplate.Length > MaxFileNameTemplateLength)
+                {
+                    reason = $"recorderConfig.fileNameTemplate exceeds maximum length of {MaxFileNameTemplateLength}.";
+                    return false;
+                }
+                // Must not contain path separators or ".." (could escape output directory)
+                if (config.fileNameTemplate.Contains("..") ||
+                    config.fileNameTemplate.Contains('/') ||
+                    config.fileNameTemplate.Contains('\\'))
+                {
+                    reason = "recorderConfig.fileNameTemplate must not contain path separators or '..'.";
+                    return false;
+                }
+            }
+
+            // Image-specific enum whitelist
+            if (config.recorderType == DistRecorderType.Image)
+            {
+                if (!Enum.IsDefined(typeof(DistImageFormat), config.imageFormat))
+                {
+                    reason = $"recorderConfig.imageFormat value '{(int)config.imageFormat}' is not in the allowed whitelist.";
+                    return false;
+                }
             }
 
             return true;
@@ -160,6 +327,20 @@ namespace DistributedRecorder.Shared
                     return false;
             }
             return true;
+        }
+
+        /// <summary>
+        /// Returns true when <paramref name="s"/> contains any ASCII control character
+        /// (code point &lt; 0x20 or 0x7F), which should never appear in display names.
+        /// </summary>
+        private static bool ContainsControlCharacters(string s)
+        {
+            foreach (char c in s)
+            {
+                if (c < 0x20 || c == 0x7F)
+                    return true;
+            }
+            return false;
         }
     }
 }

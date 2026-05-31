@@ -86,6 +86,69 @@ namespace DistributedRecorder.Shared
         /// Do not remove this field — removing it would be a breaking protocol change.
         /// </summary>
         public bool skipHashCheck;
+
+        // -----------------------------------------------------------------------
+        // MTR integration fields (added in mtr-distributed-integration M2)
+        // All fields below are optional for backward compatibility with older Masters.
+        // When empty / null, JobRunner falls back to the original "find any director"
+        // path (existing single-Timeline recording behavior is preserved).
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Asset path of the <see cref="UnityEngine.Timeline.TimelineAsset"/> to record.
+        /// Project-relative (e.g. "Assets/Timelines/Shot01.playable").
+        /// When non-empty, Worker loads this specific Timeline instead of searching
+        /// the scene for any director.
+        /// Validated: relative path, no "..", max 512 chars.
+        /// </summary>
+        public string timelineAssetPath = string.Empty;
+
+        /// <summary>
+        /// Name of the <see cref="UnityEngine.Playables.PlayableDirector"/> GameObject
+        /// in the scene that should be bound to <see cref="timelineAssetPath"/>.
+        /// Used to locate the target director when the scene has multiple directors.
+        /// Validated: max 256 chars, no control characters.
+        /// </summary>
+        public string directorObjectName = string.Empty;
+
+        /// <summary>
+        /// Optional hierarchy path of the target PlayableDirector (e.g. "Root/Director").
+        /// Takes precedence over <see cref="directorObjectName"/> when non-empty.
+        /// Validated: relative path, no "..", max 512 chars.
+        /// </summary>
+        public string directorHierarchyPath = string.Empty;
+
+        /// <summary>
+        /// Normalized recorder configuration built from the MTR RecorderConfigItem.
+        /// Replaces the MTR type dependency with a whitelist-validated DTO.
+        /// Nested <see cref="RecorderJobConfig"/> is JsonUtility-serializable.
+        /// When this field has its default <see cref="DistRecorderType.Image"/> value
+        /// but <see cref="timelineAssetPath"/> is empty, the existing RecorderClip
+        /// embedded in the scene Timeline is used (legacy path).
+        /// </summary>
+        public RecorderJobConfig recorderConfig = new RecorderJobConfig();
+
+        /// <summary>
+        /// Recording start time in seconds (Timeline-local time).
+        /// Signal-resolved value computed by the Master before dispatch.
+        /// 0.0 means start from the beginning of the Timeline.
+        /// </summary>
+        public double startTime;
+
+        /// <summary>
+        /// Recording end time in seconds (Timeline-local time).
+        /// Signal-resolved value computed by the Master before dispatch.
+        /// 0.0 or ≤ startTime means "use full Timeline duration".
+        /// </summary>
+        public double endTime;
+
+        /// <summary>
+        /// Output sub-directory name within the Worker's Recordings folder.
+        /// Worker writes to <c>Recordings/{jobId}/{outputSubDir}/</c>.
+        /// When empty, falls back to the legacy <c>Recordings/{jobId}/</c> path.
+        /// Validated: relative path component, no "..", max 256 chars.
+        /// </summary>
+        public string outputSubDir = string.Empty;
     }
 
     /// <summary>
