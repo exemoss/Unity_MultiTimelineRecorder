@@ -149,6 +149,85 @@ namespace DistributedRecorder.Shared
         /// Validated: relative path component, no "..", max 256 chars.
         /// </summary>
         public string outputSubDir = string.Empty;
+
+        // -----------------------------------------------------------------------
+        // MTR fidelity fields (added in mtr-distributed-integration M3)
+        // All fields below are optional for backward compatibility with older Masters.
+        // When empty / null / zero, Worker falls back to the existing recorderConfig DTO path.
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Job-scoped SHA-256 hash covering only the Timeline asset + its dependencies
+        /// + the scene file (not the whole Assets tree).
+        /// When non-empty and <see cref="timelineAssetPath"/> is non-empty,
+        /// Worker computes the same hash locally and compares it instead of
+        /// using the whole-Assets <see cref="projectHash"/>.
+        /// Validated: 64-char hex (SHA-256).
+        /// </summary>
+        public string jobScopeHash = string.Empty;
+
+        /// <summary>
+        /// Full <see cref="Unity.MultiTimelineRecorder.MultiRecorderConfig.RecorderConfigItem"/>
+        /// serialized via <c>JsonUtility.ToJson</c>.
+        /// Worker restores it via <c>JsonUtility.FromJson&lt;RecorderConfigItem&gt;</c> and
+        /// passes it to <c>RecorderSettingsBuilderShared</c> to faithfully reproduce MTR's
+        /// own <c>ImageRecorderSettings</c> construction logic.
+        /// Validated: max 64 KB; restored enum values must be in allowed whitelists.
+        /// </summary>
+        public string recorderConfigJson = string.Empty;
+
+        /// <summary>
+        /// Hierarchy path (e.g. "Root/CameraRig/MainCam") of the Camera GameObject in the
+        /// scene when <c>imageSourceType == TargetCamera</c>.
+        /// Takes precedence over <see cref="targetCameraName"/> when non-empty.
+        /// Validated: max 512 chars, no control characters, no "..".
+        /// </summary>
+        public string targetCameraHierarchyPath = string.Empty;
+
+        /// <summary>
+        /// Name of the Camera GameObject when <c>imageSourceType == TargetCamera</c>.
+        /// Used when <see cref="targetCameraHierarchyPath"/> is empty.
+        /// Validated: max 256 chars, no control characters.
+        /// </summary>
+        public string targetCameraName = string.Empty;
+
+        /// <summary>
+        /// AssetDatabase GUID of the RenderTexture asset when
+        /// <c>imageSourceType == RenderTexture</c>.
+        /// Worker resolves: <c>AssetDatabase.GUIDToAssetPath(guid)</c> →
+        /// <c>AssetDatabase.LoadAssetAtPath&lt;RenderTexture&gt;</c>.
+        /// Validated: 32-char lowercase hex.
+        /// </summary>
+        public string renderTextureGuid = string.Empty;
+
+        /// <summary>
+        /// Effective output width in pixels after applying MTR global/per-item resolution rules
+        /// (<c>useGlobalResolution</c>, etc.).  Resolved by Master before dispatch.
+        /// 0 means "use the value from <see cref="recorderConfigJson"/>".
+        /// </summary>
+        public int effectiveWidth;
+
+        /// <summary>
+        /// Effective output height in pixels (see <see cref="effectiveWidth"/>).
+        /// 0 means "use the value from <see cref="recorderConfigJson"/>".
+        /// </summary>
+        public int effectiveHeight;
+
+        /// <summary>
+        /// Effective frame rate resolved by Master (MTR global frameRate field).
+        /// 0.0 means "use the value from <see cref="recorderConfigJson"/>".
+        /// </summary>
+        public double effectiveFrameRate;
+
+        /// <summary>
+        /// Output relative path fragment with MTR wildcards already resolved by Master.
+        /// <c>&lt;Take&gt;</c>, <c>&lt;Scene&gt;</c> etc. are replaced; <c>&lt;Frame&gt;</c>
+        /// is preserved for the Recorder to substitute at capture time.
+        /// Worker prepends <c>Recordings/{jobId}/</c> to this fragment.
+        /// Must be relative and must not contain "..".
+        /// Validated: relative path, no "..", max 512 chars.
+        /// </summary>
+        public string resolvedOutputRelativePath = string.Empty;
     }
 
     /// <summary>
