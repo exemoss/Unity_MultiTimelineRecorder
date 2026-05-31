@@ -2130,36 +2130,82 @@ namespace Unity.MultiTimelineRecorder
             // Center the buttons
             EditorGUILayout.BeginHorizontal();
             GUILayout.FlexibleSpace();
-            
-            bool canRecord = currentState == RecordState.Idle && recordingQueueDirectors.Count > 0 && !EditorApplication.isPlaying;
-            
-            // Validate timeline selection
-            canRecord = canRecord && selectedDirectorIndices.Count > 0;
-            
-            // Validate recorder configurations for selected timelines
-            if (canRecord)
+
+            // ── Determine whether distributed mode is active ─────────────────
+            // _distributedMode is declared in the partial class (MultiTimelineRecorder_Distributed.cs).
+            // We read it here to choose button label, color, and click handler.
+            bool isDistMode = _distributedMode;
+
+            bool canRecord;
+            if (isDistMode)
             {
-                int validTimelineCount = 0;
-                foreach (int idx in selectedDirectorIndices)
-                {
-                    var config = GetTimelineRecorderConfig(idx);
-                    if (config.GetEnabledRecorders().Count > 0)
-                    {
-                        validTimelineCount++;
-                    }
-                }
-                canRecord = validTimelineCount > 0;
+                // Distributed: need at least 1 enabled worker, 1 Image-capable timeline selected,
+                // state must be Idle, and no dispatch already in progress.
+                // Lightweight worker count (no AssetDatabase calls):
+                int enabledWorkers = _distWorkerRegistry != null
+                    ? _distWorkerRegistry.EnabledWorkers.Count
+                    : 0;
+
+                // Lightweight Image-target count (no CollectRenderTargets / AssetDatabase):
+                int imageTimelineCount = CountImageTimelinesCheap();
+
+                canRecord = currentState == RecordState.Idle
+                    && !EditorApplication.isPlaying
+                    && enabledWorkers > 0
+                    && imageTimelineCount > 0
+                    && !IsAnyJobActive();
             }
-            
+            else
+            {
+                canRecord = currentState == RecordState.Idle
+                    && recordingQueueDirectors.Count > 0
+                    && !EditorApplication.isPlaying;
+
+                // Validate timeline selection
+                canRecord = canRecord && selectedDirectorIndices.Count > 0;
+
+                // Validate recorder configurations for selected timelines
+                if (canRecord)
+                {
+                    int validTimelineCount = 0;
+                    foreach (int idx in selectedDirectorIndices)
+                    {
+                        var config = GetTimelineRecorderConfig(idx);
+                        if (config.GetEnabledRecorders().Count > 0)
+                        {
+                            validTimelineCount++;
+                        }
+                    }
+                    canRecord = validTimelineCount > 0;
+                }
+            }
+
             // Record button with icon and color
             GUI.enabled = canRecord;
             Color originalColor = GUI.backgroundColor;
-            GUI.backgroundColor = new Color(0.8f, 0.2f, 0.2f); // Red for recording
-            
-            GUIContent recordContent = new GUIContent(" Start Recording", EditorGUIUtility.IconContent("d_PlayButton").image);
-            if (GUILayout.Button(recordContent, GUILayout.Height(30), GUILayout.Width(150)))
+
+            GUIContent recordContent;
+            if (isDistMode)
             {
-                StartRecording();
+                GUI.backgroundColor = new Color(0.2f, 0.5f, 0.9f); // Blue for distributed
+                recordContent = new GUIContent(
+                    " 分散実行 (Distributed Render)",
+                    EditorGUIUtility.IconContent("d_Grid.Default").image);
+            }
+            else
+            {
+                GUI.backgroundColor = new Color(0.8f, 0.2f, 0.2f); // Red for recording
+                recordContent = new GUIContent(
+                    " Start Recording",
+                    EditorGUIUtility.IconContent("d_PlayButton").image);
+            }
+
+            if (GUILayout.Button(recordContent, GUILayout.Height(30), GUILayout.Width(200)))
+            {
+                if (isDistMode)
+                    StartDistributedRecordingAsync(CollectRenderTargets());
+                else
+                    StartRecording();
             }
             
             // Stop button with icon

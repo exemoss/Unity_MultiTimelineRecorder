@@ -84,95 +84,90 @@ namespace Unity.MultiTimelineRecorder
             // ── Foldout header ──────────────────────────────────────────────
             EditorGUILayout.BeginVertical("HelpBox");
 
-            EditorGUILayout.BeginHorizontal();
-            _distributedMode = EditorGUILayout.Toggle(_distributedMode, GUILayout.Width(16));
-            EditorGUILayout.LabelField("分散レンダリング (Distributed Render)", EditorStyles.boldLabel);
-            EditorGUILayout.EndHorizontal();
+            // Wrap entire body in try/finally so Begin/End calls are always balanced
+            // even if an exception occurs mid-draw (prevents layout stack corruption).
+            try
+            {
+                EditorGUILayout.BeginHorizontal();
+                bool newMode = EditorGUILayout.Toggle(_distributedMode, GUILayout.Width(16));
+                if (newMode != _distributedMode)
+                {
+                    _distributedMode = newMode;
+                    PersistDistributedState();
+                }
+                EditorGUILayout.LabelField("分散レンダリング (Distributed Render)", EditorStyles.boldLabel);
+                EditorGUILayout.EndHorizontal();
 
-            if (!_distributedMode)
+                if (!_distributedMode)
+                    return;
+
+                EditorGUILayout.Space(4);
+
+                // ── Worker registry selector ─────────────────────────────────
+                EditorGUI.BeginChangeCheck();
+                _distWorkerRegistry = (WorkerRegistryAsset)EditorGUILayout.ObjectField(
+                    "Worker Registry",
+                    _distWorkerRegistry,
+                    typeof(WorkerRegistryAsset),
+                    false);
+                if (EditorGUI.EndChangeCheck())
+                    PersistDistributedState();
+
+                int enabledWorkerCount = _distWorkerRegistry != null
+                    ? _distWorkerRegistry.EnabledWorkers.Count
+                    : 0;
+
+                if (_distWorkerRegistry == null)
+                {
+                    EditorGUILayout.HelpBox(
+                        "WorkerRegistryAsset を割り当ててください。\n" +
+                        "Assets > Create > DistributedRecorder > WorkerRegistry で作成できます。",
+                        MessageType.Info);
+                }
+                else if (enabledWorkerCount == 0)
+                {
+                    EditorGUILayout.HelpBox(
+                        "有効な Worker がレジストリに登録されていません。",
+                        MessageType.Warning);
+                }
+                else
+                {
+                    EditorGUILayout.LabelField(
+                        $"有効 Worker: {enabledWorkerCount} 台",
+                        EditorStyles.miniLabel);
+                }
+
+                // ── Lightweight target count (no CollectRenderTargets / AssetDatabase) ──
+                // CollectRenderTargets() is called only at dispatch time (button click in
+                // DrawRecordControls). Here we just show a cheap count so the UI can
+                // display an informational hint without heavy processing every frame.
+                int imageTimelineCount = CountImageTimelinesCheap();
+
+                if (imageTimelineCount == 0 && selectedDirectorIndices.Count > 0)
+                {
+                    EditorGUILayout.HelpBox(
+                        "分散対応の Image Recorder が選択 Timeline に見つかりません。\n" +
+                        "対応形式: Image Sequence のみ（Movie等はスキップ）。",
+                        MessageType.Warning);
+                }
+                else if (imageTimelineCount > 0)
+                {
+                    EditorGUILayout.LabelField(
+                        $"対象 Timeline: {imageTimelineCount} 件 → 上の「分散実行」ボタンで開始",
+                        EditorStyles.miniLabel);
+                }
+
+                // ── Job progress list ────────────────────────────────────────
+                if (_dispatchedJobs.Count > 0)
+                {
+                    EditorGUILayout.Space(4);
+                    DrawDistributedJobList();
+                }
+            }
+            finally
             {
                 EditorGUILayout.EndVertical();
-                return;
             }
-
-            EditorGUILayout.Space(4);
-
-            // ── Worker registry selector ─────────────────────────────────────
-            EditorGUI.BeginChangeCheck();
-            _distWorkerRegistry = (WorkerRegistryAsset)EditorGUILayout.ObjectField(
-                "Worker Registry",
-                _distWorkerRegistry,
-                typeof(WorkerRegistryAsset),
-                false);
-            if (EditorGUI.EndChangeCheck())
-                PersistDistributedState();
-
-            int enabledWorkerCount = _distWorkerRegistry != null
-                ? _distWorkerRegistry.EnabledWorkers.Count
-                : 0;
-
-            if (_distWorkerRegistry == null)
-            {
-                EditorGUILayout.HelpBox(
-                    "WorkerRegistryAsset を割り当ててください。\n" +
-                    "Assets > Create > DistributedRecorder > WorkerRegistry で作成できます。",
-                    MessageType.Info);
-            }
-            else if (enabledWorkerCount == 0)
-            {
-                EditorGUILayout.HelpBox(
-                    "有効な Worker がレジストリに登録されていません。",
-                    MessageType.Warning);
-            }
-            else
-            {
-                EditorGUILayout.LabelField(
-                    $"有効 Worker: {enabledWorkerCount} 台",
-                    EditorStyles.miniLabel);
-            }
-
-            EditorGUILayout.Space(4);
-
-            // ── Collect render targets for button state ────────────────────
-            var targets = CollectRenderTargets();
-            int imageTargetCount = targets.Count;
-
-            bool isDispatching = IsAnyJobActive();
-            bool canDispatch = imageTargetCount > 0 && enabledWorkerCount > 0
-                               && currentState == RecordState.Idle
-                               && !isDispatching;
-
-            if (imageTargetCount == 0 && selectedDirectorIndices.Count > 0)
-            {
-                EditorGUILayout.HelpBox(
-                    "分散対応の Image Recorder が選択 Timeline に見つかりません。\n" +
-                    "対応形式: Image Sequence のみ（Movie等はスキップ）。",
-                    MessageType.Warning);
-            }
-
-            // ── Dispatch button ──────────────────────────────────────────────
-            using (new EditorGUI.DisabledScope(!canDispatch))
-            {
-                Color orig = GUI.backgroundColor;
-                GUI.backgroundColor = new Color(0.2f, 0.5f, 0.9f); // blue tint
-                GUIContent dispatchContent = new GUIContent(
-                    $" 分散実行 ({imageTargetCount} ジョブ → {enabledWorkerCount} Worker)",
-                    EditorGUIUtility.IconContent("d_Grid.Default").image);
-                if (GUILayout.Button(dispatchContent, GUILayout.Height(30)))
-                {
-                    StartDistributedRecordingAsync(targets);
-                }
-                GUI.backgroundColor = orig;
-            }
-
-            // ── Job progress list ────────────────────────────────────────────
-            if (_dispatchedJobs.Count > 0)
-            {
-                EditorGUILayout.Space(4);
-                DrawDistributedJobList();
-            }
-
-            EditorGUILayout.EndVertical();
         }
 
         // -----------------------------------------------------------------------
@@ -205,11 +200,15 @@ namespace Unity.MultiTimelineRecorder
             // Scrollable job list (max 150px)
             _distJobScrollPos = EditorGUILayout.BeginScrollView(
                 _distJobScrollPos, GUILayout.Height(Mathf.Min(150, _dispatchedJobs.Count * 36 + 4)));
-
-            foreach (var vm in _dispatchedJobs)
-                DrawMtrJobRow(vm);
-
-            EditorGUILayout.EndScrollView();
+            try
+            {
+                foreach (var vm in _dispatchedJobs)
+                    DrawMtrJobRow(vm);
+            }
+            finally
+            {
+                EditorGUILayout.EndScrollView();
+            }
         }
 
         private static void DrawMtrJobRow(MtrJobViewModel vm)
@@ -1036,6 +1035,34 @@ namespace Unity.MultiTimelineRecorder
         // -----------------------------------------------------------------------
         // Helpers
         // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Cheaply counts the number of selected timelines that have at least one
+        /// enabled Image recorder item, without calling <see cref="CollectRenderTargets"/>
+        /// (which invokes AssetDatabase, JsonUtility, and hash computation).
+        /// Safe to call every OnGUI frame.
+        /// </summary>
+        private int CountImageTimelinesCheap()
+        {
+            if (selectedDirectorIndices == null || selectedDirectorIndices.Count == 0)
+                return 0;
+
+            int count = 0;
+            foreach (int idx in selectedDirectorIndices)
+            {
+                var config = GetTimelineRecorderConfig(idx);
+                var enabled = config.GetEnabledRecorders();
+                foreach (var item in enabled)
+                {
+                    if (IsImageRecorderItem(item))
+                    {
+                        count++;
+                        break; // one Image item is enough to count this timeline
+                    }
+                }
+            }
+            return count;
+        }
 
         private bool IsAnyJobActive()
         {
