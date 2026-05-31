@@ -94,3 +94,21 @@ This package is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ## Acknowledgments
 
 This package builds upon Unity's Timeline and Recorder systems to provide enhanced batch recording capabilities.
+
+---
+
+## Fork Notice
+
+This repository is a fork of [Unity_MultiTimelineRecorder](https://github.com/murasaqi/Unity_MultiTimelineRecorder)
+by Murasaqi (Copyright (c) 2024 Murasaqi, MIT License).
+
+The original MTR package is **unchanged** in this fork. The following additions have been made:
+
+- `DistributedRecorder/` — a distributed rendering module ported from the
+  [Unity_Recorder_DistRendering](https://github.com/exemoss/Unity_Recorder_DistRendering) project.
+  This module integrates LAN-based multi-PC rendering dispatch into the MTR workflow.
+  It is MIT-licensed and maintained separately from the MTR core.
+
+Both the original MTR code and the distributed module are published under the MIT License.
+See the [LICENSE](LICENSE) file and [`DistributedRecorder/README_DISTRIBUTED_MTR.md`](DistributedRecorder/README_DISTRIBUTED_MTR.md)
+for full attribution and usage details.
