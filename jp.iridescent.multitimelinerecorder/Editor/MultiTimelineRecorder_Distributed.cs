@@ -547,6 +547,25 @@ namespace Unity.MultiTimelineRecorder
 
         private async void StartDistributedRecordingAsync(List<DistributedTimelineJob> targets)
         {
+            // async void: wrap entire body so any synchronous or async exception is logged
+            // rather than silently crashing the Editor (uncaught exception in async void
+            // propagates to the synchronization context and can destabilize the Editor).
+            try
+            {
+                await StartDistributedRecordingInternalAsync(targets);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex);
+                Debug.LogError("[DistributedRecorder] 分散録画中に予期しないエラーが発生しました。詳細は上記の例外を参照してください。");
+            }
+        }
+
+        /// <summary>
+        /// Implementation of distributed recording dispatch (called from the async void guard).
+        /// </summary>
+        private async Task StartDistributedRecordingInternalAsync(List<DistributedTimelineJob> targets)
+        {
             if (targets == null || targets.Count == 0)
             {
                 Debug.LogWarning("[DistributedRecorder] 投入ジョブが 0 件です。中断します。");
