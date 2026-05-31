@@ -223,7 +223,9 @@ namespace DistributedRecorder.Shared
                     return false;
                 }
                 // Structural validation: must be deserializable as RecorderConfigItem.
-                // Enum whitelist checks are deferred to the Worker's RecorderSettingsBuilderShared call.
+                // Enum whitelist checks (recorderType / imageFormat) are performed in the
+                // Worker's DistributedWorkerBridge.BuildImageSettingsFromRequest after
+                // JsonUtility.FromJson has restored the item (design doc §6).
                 // Here we confirm the JSON is not malformed by doing a lightweight parse check.
                 // JsonUtility.FromJson returns a default struct on partial/bad JSON rather than throwing,
                 // so we validate the envelope minimally.
@@ -289,6 +291,36 @@ namespace DistributedRecorder.Shared
                     !IsHexString(request.renderTextureGuid))
                 {
                     reason = $"renderTextureGuid must be a {RenderTextureGuidLength}-character hexadecimal AssetDatabase GUID.";
+                    return false;
+                }
+            }
+
+            // effectiveWidth / effectiveHeight / effectiveFrameRate
+            // 0 is the sentinel meaning "use the value from recorderConfigJson"; any
+            // non-zero value must be within the accepted range.
+            // These fields are only meaningful (and therefore validated) on the MTR
+            // fidelity path where timelineAssetPath or recorderConfigJson is present.
+            bool isMtrFidelityPath = !string.IsNullOrEmpty(request.timelineAssetPath)
+                                  || !string.IsNullOrEmpty(request.recorderConfigJson);
+
+            if (isMtrFidelityPath)
+            {
+                if (request.effectiveWidth != 0 &&
+                    (request.effectiveWidth < MinResolution || request.effectiveWidth > MaxResolution))
+                {
+                    reason = $"effectiveWidth must be 0 (use recorderConfigJson value) or between {MinResolution} and {MaxResolution}. Got: {request.effectiveWidth}.";
+                    return false;
+                }
+                if (request.effectiveHeight != 0 &&
+                    (request.effectiveHeight < MinResolution || request.effectiveHeight > MaxResolution))
+                {
+                    reason = $"effectiveHeight must be 0 (use recorderConfigJson value) or between {MinResolution} and {MaxResolution}. Got: {request.effectiveHeight}.";
+                    return false;
+                }
+                if (request.effectiveFrameRate != 0.0 &&
+                    (request.effectiveFrameRate <= 0.0 || request.effectiveFrameRate > MaxFrameRate))
+                {
+                    reason = $"effectiveFrameRate must be 0 (use recorderConfigJson value) or > 0 and <= {MaxFrameRate}. Got: {request.effectiveFrameRate}.";
                     return false;
                 }
             }

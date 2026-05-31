@@ -11,12 +11,14 @@ namespace Unity.MultiTimelineRecorder
     /// <summary>
     /// Shared, pure-static helper that constructs an <see cref="UnityEditor.Recorder.ImageRecorderSettings"/>
     /// from a <see cref="MultiRecorderConfig.RecorderConfigItem"/> using only the
-    /// Recorder 5.1.2 public API (no Reflection).
+    /// Recorder 5.1.2 public API (no Reflection, except for the Camera property set
+    /// which mirrors MTR's own approach — see remarks on <see cref="BuildImageSettings"/>).
     ///
-    /// This is the single authoritative implementation of MTR's Image settings
-    /// construction logic. Both the local MTR recording path and the distributed
-    /// Worker path call this method so that the resulting ImageRecorderSettings are
-    /// byte-for-byte identical regardless of which machine produces them.
+    /// Current usage: the distributed Worker path calls this method via
+    /// <c>DistributedWorkerBridge.BuildImageSettingsFromRequest</c>. The local MTR
+    /// recording path (<c>MultiTimelineRecorder_RecorderSettings.CreateImageRecorderSettingsFromConfig</c>)
+    /// still uses its own inline implementation; unifying both callers is a planned
+    /// next step but has been deferred to minimise upstream merge conflicts.
     ///
     /// Design rules:
     ///  - Pure static: no instance state, no Unity Object side-effects.

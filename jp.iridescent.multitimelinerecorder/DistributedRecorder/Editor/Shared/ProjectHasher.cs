@@ -105,7 +105,7 @@ namespace DistributedRecorder.Shared
         /// version is installed.  Changes to code that do not affect the recorded
         /// output should not invalidate the hash.
         ///
-        /// Excluded extensions: .cs, .dll, .pdb, .mdb, .xml (documentation).
+        /// Excluded extensions: .cs, .dll, .pdb, .mdb, .asmdef, .asmref.
         /// Included: .playable, .unity, .anim, .mat, .asset, .png, .jpg, .jpeg,
         ///           .exr, .tga, .hdr, .tiff, .psd, .wav, .mp3, .ogg, .fbx,
         ///           .obj, .prefab, .shader, .hlsl, .cginc, .shadergraph,
@@ -184,7 +184,7 @@ namespace DistributedRecorder.Shared
         /// Returns <c>true</c> when <paramref name="assetPath"/> is a script or
         /// compiled binary that should be excluded from the job-scope hash.
         ///
-        /// Excluded: .cs, .dll, .pdb, .mdb, .xml (standalone documentation files).
+        /// Excluded: .cs, .dll, .pdb, .mdb, .asmdef, .asmref.
         /// </summary>
         internal static bool IsScriptDependency(string assetPath)
         {

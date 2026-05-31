@@ -115,6 +115,21 @@ namespace Unity.MultiTimelineRecorder
                 return null;
             }
 
+            // Enum whitelist: reject unknown recorderType / imageFormat values that may
+            // have been produced by a newer or incompatible Master. This check runs on
+            // the Worker side – the network receive path – to enforce design doc §6.
+            if (!Enum.IsDefined(typeof(RecorderSettingsType), item.recorderType))
+            {
+                errorMessage = $"recorderConfigJson.recorderType value '{(int)item.recorderType}' is not in the allowed whitelist.";
+                return null;
+            }
+            if (item.recorderType == RecorderSettingsType.Image &&
+                !Enum.IsDefined(typeof(ImageRecorderSettings.ImageRecorderOutputFormat), item.imageFormat))
+            {
+                errorMessage = $"recorderConfigJson.imageFormat value '{(int)item.imageFormat}' is not in the allowed whitelist.";
+                return null;
+            }
+
             // Apply effective width/height/frameRate from request (overrides item values)
             int    effectiveWidth     = request.effectiveWidth  > 0 ? request.effectiveWidth  : item.width;
             int    effectiveHeight    = request.effectiveHeight > 0 ? request.effectiveHeight : item.height;
