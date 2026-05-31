@@ -221,7 +221,10 @@ namespace DistributedRecorder.Worker
                 ? "frame_<Frame>"
                 : config.fileNameTemplate;
 
-            return Path.Combine(outputDirectory, template).Replace('\\', '/');
+            // `template` contains the <Frame> wildcard ('<','>' are illegal path chars on
+            // Windows), so Path.Combine would throw "Illegal characters in path". Join manually.
+            return outputDirectory.Replace('\\', '/').TrimEnd('/')
+                + "/" + template.Replace('\\', '/').TrimStart('/');
         }
 
         // -----------------------------------------------------------------------

@@ -300,8 +300,11 @@ namespace DistributedRecorder.Worker
                     if (!string.IsNullOrEmpty(request.resolvedOutputRelativePath))
                     {
                         // Prepend the job's output base directory to the resolved relative path.
-                        outputFile = Path.Combine(baseOutputDir, request.resolvedOutputRelativePath)
-                            .Replace('\\', '/');
+                        // resolvedOutputRelativePath may contain <Frame>/<Take> wildcards ('<','>'
+                        // are illegal path chars on Windows), so Path.Combine throws "Illegal
+                        // characters in path". Join manually with '/'.
+                        outputFile = baseOutputDir.Replace('\\', '/').TrimEnd('/')
+                            + "/" + request.resolvedOutputRelativePath.Replace('\\', '/').TrimStart('/');
                     }
                     else
                     {
