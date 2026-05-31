@@ -5,11 +5,7 @@ using UnityEngine;
 using UnityEngine.Playables;
 using UnityEngine.Timeline;
 
-#if UNITY_RECORDER
-using UnityEditor.Recorder;
-using UnityEditor.Recorder.Input;
-using UnityEditor.Recorder.Timeline;
-#endif
+// NOTE: com.unity.recorder using blocks removed – AddRecorderClip was deleted (§C worker-recorder-redesign).
 
 namespace DistributedRecorder.Setup
 {
@@ -35,7 +31,7 @@ namespace DistributedRecorder.Setup
     ///   - Camera at (0, 3, -8) looking at origin — fixed, covers all three cubes
     ///   - SubjectCubeA at (-2.5, 0, 0), SubjectCubeB at (0, 0, 0), SubjectCubeC at (2.5, 0, 0)
     ///   - DirectorA, DirectorB, DirectorC — each PlayableDirector bound to its cube's AnimationTrack
-    ///   - Each Timeline has AnimationTrack + RecorderTrack/RecorderClip (PNG 1280×720, GameView)
+    ///   - Each Timeline has AnimationTrack only (Recorder is configured via MTR window per §C of worker-recorder-redesign)
     ///
     /// Design notes (from SampleSceneFactory iter10 lessons):
     ///   1. Timeline is created as an EMPTY asset first (CreateAsset), then reloaded, THEN tracks
@@ -240,10 +236,13 @@ namespace DistributedRecorder.Setup
                 "  1. Window > Multi Timeline Recorder でウィンドウを開く\n" +
                 "  2. 生成されたシーン (MtrMultiSample) を開き、" +
                 "DirectorA / DirectorB / DirectorC を + ボタンで登録\n" +
-                "  3. 各 Timeline の Recorder 列で Image Recorder を有効化\n" +
+                "  3. 各 Timeline の Recorder 列で Image Recorder を設定・有効化\n" +
+                "     (Timeline ごとに解像度・フォーマット・出力先などを MTR ウィンドウで設定する)\n" +
                 "  4. 分散レンダリングセクションの チェックボックスを ON にして" +
                 "WorkerRegistryAsset を割り当てる\n" +
                 "  5. 「分散実行」ボタンをクリック\n\n" +
+                "  ※ サンプルには Recorder トラックを含みません。\n" +
+                "     分散録画は MTR ウィンドウで設定した Image Recorder のみを使用します。\n" +
                 "  詳細なセットアップ手順: DistributedRecorder/README_DISTRIBUTED_MTR.md");
 
             Selection.activeObject =
@@ -293,14 +292,11 @@ namespace DistributedRecorder.Setup
             // Step 4: reload again to ensure AnimationTrack sub-asset is fully serialized
             saved = AssetDatabase.LoadAssetAtPath<TimelineAsset>(assetPath);
 
-            // Step 5: add RecorderTrack (requires UNITY_RECORDER)
-#if UNITY_RECORDER
-            AddRecorderClip(saved);
-#else
-            Debug.LogWarning(
-                "[MtrMultiTimelineSampleFactory] com.unity.recorder が未インストールのため " +
-                "RecorderTrack を Timeline " + timelineName + " に追加できませんでした。");
-#endif
+            // NOTE: RecorderTrack is NOT added here (§C worker-recorder-redesign).
+            // The distributed Worker builds a fresh ImageRecorderSettings from the
+            // transferred recorderConfigJson every job, so a baked RecorderClip is
+            // no longer needed or used. Configure Image Recorder via the MTR window
+            // before running distributed rendering.
 
             return saved;
         }
@@ -502,56 +498,6 @@ namespace DistributedRecorder.Setup
 
             return mat;
         }
-
-        // ------------------------------------------------------------------
-        // RecorderClip helper
-        // ------------------------------------------------------------------
-
-#if UNITY_RECORDER
-        /// <summary>
-        /// Adds a RecorderTrack + RecorderClip (ImageRecorderSettings, PNG 1280×720, GameView)
-        /// to an already-saved TimelineAsset.
-        ///
-        /// MUST be called after the asset is on disk (AssetDatabase.Contains == true)
-        /// so that AddObjectToAsset has a target file.
-        ///
-        /// hideFlags reset pattern: same as SampleSceneFactory.AddRecorderClipToTimeline.
-        /// </summary>
-        private static void AddRecorderClip(TimelineAsset timeline)
-        {
-            if (timeline == null) return;
-
-            var recTrack   = timeline.CreateTrack<RecorderTrack>(null, "Recorder");
-            var timeClip   = recTrack.CreateClip<RecorderClip>();
-            timeClip.start    = 0.0;
-            timeClip.duration = DurationSeconds;
-
-            var imageRec = ScriptableObject.CreateInstance<ImageRecorderSettings>();
-            imageRec.name         = "DistSampleImageRecorder";
-            imageRec.OutputFormat = ImageRecorderSettings.ImageRecorderOutputFormat.PNG;
-            imageRec.Enabled      = true;
-
-            imageRec.imageInputSettings = new GameViewInputSettings
-            {
-                OutputWidth  = 1280,
-                OutputHeight = 720,
-            };
-
-            // Placeholder output path — JobRunner overwrites per job
-            imageRec.OutputFile = "Recordings/_mtr_sample/frame_<Frame>";
-
-            // Reset hideFlags before AddObjectToAsset (prevents C++ assertion failure)
-            imageRec.hideFlags = HideFlags.None;
-
-            var recClip = timeClip.asset as RecorderClip;
-            if (recClip != null)
-                recClip.settings = imageRec;
-
-            AssetDatabase.AddObjectToAsset(imageRec, timeline);
-            EditorUtility.SetDirty(timeline);
-            AssetDatabase.SaveAssets();
-        }
-#endif
 
         // ------------------------------------------------------------------
         // Helpers
