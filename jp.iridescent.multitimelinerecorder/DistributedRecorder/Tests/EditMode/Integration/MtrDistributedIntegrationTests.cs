@@ -1,6 +1,8 @@
 // Tests for M4/M5: RecorderConfigItem→RecorderJobConfig mapping and round-robin assignment.
+// Tests for M6: job-state aggregation and result output path safety.
 // Hermetic: no Assets created/deleted, no EditorWindow instantiated, no Play Mode entered.
 
+using System;
 using System.Collections.Generic;
 using DistributedRecorder.Shared;
 using NUnit.Framework;
@@ -232,6 +234,223 @@ namespace DistributedRecorder.Tests.Integration
                 null);
 
             Assert.AreEqual(0, result.Count);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M6: Job-state aggregation tests
+    // -----------------------------------------------------------------------
+
+    [TestFixture]
+    public class MtrJobStateAggregationTests
+    {
+        private static MtrJobViewModel MakeVm(JobState state)
+            => new MtrJobViewModel { JobId = Guid.NewGuid().ToString("N"), State = state };
+
+        // ── AreAllJobsTerminal ───────────────────────────────────────────────
+
+        [Test]
+        public void AreAllJobsTerminal_AllCompleted_ReturnsTrue()
+        {
+            var vms = new List<MtrJobViewModel>
+            {
+                MakeVm(JobState.Completed),
+                MakeVm(JobState.Completed)
+            };
+            Assert.IsTrue(MultiTimelineRecorder.AreAllJobsTerminal(vms));
+        }
+
+        [Test]
+        public void AreAllJobsTerminal_AllFailed_ReturnsTrue()
+        {
+            var vms = new List<MtrJobViewModel>
+            {
+                MakeVm(JobState.Failed),
+                MakeVm(JobState.Failed)
+            };
+            Assert.IsTrue(MultiTimelineRecorder.AreAllJobsTerminal(vms));
+        }
+
+        [Test]
+        public void AreAllJobsTerminal_MixedTerminal_ReturnsTrue()
+        {
+            var vms = new List<MtrJobViewModel>
+            {
+                MakeVm(JobState.Completed),
+                MakeVm(JobState.Failed),
+                MakeVm(JobState.Cancelled),
+                MakeVm(JobState.Unreachable)
+            };
+            Assert.IsTrue(MultiTimelineRecorder.AreAllJobsTerminal(vms));
+        }
+
+        [Test]
+        public void AreAllJobsTerminal_OneRunning_ReturnsFalse()
+        {
+            var vms = new List<MtrJobViewModel>
+            {
+                MakeVm(JobState.Completed),
+                MakeVm(JobState.Running)
+            };
+            Assert.IsFalse(MultiTimelineRecorder.AreAllJobsTerminal(vms));
+        }
+
+        [Test]
+        public void AreAllJobsTerminal_OnePending_ReturnsFalse()
+        {
+            var vms = new List<MtrJobViewModel> { MakeVm(JobState.Pending) };
+            Assert.IsFalse(MultiTimelineRecorder.AreAllJobsTerminal(vms));
+        }
+
+        [Test]
+        public void AreAllJobsTerminal_EmptyList_ReturnsTrue()
+        {
+            Assert.IsTrue(MultiTimelineRecorder.AreAllJobsTerminal(new List<MtrJobViewModel>()));
+        }
+
+        [Test]
+        public void AreAllJobsTerminal_NullList_ReturnsTrue()
+        {
+            Assert.IsTrue(MultiTimelineRecorder.AreAllJobsTerminal(null));
+        }
+
+        // ── CountJobsInState ─────────────────────────────────────────────────
+
+        [Test]
+        public void CountJobsInState_TwoCompleted_ReturnsTwo()
+        {
+            var vms = new List<MtrJobViewModel>
+            {
+                MakeVm(JobState.Completed),
+                MakeVm(JobState.Completed),
+                MakeVm(JobState.Failed)
+            };
+            Assert.AreEqual(2, MultiTimelineRecorder.CountJobsInState(vms, JobState.Completed));
+        }
+
+        [Test]
+        public void CountJobsInState_NoneMatching_ReturnsZero()
+        {
+            var vms = new List<MtrJobViewModel> { MakeVm(JobState.Running) };
+            Assert.AreEqual(0, MultiTimelineRecorder.CountJobsInState(vms, JobState.Completed));
+        }
+
+        [Test]
+        public void CountJobsInState_NullList_ReturnsZero()
+        {
+            Assert.AreEqual(0, MultiTimelineRecorder.CountJobsInState(null, JobState.Completed));
+        }
+
+        [Test]
+        public void CountJobsInState_MixedStates_CountsCorrectly()
+        {
+            var vms = new List<MtrJobViewModel>
+            {
+                MakeVm(JobState.Pending),
+                MakeVm(JobState.Running),
+                MakeVm(JobState.Running),
+                MakeVm(JobState.Completed),
+                MakeVm(JobState.Failed)
+            };
+            Assert.AreEqual(2, MultiTimelineRecorder.CountJobsInState(vms, JobState.Running),  "Running");
+            Assert.AreEqual(1, MultiTimelineRecorder.CountJobsInState(vms, JobState.Completed), "Completed");
+            Assert.AreEqual(1, MultiTimelineRecorder.CountJobsInState(vms, JobState.Failed),    "Failed");
+            Assert.AreEqual(1, MultiTimelineRecorder.CountJobsInState(vms, JobState.Pending),   "Pending");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M6: BuildResultOutputDir path-safety tests
+    // -----------------------------------------------------------------------
+
+    [TestFixture]
+    public class MtrResultOutputPathTests
+    {
+        private const string FakeRoot = "C:/Projects/MyUnityProject";
+
+        // ── Normal cases ─────────────────────────────────────────────────────
+
+        [Test]
+        public void BuildResultOutputDir_ValidJobId_ContainsExpectedSegments()
+        {
+            string jobId = "abc123def456";
+            string path  = MultiTimelineRecorder.BuildResultOutputDir(FakeRoot, jobId);
+
+            StringAssert.Contains("Recordings", path, "should contain Recordings");
+            StringAssert.Contains("Distributed", path, "should contain Distributed");
+            StringAssert.Contains(jobId, path, "should contain jobId");
+        }
+
+        [Test]
+        public void BuildResultOutputDir_GuidStyleJobId_ProducesValidPath()
+        {
+            // GUID without hyphens (Guid.ToString("N") format used in production code)
+            string jobId = "a1b2c3d4e5f64a3b8c9d0e1f2a3b4c5d";
+            string path  = MultiTimelineRecorder.BuildResultOutputDir(FakeRoot, jobId);
+
+            Assert.IsFalse(path.Contains(".."), "path must not contain '..'");
+        }
+
+        [Test]
+        public void BuildResultOutputDir_DoesNotContainDotDot()
+        {
+            string jobId = "0123456789abcdef0123456789abcdef";
+            string path  = MultiTimelineRecorder.BuildResultOutputDir(FakeRoot, jobId);
+            Assert.IsFalse(path.Contains(".."), "path must not contain '..'");
+        }
+
+        // ── Boundary / error cases ───────────────────────────────────────────
+
+        [Test]
+        public void BuildResultOutputDir_JobIdWithDotDot_ThrowsArgumentException()
+        {
+            Assert.Throws<ArgumentException>(
+                () => MultiTimelineRecorder.BuildResultOutputDir(FakeRoot, "../../etc"),
+                "jobId with '..' must throw");
+        }
+
+        [Test]
+        public void BuildResultOutputDir_JobIdWithForwardSlash_ThrowsArgumentException()
+        {
+            Assert.Throws<ArgumentException>(
+                () => MultiTimelineRecorder.BuildResultOutputDir(FakeRoot, "sub/dir"),
+                "jobId with '/' must throw");
+        }
+
+        [Test]
+        public void BuildResultOutputDir_JobIdWithBackSlash_ThrowsArgumentException()
+        {
+            Assert.Throws<ArgumentException>(
+                () => MultiTimelineRecorder.BuildResultOutputDir(FakeRoot, "sub\\dir"),
+                "jobId with '\\' must throw");
+        }
+
+        [Test]
+        public void BuildResultOutputDir_NullProjectRoot_ThrowsArgumentNullException()
+        {
+            Assert.Throws<ArgumentNullException>(
+                () => MultiTimelineRecorder.BuildResultOutputDir(null, "abc123"));
+        }
+
+        [Test]
+        public void BuildResultOutputDir_EmptyProjectRoot_ThrowsArgumentNullException()
+        {
+            Assert.Throws<ArgumentNullException>(
+                () => MultiTimelineRecorder.BuildResultOutputDir(string.Empty, "abc123"));
+        }
+
+        [Test]
+        public void BuildResultOutputDir_NullJobId_ThrowsArgumentNullException()
+        {
+            Assert.Throws<ArgumentNullException>(
+                () => MultiTimelineRecorder.BuildResultOutputDir(FakeRoot, null));
+        }
+
+        [Test]
+        public void BuildResultOutputDir_EmptyJobId_ThrowsArgumentNullException()
+        {
+            Assert.Throws<ArgumentNullException>(
+                () => MultiTimelineRecorder.BuildResultOutputDir(FakeRoot, string.Empty));
         }
     }
 }
