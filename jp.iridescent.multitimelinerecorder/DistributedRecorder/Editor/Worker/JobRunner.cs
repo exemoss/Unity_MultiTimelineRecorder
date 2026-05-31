@@ -480,6 +480,13 @@ namespace DistributedRecorder.Worker
             _director          = null;
             _lastKnownFrame    = 0;
 
+            // Clear any leftover Time.captureFramerate. The Recorder sets this global while
+            // recording at a fixed rate; with Domain Reload OFF it "sticks" in the Editor after
+            // a job, so the next job's recorder reports
+            //   "another component has already set a conflicting value for [Time.captureFramerate]"
+            // and the recording fails. Reset to 0 so each job starts from a clean state.
+            UnityEngine.Time.captureFramerate = 0;
+
             // playModeStateChanged fires for EnteredPlayMode so we can re-acquire director.
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             EditorApplication.update               += OnUpdate;
@@ -742,6 +749,9 @@ namespace DistributedRecorder.Worker
 
             Debug.Log($"[JobRunner] Edit Mode に戻りました。ジョブ完了処理: '{_runningJobId}'");
             AppendE2ELog("[JobRunner] Edit Mode に戻りました。");
+            // Reset the sticky capture frame rate so the Editor returns to normal and the next
+            // job does not hit the "[Time.captureFramerate] conflicting value" recorder error.
+            UnityEngine.Time.captureFramerate = 0;
             UnsubscribeAll();
             FinalizeCompletedJob(_runningJobId);
         }
