@@ -107,8 +107,9 @@ namespace DistributedRecorder.Worker
         /// carrying the supplied <paramref name="settings"/> to the given
         /// <paramref name="timeline"/>.
         ///
-        /// The clip spans the full duration of the Timeline
-        /// (from <c>0</c> to <see cref="TimelineAsset.duration"/>).
+        /// When <paramref name="startTime"/> and <paramref name="endTime"/> specify a valid
+        /// sub-range (endTime &gt; startTime &gt;= 0), the clip is positioned to cover only
+        /// that range.  Otherwise the clip spans the full Timeline duration (fallback).
         ///
         /// NOTE: The method modifies the timeline in-memory; the caller must not
         /// call <c>AssetDatabase.SaveAssets()</c> on the timeline asset to avoid
@@ -116,13 +117,43 @@ namespace DistributedRecorder.Worker
         /// </summary>
         /// <param name="timeline">Target timeline (must not be null).</param>
         /// <param name="settings">Pre-built recorder settings (must not be null).</param>
+        /// <param name="startTime">
+        /// Recording start time in seconds (Timeline-local).
+        /// Pass 0 (or any value where endTime &lt;= startTime) to use full Timeline duration.
+        /// </param>
+        /// <param name="endTime">
+        /// Recording end time in seconds (Timeline-local).
+        /// Must be &gt; startTime to activate sub-range recording; otherwise full duration is used.
+        /// </param>
         /// <returns>The created <see cref="RecorderClip"/> (non-null on success).</returns>
-        public static RecorderClip ApplyToTimeline(TimelineAsset timeline, ImageRecorderSettings settings)
+        public static RecorderClip ApplyToTimeline(
+            TimelineAsset timeline,
+            ImageRecorderSettings settings,
+            double startTime = 0.0,
+            double endTime   = 0.0)
         {
             if (timeline == null)
                 throw new ArgumentNullException(nameof(timeline));
             if (settings == null)
                 throw new ArgumentNullException(nameof(settings));
+
+            // Determine clip placement.
+            // Use the sub-range when endTime > startTime >= 0; otherwise fall back to full duration.
+            bool hasRange = startTime >= 0.0 && endTime > startTime;
+
+            double clipStart;
+            double clipDuration;
+            if (hasRange)
+            {
+                clipStart    = startTime;
+                clipDuration = endTime - startTime;
+            }
+            else
+            {
+                // Full Timeline duration fallback (original behavior).
+                clipStart    = 0.0;
+                clipDuration = timeline.duration > 0.0 ? timeline.duration : 1.0;
+            }
 
             // Create a dedicated RecorderTrack for this distributed job.
             // Naming convention makes it identifiable for cleanup / debugging.
@@ -130,8 +161,8 @@ namespace DistributedRecorder.Worker
 
             // Create the RecorderClip on the track.
             var timelineClip = recorderTrack.CreateClip<RecorderClip>();
-            timelineClip.start    = 0.0;
-            timelineClip.duration = timeline.duration > 0.0 ? timeline.duration : 1.0;
+            timelineClip.start    = clipStart;
+            timelineClip.duration = clipDuration;
 
             var recorderClip = timelineClip.asset as RecorderClip;
             if (recorderClip == null)
@@ -149,14 +180,24 @@ namespace DistributedRecorder.Worker
         /// <param name="config">Validated recorder configuration DTO.</param>
         /// <param name="absoluteOutputFilePath">Output file path template (without extension).</param>
         /// <param name="timeline">Target Timeline asset (modified in-memory).</param>
+        /// <param name="startTime">
+        /// Recording start time in seconds (Timeline-local).
+        /// Pass 0 (or any value where endTime &lt;= startTime) to record the full Timeline.
+        /// </param>
+        /// <param name="endTime">
+        /// Recording end time in seconds (Timeline-local).
+        /// Must be &gt; startTime to activate sub-range recording.
+        /// </param>
         /// <returns>The created <see cref="RecorderClip"/>.</returns>
         public static RecorderClip BuildAndApply(
             RecorderJobConfig config,
             string absoluteOutputFilePath,
-            TimelineAsset timeline)
+            TimelineAsset timeline,
+            double startTime = 0.0,
+            double endTime   = 0.0)
         {
             var imageSettings = BuildImageSettings(config, absoluteOutputFilePath);
-            return ApplyToTimeline(timeline, imageSettings);
+            return ApplyToTimeline(timeline, imageSettings, startTime, endTime);
         }
 
         /// <summary>

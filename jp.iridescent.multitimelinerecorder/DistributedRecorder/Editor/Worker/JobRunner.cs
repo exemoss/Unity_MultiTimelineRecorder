@@ -291,7 +291,8 @@ namespace DistributedRecorder.Worker
                 try
                 {
                     preflightRecorderClip = MtrRecorderClipBuilder.BuildAndApply(
-                        request.recorderConfig, outputTemplate, timelineAsset);
+                        request.recorderConfig, outputTemplate, timelineAsset,
+                        request.startTime, request.endTime);
                 }
                 catch (Exception ex)
                 {
