@@ -370,7 +370,7 @@ namespace Unity.MultiTimelineRecorder
                 // Resolve hierarchy path
                 string hierarchyPath = BuildHierarchyPath(director.gameObject);
 
-                // Map RecorderConfigItem → RecorderJobConfig
+                // Map RecorderConfigItem → RecorderJobConfig (legacy DTO, kept for backward compat)
                 var jobConfig = MapToRecorderJobConfig(imageItem);
 
                 // Resolve Timeline asset path
@@ -378,16 +378,94 @@ namespace Unity.MultiTimelineRecorder
                 if (director.playableAsset != null)
                     timelineAssetPath = AssetDatabase.GetAssetPath(director.playableAsset);
 
+                // --- MTR fidelity: resolve new fields ---
+
+                // Serialize full config (without Object references; they are sent as path/GUID)
+                string recorderConfigJson = JsonUtility.ToJson(imageItem);
+
+                // Resolve camera reference to hierarchy path / name
+                string targetCameraHierarchyPath = string.Empty;
+                string targetCameraName = string.Empty;
+                if (imageItem.imageSourceType == ImageRecorderSourceType.TargetCamera &&
+                    imageItem.imageTargetCamera != null)
+                {
+                    var camGo = imageItem.imageTargetCamera.gameObject;
+                    targetCameraHierarchyPath = BuildHierarchyPath(camGo);
+                    targetCameraName          = camGo.name;
+                }
+
+                // Resolve RenderTexture to GUID
+                string renderTextureGuid = string.Empty;
+                if (imageItem.imageSourceType == ImageRecorderSourceType.RenderTexture &&
+                    imageItem.imageRenderTexture != null)
+                {
+                    string rtPath = AssetDatabase.GetAssetPath(imageItem.imageRenderTexture);
+                    if (!string.IsNullOrEmpty(rtPath))
+                        renderTextureGuid = AssetDatabase.AssetPathToGUID(rtPath);
+                }
+
+                // Resolve effective width/height respecting global/per-item rule
+                // MTR: settings.useGlobalResolution controls whether the global width/height is used
+                var globalSettings = MultiTimelineRecorderSettings.LoadOrCreateSettings();
+                int effectiveWidth;
+                int effectiveHeight;
+                if (globalSettings != null && globalSettings.multiRecorderConfig != null &&
+                    globalSettings.multiRecorderConfig.useGlobalResolution)
+                {
+                    effectiveWidth  = globalSettings.width;
+                    effectiveHeight = globalSettings.height;
+                }
+                else
+                {
+                    effectiveWidth  = imageItem.width;
+                    effectiveHeight = imageItem.height;
+                }
+
+                // Effective frame rate always comes from global MTR settings (same as
+                // CreateImageRecorderSettingsFromConfig which uses `this.settings.frameRate`)
+                double effectiveFrameRate = globalSettings != null ? globalSettings.frameRate : imageItem.frameRate;
+
+                // Resolve output path: process Take/Scene wildcards now; preserve <Frame> for Recorder
+                string resolvedOutputRelativePath = ResolveOutputRelativePath(
+                    imageItem, activeScenePath, director);
+
+                // Compute job-scope hash (timeline + deps + scene only, no whole-Assets scan)
+                string jobScopeHash = string.Empty;
+                if (!string.IsNullOrEmpty(timelineAssetPath) && !string.IsNullOrEmpty(activeScenePath))
+                {
+                    try
+                    {
+                        jobScopeHash = ProjectHasher.ComputeJobScope(
+                            timelineAssetPath, activeScenePath);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] ジョブスコープハッシュの計算に失敗しました " +
+                            $"(timeline={timelineAssetPath}): {ex.Message}");
+                    }
+                }
+
                 result.Add(new DistributedTimelineJob
                 {
-                    Director            = director,
-                    TimelineAssetPath   = timelineAssetPath,
-                    DirectorObjectName  = director.gameObject.name,
-                    DirectorHierarchyPath = hierarchyPath,
-                    JobConfig           = jobConfig,
-                    StartTime           = startT,
-                    EndTime             = endT,
-                    ScenePath           = activeScenePath
+                    Director                  = director,
+                    TimelineAssetPath         = timelineAssetPath,
+                    DirectorObjectName        = director.gameObject.name,
+                    DirectorHierarchyPath     = hierarchyPath,
+                    JobConfig                 = jobConfig,
+                    StartTime                 = startT,
+                    EndTime                   = endT,
+                    ScenePath                 = activeScenePath,
+                    // MTR fidelity fields
+                    RecorderConfigJson        = recorderConfigJson,
+                    TargetCameraHierarchyPath = targetCameraHierarchyPath,
+                    TargetCameraName          = targetCameraName,
+                    RenderTextureGuid         = renderTextureGuid,
+                    EffectiveWidth            = effectiveWidth,
+                    EffectiveHeight           = effectiveHeight,
+                    EffectiveFrameRate        = effectiveFrameRate,
+                    ResolvedOutputRelativePath = resolvedOutputRelativePath,
+                    JobScopeHash              = jobScopeHash
                 });
             }
 
@@ -638,15 +716,25 @@ namespace Unity.MultiTimelineRecorder
 
                 var request = new JobRequest
                 {
-                    jobId                  = vm.JobId,
-                    scenePath              = job.ScenePath,
-                    timelineAssetPath      = job.TimelineAssetPath,
-                    directorObjectName     = job.DirectorObjectName,
-                    directorHierarchyPath  = job.DirectorHierarchyPath,
-                    recorderConfig         = job.JobConfig,
-                    startTime              = job.StartTime,
-                    endTime                = job.EndTime,
-                    outputSubDir           = vm.JobId
+                    jobId                      = vm.JobId,
+                    scenePath                  = job.ScenePath,
+                    timelineAssetPath          = job.TimelineAssetPath,
+                    directorObjectName         = job.DirectorObjectName,
+                    directorHierarchyPath      = job.DirectorHierarchyPath,
+                    recorderConfig             = job.JobConfig,
+                    startTime                  = job.StartTime,
+                    endTime                    = job.EndTime,
+                    outputSubDir               = vm.JobId,
+                    // MTR fidelity fields
+                    jobScopeHash               = job.JobScopeHash,
+                    recorderConfigJson         = job.RecorderConfigJson,
+                    targetCameraHierarchyPath  = job.TargetCameraHierarchyPath,
+                    targetCameraName           = job.TargetCameraName,
+                    renderTextureGuid          = job.RenderTextureGuid,
+                    effectiveWidth             = job.EffectiveWidth,
+                    effectiveHeight            = job.EffectiveHeight,
+                    effectiveFrameRate         = job.EffectiveFrameRate,
+                    resolvedOutputRelativePath = job.ResolvedOutputRelativePath
                 };
 
                 bool accepted = await DispatchOneWithOverrideAsync(
@@ -1025,6 +1113,95 @@ namespace Unity.MultiTimelineRecorder
             int len = Math.Min(8, reason.Length - start);
             return reason.Substring(start, len) + "…";
         }
+
+        /// <summary>
+        /// Resolves the output relative path for a given recorder config item,
+        /// substituting MTR wildcards that are known at dispatch time (<c>&lt;Take&gt;</c>,
+        /// <c>&lt;Scene&gt;</c>, <c>&lt;Timeline&gt;</c>, etc.) while preserving
+        /// <c>&lt;Frame&gt;</c> for the Recorder to resolve at capture time.
+        ///
+        /// The result is a relative path fragment that the Worker prepends with
+        /// <c>Recordings/{jobId}/</c>.  It is guaranteed to be relative and free of
+        /// ".." traversal.
+        ///
+        /// Made internal for hermetic testing.
+        /// </summary>
+        internal static string ResolveOutputRelativePath(
+            MultiRecorderConfig.RecorderConfigItem item,
+            string scenePath,
+            PlayableDirector director)
+        {
+            string sceneName = string.IsNullOrEmpty(scenePath)
+                ? "Scene"
+                : Path.GetFileNameWithoutExtension(scenePath);
+
+            string timelineName = (director != null && director.playableAsset != null)
+                ? director.playableAsset.name
+                : "Timeline";
+
+            // Build the wildcard context; PreserveFrameWildcard=true so <Frame> is kept intact.
+            var ctx = new WildcardContext
+            {
+                SceneName              = sceneName,
+                TimelineName           = timelineName,
+                TakeNumber             = item.takeNumber,
+                Width                  = item.width,
+                Height                 = item.height,
+                RecorderType           = RecorderSettingsType.Image,
+                PreserveFrameWildcard  = true,
+                RecorderDisplayName    = item.name,
+                RecorderName           = item.name
+            };
+
+            // Determine the raw path from the item's output path settings
+            string rawPath;
+            if (item.outputPath != null && item.outputPath.pathMode == RecorderPathMode.Custom &&
+                !string.IsNullOrEmpty(item.outputPath.path))
+            {
+                // Custom path: use it directly (it is already relative or will be made relative below)
+                rawPath = item.outputPath.path + "/" + item.fileName;
+            }
+            else
+            {
+                // UseGlobal / default: use only the fileName (the global output root is handled
+                // on the Worker side by prepending Recordings/{jobId}/)
+                rawPath = item.fileName;
+            }
+
+            // Process all wildcards except <Frame>
+            string processed = WildcardProcessor.ProcessWildcards(rawPath, ctx);
+
+            // Sanitize: strip leading slashes, normalize separators
+            processed = processed.Replace('\\', '/').TrimStart('/');
+
+            // Safety: reject absolute paths or ".." (should not happen after wildcard
+            // processing, but defend-in-depth)
+            if (Path.IsPathRooted(processed) || processed.StartsWith("/", StringComparison.Ordinal))
+            {
+                Debug.LogWarning(
+                    $"[DistributedRecorder] resolvedOutputRelativePath was absolute after processing; " +
+                    $"falling back to safe default. Original: {rawPath}");
+                processed = $"{sceneName}_{timelineName}/{item.fileName}";
+                processed = WildcardProcessor.ProcessWildcards(processed, ctx);
+                processed = processed.Replace('\\', '/').TrimStart('/');
+            }
+
+            // Check for ".." traversal components
+            bool hasDotDot = false;
+            foreach (string part in processed.Split('/'))
+            {
+                if (part == "..") { hasDotDot = true; break; }
+            }
+            if (hasDotDot)
+            {
+                Debug.LogWarning(
+                    $"[DistributedRecorder] resolvedOutputRelativePath contained '..'; " +
+                    $"falling back to safe default. Original: {rawPath}");
+                processed = $"{sceneName}_{item.name}_{item.takeNumber}/<Frame>";
+            }
+
+            return processed;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1050,7 +1227,7 @@ namespace Unity.MultiTimelineRecorder
         /// <summary>Full hierarchy path of the PlayableDirector's GameObject (e.g. "Root/Director").</summary>
         public string DirectorHierarchyPath;
 
-        /// <summary>Normalized recorder configuration to send inside JobRequest.</summary>
+        /// <summary>Normalized recorder configuration to send inside JobRequest (legacy DTO).</summary>
         public RecorderJobConfig JobConfig;
 
         /// <summary>Recording start time in seconds (signal-resolved or 0).</summary>
@@ -1061,6 +1238,39 @@ namespace Unity.MultiTimelineRecorder
 
         /// <summary>Active scene path at the time of collection.</summary>
         public string ScenePath;
+
+        // --- MTR fidelity fields (mtr-distributed-integration M3) ---
+
+        /// <summary>
+        /// Full RecorderConfigItem serialized by JsonUtility.ToJson (without Camera/RT Object refs).
+        /// </summary>
+        public string RecorderConfigJson;
+
+        /// <summary>Hierarchy path of the target Camera (TargetCamera source type).</summary>
+        public string TargetCameraHierarchyPath;
+
+        /// <summary>Name of the target Camera GameObject (fallback when hierarchy path is empty).</summary>
+        public string TargetCameraName;
+
+        /// <summary>AssetDatabase GUID of the RenderTexture (RenderTexture source type).</summary>
+        public string RenderTextureGuid;
+
+        /// <summary>Resolved output width after applying global/per-item resolution rules.</summary>
+        public int EffectiveWidth;
+
+        /// <summary>Resolved output height.</summary>
+        public int EffectiveHeight;
+
+        /// <summary>Resolved frame rate from MTR global settings.</summary>
+        public double EffectiveFrameRate;
+
+        /// <summary>
+        /// Output relative path fragment with Take/Scene wildcards resolved; Frame preserved.
+        /// </summary>
+        public string ResolvedOutputRelativePath;
+
+        /// <summary>Job-scoped hash (timeline + deps + scene).</summary>
+        public string JobScopeHash;
     }
 
     /// <summary>
