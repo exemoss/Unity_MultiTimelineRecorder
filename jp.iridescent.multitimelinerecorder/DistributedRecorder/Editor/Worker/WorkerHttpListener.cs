@@ -298,17 +298,46 @@ namespace DistributedRecorder.Worker
                 return;
             }
 
-            // Project hash check.
+            // Project / job-scope hash check.
+            // MTR jobs (timelineAssetPath non-empty) use the job-scope hash (timeline+deps+scene only).
+            // Legacy jobs (timelineAssetPath empty) use the whole-Assets projectHash as before.
             // Delegate to CheckProjectHash so the logic is unit-testable.
-            string localHash = ProjectHasher.Compute(ProjectPaths.ProjectRoot);
-            if (!CheckProjectHash(localHash, request.projectHash, request.skipHashCheck,
+            bool isMtrJob = !string.IsNullOrEmpty(request.timelineAssetPath);
+            string localHash;
+            string masterHashToCheck;
+            if (isMtrJob && !string.IsNullOrEmpty(request.jobScopeHash))
+            {
+                // MTR path: compute job-scope hash and compare against jobScopeHash.
+                try
+                {
+                    localHash = ProjectHasher.ComputeJobScope(
+                        request.timelineAssetPath, request.scenePath);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning(
+                        $"[Worker] ジョブスコープハッシュ計算失敗 – whole-Assets ハッシュにフォールバック: {ex.Message}");
+                    localHash = ProjectHasher.Compute(ProjectPaths.ProjectRoot);
+                }
+                masterHashToCheck = request.jobScopeHash;
+            }
+            else
+            {
+                // Legacy path: whole-Assets hash.
+                localHash         = ProjectHasher.Compute(ProjectPaths.ProjectRoot);
+                masterHashToCheck = request.projectHash;
+            }
+
+            if (!CheckProjectHash(localHash, masterHashToCheck, request.skipHashCheck,
                                   out bool shouldWarnHash))
             {
+                string hashType = (isMtrJob && !string.IsNullOrEmpty(request.jobScopeHash))
+                    ? "job-scope hash" : "project hash";
                 var ack = new JobAck
                 {
                     jobId    = request.jobId,
                     accepted = false,
-                    reason   = $"Project hash mismatch (local={localHash}, master={request.projectHash}). " +
+                    reason   = $"{hashType} mismatch (local={localHash}, master={masterHashToCheck}). " +
                                "両 PC を `git pull` で同じコミットに揃えるか、" +
                                "Master 側で上書き許可（Send anyway）で続行してください。"
                 };
@@ -318,9 +347,13 @@ namespace DistributedRecorder.Worker
             if (shouldWarnHash)
             {
                 // Override approved by user – proceed with local project copy.
+                string masterShort = masterHashToCheck.Length >= 8
+                    ? masterHashToCheck.Substring(0, 8) : masterHashToCheck;
+                string localShort  = localHash.Length >= 8
+                    ? localHash.Substring(0, 8) : localHash;
                 Debug.LogWarning(
-                    "[Worker] プロジェクトハッシュ不一致だが skipHashCheck により実行します" +
-                    $"（local={localHash.Substring(0, 8)}…, master={request.projectHash.Substring(0, 8)}…）。" +
+                    "[Worker] ハッシュ不一致だが skipHashCheck により実行します" +
+                    $"（local={localShort}…, master={masterShort}…）。" +
                     "Worker のローカル版プロジェクトで録画します。");
             }
 

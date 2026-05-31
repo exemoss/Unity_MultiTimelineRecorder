@@ -279,29 +279,95 @@ namespace DistributedRecorder.Worker
 
             if (isMtrPath && request.recorderConfig != null)
             {
-                // MTR path: build RecorderClip from the normalized DTO.
-                // The clip is attached to the timeline in-memory; no asset save.
+                // MTR path: build RecorderClip.
+                // Prefer the MTR-fidelity path (recorderConfigJson) for faithful reproduction;
+                // fall back to the normalized DTO path for backward compatibility with older Masters.
                 string baseOutputDir = _store.GetOutputDirectory(request.jobId);
                 if (!string.IsNullOrEmpty(request.outputSubDir))
                     baseOutputDir = Path.Combine(baseOutputDir, request.outputSubDir);
 
-                string outputTemplate = MtrRecorderClipBuilder.ResolveOutputFilePath(
-                    baseOutputDir, request.recorderConfig);
+                bool usedFidelityPath = false;
 
-                try
+                // --- MTR-fidelity path (M3): recorderConfigJson present ---
+                // Uses the FidelityBuilderRegistry delegate (registered at domain reload by
+                // Unity.MultiTimelineRecorder.DistributedWorkerBridge) to avoid a circular
+                // assembly reference DistributedRecorder.Editor → Unity.MultiTimelineRecorder.Editor.
+                if (!string.IsNullOrEmpty(request.recorderConfigJson) &&
+                    FidelityBuilderRegistry.OnBuildImageSettings != null)
                 {
-                    preflightRecorderClip = MtrRecorderClipBuilder.BuildAndApply(
-                        request.recorderConfig, outputTemplate, timelineAsset,
-                        request.startTime, request.endTime);
-                }
-                catch (Exception ex)
-                {
-                    FailJob(request.jobId,
-                        $"[A4] MtrRecorderClipBuilder でRecorderClipの構築に失敗しました: {ex.Message}");
-                    return;
+                    // Determine output file path from resolvedOutputRelativePath (M3) or fallback.
+                    string outputFile;
+                    if (!string.IsNullOrEmpty(request.resolvedOutputRelativePath))
+                    {
+                        // Prepend the job's output base directory to the resolved relative path.
+                        outputFile = Path.Combine(baseOutputDir, request.resolvedOutputRelativePath)
+                            .Replace('\\', '/');
+                    }
+                    else
+                    {
+                        // Fallback: use the legacy fileNameTemplate from recorderConfig.
+                        outputFile = MtrRecorderClipBuilder.ResolveOutputFilePath(
+                            baseOutputDir, request.recorderConfig);
+                    }
+
+                    // Invoke the MTR-side bridge to build ImageRecorderSettings.
+                    bool buildOk = FidelityBuilderRegistry.OnBuildImageSettings(
+                        request, outputFile, out object settingsObj, out string buildError);
+
+                    if (!buildOk || settingsObj == null)
+                    {
+                        FailJob(request.jobId,
+                            $"[A4] MTRフィデリティ設定の構築に失敗しました: {buildError}");
+                        return;
+                    }
+
+                    var imageSettings = settingsObj as ImageRecorderSettings;
+                    if (imageSettings == null)
+                    {
+                        FailJob(request.jobId,
+                            "[A4] DistributedWorkerBridge が ImageRecorderSettings を返しませんでした。" +
+                            "com.unity.recorder のバージョンを確認してください。");
+                        return;
+                    }
+
+                    try
+                    {
+                        preflightRecorderClip = MtrRecorderClipBuilder.ApplyToTimeline(
+                            timelineAsset, imageSettings, request.startTime, request.endTime);
+                    }
+                    catch (Exception ex)
+                    {
+                        UnityEngine.Object.DestroyImmediate(imageSettings);
+                        FailJob(request.jobId,
+                            $"[A4] RecorderClip の Timeline への適用に失敗しました: {ex.Message}");
+                        return;
+                    }
+
+                    AppendE2ELog($"[JobRunner] MTRフィデリティパスでRecorderClipを構築しました: {outputFile}");
+                    usedFidelityPath = true;
                 }
 
-                AppendE2ELog($"[JobRunner] MtrRecorderClipBuilderでRecorderClipを構築しました: {outputTemplate}");
+                // --- Legacy DTO path: recorderConfig only ---
+                if (!usedFidelityPath)
+                {
+                    string outputTemplate = MtrRecorderClipBuilder.ResolveOutputFilePath(
+                        baseOutputDir, request.recorderConfig);
+
+                    try
+                    {
+                        preflightRecorderClip = MtrRecorderClipBuilder.BuildAndApply(
+                            request.recorderConfig, outputTemplate, timelineAsset,
+                            request.startTime, request.endTime);
+                    }
+                    catch (Exception ex)
+                    {
+                        FailJob(request.jobId,
+                            $"[A4] MtrRecorderClipBuilder でRecorderClipの構築に失敗しました: {ex.Message}");
+                        return;
+                    }
+
+                    AppendE2ELog($"[JobRunner] Legacy DTOパスでRecorderClipを構築しました: {outputTemplate}");
+                }
             }
             else
             {
@@ -329,10 +395,12 @@ namespace DistributedRecorder.Worker
             // timeline.duration is in seconds; frameRate is the Timeline editor rate.
             double durationSec  = timelineAsset.duration;
 
-            // For the MTR path, use recorderConfig.frameRate if provided (> 0);
-            // otherwise fall back to the Timeline's own editorSettings.frameRate.
+            // For the MTR path, prefer effectiveFrameRate (resolved by Master from MTR global settings);
+            // fall back to recorderConfig.frameRate, then to the Timeline's own frame rate.
             double fps;
-            if (isMtrPath && request.recorderConfig != null && request.recorderConfig.frameRate > 0)
+            if (isMtrPath && request.effectiveFrameRate > 0)
+                fps = request.effectiveFrameRate;
+            else if (isMtrPath && request.recorderConfig != null && request.recorderConfig.frameRate > 0)
                 fps = request.recorderConfig.frameRate;
             else
                 fps = timelineAsset.editorSettings.frameRate;
