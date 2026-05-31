@@ -103,12 +103,41 @@ namespace DistributedRecorder.Worker
         /// <summary>
         /// Returns the absolute output directory for a job.
         /// The directory is created if it does not exist.
+        ///
+        /// When <see cref="JobRequest.dispatchTimestamp"/> and
+        /// <see cref="JobRequest.directorObjectName"/> are both set, uses the new
+        /// naming scheme: <c>Recordings/{dispatchTimestamp}/{sanitizedTimelineName}/</c>.
+        /// Otherwise falls back to the legacy <c>Recordings/{jobId}/</c> path.
         /// </summary>
         public string GetOutputDirectory(string jobId)
         {
-            string dir = Path.Combine(_recordingsRoot, SanitiseJobId(jobId));
-            Directory.CreateDirectory(dir);
-            return dir;
+            // Attempt new timestamp-based naming if the request carries the fields.
+            JobEntry entry;
+            lock (_lock)
+            {
+                _jobs.TryGetValue(jobId, out entry);
+            }
+
+            if (entry != null)
+            {
+                var req = entry.Request;
+                if (!string.IsNullOrEmpty(req?.dispatchTimestamp) &&
+                    !string.IsNullOrEmpty(req?.directorObjectName))
+                {
+                    string sanitizedName = SanitiseTimelineName(req.directorObjectName);
+                    string dir = Path.Combine(_recordingsRoot,
+                        req.dispatchTimestamp, sanitizedName);
+                    Directory.CreateDirectory(dir);
+                    return dir;
+                }
+            }
+
+            // Legacy fallback: Recordings/{jobId}/
+            {
+                string dir = Path.Combine(_recordingsRoot, SanitiseJobId(jobId));
+                Directory.CreateDirectory(dir);
+                return dir;
+            }
         }
 
         private static string SanitiseJobId(string jobId)
@@ -118,6 +147,37 @@ namespace DistributedRecorder.Worker
             foreach (char c in Path.GetInvalidFileNameChars())
                 jobId = jobId.Replace(c.ToString(), string.Empty);
             return jobId;
+        }
+
+        /// <summary>
+        /// Sanitizes a Timeline name so it is safe to use as a path component.
+        /// Mirrors <see cref="MultiTimelineRecorder.SanitizeTimelineName"/> from the Master side
+        /// so both produce identical results for the same input (F7 acceptance criterion).
+        /// </summary>
+        public static string SanitiseTimelineName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return "Timeline";
+
+            string trimmed = name.Trim();
+            if (trimmed == ".." || trimmed == ".")
+                trimmed = "__";
+
+            const int maxLen = 64;
+            var sb = new System.Text.StringBuilder(trimmed.Length);
+            foreach (char c in trimmed)
+            {
+                bool isInvalid = c < 32
+                    || c == '/' || c == '\\' || c == ':' || c == '*'
+                    || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
+                sb.Append(isInvalid ? '_' : c);
+            }
+
+            string result = sb.ToString();
+            if (result.Length > maxLen)
+                result = result.Substring(0, maxLen);
+
+            return string.IsNullOrEmpty(result) ? "Timeline" : result;
         }
 
         // --- completed-job count (for auto-restart logic) -----------------------
