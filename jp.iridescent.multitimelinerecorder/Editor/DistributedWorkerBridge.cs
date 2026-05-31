@@ -15,11 +15,14 @@ using System;
 using DistributedRecorder.Shared;
 using DistributedRecorder.Worker;
 using UnityEngine;
+using UnityEngine.Playables;
+using UnityEngine.Timeline;
 
 #if UNITY_RECORDER
 using UnityEditor;
 using UnityEditor.Recorder;
 using UnityEditor.Recorder.Input;
+using UnityEditor.Recorder.Timeline;
 #endif
 
 namespace Unity.MultiTimelineRecorder
@@ -57,6 +60,12 @@ namespace Unity.MultiTimelineRecorder
                 BuildImageSettingsFromRequestBridge;
             // NOTE: OnApplyImageSettings removed – the Worker now builds fresh settings into
             // a temp render timeline per job instead of mutating a baked persistent clip (§E).
+
+#if UNITY_RECORDER
+            // worker-recording-fix: register the MTR headless render pipeline starter
+            DistributedRecorder.Worker.FidelityBuilderRegistry.OnStartHeadlessRender =
+                StartHeadlessRenderBridge;
+#endif
         }
 
         // -----------------------------------------------------------------------
@@ -203,6 +212,218 @@ namespace Unity.MultiTimelineRecorder
 
             return settings;
         }
+
+        // -----------------------------------------------------------------------
+        // worker-recording-fix: headless render pipeline (MTR core, EditorWindow-free)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Bridge shim matching <see cref="DistributedRecorder.Worker.FidelityBuilderRegistry.StartHeadlessRenderDelegate"/>.
+        /// Already inside the outer #if UNITY_RECORDER block.
+        /// </summary>
+        private static string StartHeadlessRenderBridge(
+            UnityEngine.Playables.PlayableDirector director,
+            object                                 imageRecorderSettings,
+            double                                 timelineDuration,
+            double                                 frameRate,
+            out string                             errorMessage)
+        {
+            if (!(imageRecorderSettings is ImageRecorderSettings settings))
+            {
+                errorMessage = "imageRecorderSettings is not an ImageRecorderSettings instance.";
+                return null;
+            }
+            return StartHeadlessRender(director, settings, timelineDuration, frameRate, out errorMessage);
+        }
+
+        /// <summary>Temp folder for headless render timeline assets (mirrors MTR local path).</summary>
+        private const string HeadlessTempDir = "Assets/MultiTimelineRecorder/Temp";
+
+        /// <summary>
+        /// Builds a temporary render <see cref="UnityEngine.Timeline.TimelineAsset"/> containing:
+        ///  - A <see cref="ControlTrack"/> with one clip driving <paramref name="director"/>
+        ///    (ControlPlayableAsset: updateDirector=true, searchHierarchy=false, postPlayback=Revert).
+        ///  - A <see cref="RecorderTrack"/> clip with <paramref name="settings"/> as the sub-asset.
+        ///
+        /// After building the asset it injects <c>[RenderingData]</c> + <c>[PlayModeTimelineRenderer]</c>
+        /// GameObjects into the active scene (the same objects MTR local recording creates) and
+        /// calls <c>EditorApplication.isPlaying = true</c>.
+        ///
+        /// Returns the project-relative temp asset path for caller to clean up via
+        /// <c>AssetDatabase.DeleteAsset</c> after Edit Mode is restored.
+        /// </summary>
+        public static string StartHeadlessRender(
+            UnityEngine.Playables.PlayableDirector director,
+            ImageRecorderSettings                  settings,
+            double                                 timelineDuration,
+            double                                 frameRate,
+            out string                             errorMessage)
+        {
+            errorMessage = string.Empty;
+
+            if (director == null)
+            {
+                errorMessage = "director is null.";
+                return null;
+            }
+            if (settings == null)
+            {
+                errorMessage = "imageRecorderSettings is null.";
+                return null;
+            }
+
+            // ── 1. Ensure temp folder exists ────────────────────────────────
+            if (!AssetDatabase.IsValidFolder(HeadlessTempDir))
+            {
+                if (!AssetDatabase.IsValidFolder("Assets/MultiTimelineRecorder"))
+                    AssetDatabase.CreateFolder("Assets", "MultiTimelineRecorder");
+                AssetDatabase.CreateFolder("Assets/MultiTimelineRecorder", "Temp");
+            }
+
+            // ── 2. Create temp TimelineAsset (same structure as MTR's CreateRenderTimeline) ─
+            var timeline = ScriptableObject.CreateInstance<TimelineAsset>();
+            timeline.name = $"{director.gameObject.name}_DistHeadless_RenderTimeline";
+            timeline.editorSettings.frameRate = frameRate;
+
+            string assetPath = $"{HeadlessTempDir}/dist_{director.gameObject.name}_{System.DateTime.Now.Ticks}.playable";
+
+            try
+            {
+                AssetDatabase.CreateAsset(timeline, assetPath);
+                AssetDatabase.SaveAssets();
+            }
+            catch (Exception ex)
+            {
+                errorMessage = $"Failed to create temp timeline asset at '{assetPath}': {ex.Message}";
+                return null;
+            }
+
+            // Reload from disk so sub-asset embedding works correctly (same pattern as WorkerRenderTimelineFactory).
+            timeline = AssetDatabase.LoadAssetAtPath<TimelineAsset>(assetPath);
+            if (timeline == null)
+            {
+                errorMessage = $"Failed to reload temp timeline asset from '{assetPath}'.";
+                return null;
+            }
+
+            // ── 3. ControlTrack: drive the original director (same config as CreateRenderTimeline) ─
+            var controlTrack = timeline.CreateTrack<UnityEngine.Timeline.ControlTrack>(null, "Control Track");
+            if (controlTrack == null)
+            {
+                AssetDatabase.DeleteAsset(assetPath);
+                errorMessage = "Failed to create ControlTrack on temp timeline.";
+                return null;
+            }
+
+            float oneFrameDuration = (float)(1.0 / (frameRate > 0 ? frameRate : 24.0));
+            var controlClip = controlTrack.CreateClip<UnityEngine.Timeline.ControlPlayableAsset>();
+            if (controlClip == null)
+            {
+                AssetDatabase.DeleteAsset(assetPath);
+                errorMessage = "Failed to create ControlClip on temp timeline.";
+                return null;
+            }
+
+            controlClip.displayName = director.gameObject.name;
+            controlClip.start       = 0.0;
+            controlClip.duration    = timelineDuration + oneFrameDuration; // +1 frame to include last frame
+
+            var controlAsset = controlClip.asset as UnityEngine.Timeline.ControlPlayableAsset;
+            // sourceGameObject.defaultValue: persist the GameObject ref so it survives the Play Mode boundary
+            // (same as MTR CreateRenderTimeline :916 / CreateRenderTimelineMultiple :207)
+            controlAsset.sourceGameObject.defaultValue = director.gameObject;
+            controlAsset.updateDirector     = true;
+            controlAsset.updateParticle     = true;
+            controlAsset.updateITimeControl = true;
+            controlAsset.searchHierarchy    = false; // security: no broad hierarchy search
+            controlAsset.active             = true;
+            controlAsset.postPlayback       = UnityEngine.Timeline.ActivationControlPlayable.PostPlaybackState.Revert;
+
+            // ── 4. RecorderTrack + RecorderClip ─────────────────────────────
+            var recorderTrack = timeline.CreateTrack<UnityEditor.Recorder.Timeline.RecorderTrack>(null, "[DistributedRecorder]");
+            if (recorderTrack == null)
+            {
+                AssetDatabase.DeleteAsset(assetPath);
+                errorMessage = "Failed to create RecorderTrack on temp timeline.";
+                return null;
+            }
+
+            var timelineClip = recorderTrack.CreateClip<UnityEditor.Recorder.Timeline.RecorderClip>();
+            if (timelineClip == null)
+            {
+                AssetDatabase.DeleteAsset(assetPath);
+                errorMessage = "Failed to create RecorderClip on temp timeline.";
+                return null;
+            }
+
+            timelineClip.start    = 0.0;
+            timelineClip.duration = timelineDuration + oneFrameDuration;
+
+            // Embed settings as persistent sub-asset before assigning to clip
+            // (required to survive Play Mode boundary – same as WorkerRenderTimelineFactory)
+            settings.hideFlags = HideFlags.None;
+            settings.name      = "DistHeadlessRecorderSettings";
+            AssetDatabase.AddObjectToAsset(settings, timeline);
+
+            var recorderClip = timelineClip.asset as UnityEditor.Recorder.Timeline.RecorderClip;
+            if (recorderClip == null)
+            {
+                AssetDatabase.DeleteAsset(assetPath);
+                errorMessage = "timelineClip.asset is not a RecorderClip.";
+                return null;
+            }
+            recorderClip.settings = settings;
+
+            EditorUtility.SetDirty(timeline);
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+
+            // Reload after save to confirm validity
+            var savedTimeline = AssetDatabase.LoadAssetAtPath<TimelineAsset>(assetPath);
+            if (savedTimeline == null)
+            {
+                AssetDatabase.DeleteAsset(assetPath);
+                errorMessage = $"Failed to reload temp timeline after save: '{assetPath}'.";
+                return null;
+            }
+
+            // ── 5. Clear stale STR_* EditorPrefs from previous job ────────────
+            // (prevents false-positive completion detection on the first polling tick)
+            EditorPrefs.DeleteKey("STR_IsRenderingComplete");
+            EditorPrefs.DeleteKey("STR_IsRenderingInProgress");
+            EditorPrefs.DeleteKey("STR_Progress");
+            EditorPrefs.DeleteKey("STR_Status");
+            EditorPrefs.DeleteKey("STR_CurrentTime");
+
+            // ── 6. Inject RenderingData + PlayModeTimelineRenderer (same as MTR local) ─
+            // (mirrors MultiTimelineRecorder.cs :1975-1987)
+            var dataGO       = new UnityEngine.GameObject("[RenderingData]");
+            var renderingData = dataGO.AddComponent<Unity.MultiTimelineRecorder.RenderingData>();
+            renderingData.directorName   = director.gameObject.name;
+            renderingData.renderTimeline = savedTimeline;
+            renderingData.duration       = (float)timelineDuration;
+            renderingData.frameRate      = (int)System.Math.Round(frameRate);
+
+            var rendererGO = new UnityEngine.GameObject("[PlayModeTimelineRenderer]");
+            rendererGO.AddComponent<Unity.MultiTimelineRecorder.PlayModeTimelineRenderer>();
+
+            // Ensure STR_IsRendering=true and STR_AutoExitPlayMode=true so PlayModeTimelineRenderer
+            // drives recording and exits Play Mode on completion.
+            EditorPrefs.SetBool("STR_IsRendering", true);
+            EditorPrefs.SetBool("STR_AutoExitPlayMode", true);
+
+            // ── 7. Enter Play Mode ────────────────────────────────────────────
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            EditorApplication.isPlaying = true;
+
+            UnityEngine.Debug.Log(
+                $"[DistributedWorkerBridge] Headless render started. " +
+                $"director='{director.gameObject.name}' tempAsset='{assetPath}'");
+
+            return assetPath;
+        }
+#endif // UNITY_RECORDER
 
         // -----------------------------------------------------------------------
         // Camera resolution (same strategy as JobRunner.FindDirectorByRequest)

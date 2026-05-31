@@ -49,5 +49,38 @@ namespace DistributedRecorder.Worker
         /// is called (which happens automatically via <c>[InitializeOnLoadMethod]</c>).
         /// </summary>
         public static BuildSettingsDelegate OnBuildImageSettings;
+
+        // -----------------------------------------------------------------------
+        // worker-recording-fix: MTR headless render pipeline delegate
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Delegate signature for starting the MTR headless render pipeline.
+        ///
+        /// The implementation (registered by <c>DistributedWorkerBridge</c>) must:
+        ///  1. Build a temp render <see cref="UnityEngine.Timeline.TimelineAsset"/> with
+        ///     a ControlTrack driving <paramref name="director"/> and a RecorderTrack using
+        ///     <paramref name="imageRecorderSettings"/>.
+        ///  2. Inject <c>[RenderingData]</c> + <c>[PlayModeTimelineRenderer]</c> into the
+        ///     active scene and set <c>EditorApplication.isPlaying = true</c>.
+        ///  3. Return the project-relative temp asset path (used by the caller for cleanup).
+        ///
+        /// Called from the Unity main thread (Edit Mode preflight).
+        /// Returns the temp asset path on success, or null/empty on failure (with
+        /// <paramref name="errorMessage"/> populated).
+        /// </summary>
+        public delegate string StartHeadlessRenderDelegate(
+            UnityEngine.Playables.PlayableDirector director,
+            object                                 imageRecorderSettings,
+            double                                 timelineDuration,
+            double                                 frameRate,
+            out string                             errorMessage);
+
+        /// <summary>
+        /// The registered headless render starter.  Null until
+        /// <c>Unity.MultiTimelineRecorder.DistributedWorkerBridge.RegisterDelegate</c>
+        /// is called (which happens automatically via <c>[InitializeOnLoadMethod]</c>).
+        /// </summary>
+        public static StartHeadlessRenderDelegate OnStartHeadlessRender;
     }
 }
