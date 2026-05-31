@@ -2183,7 +2183,7 @@ namespace Unity.MultiTimelineRecorder
             {
                 EditorGUILayout.Space(5);
                 EditorGUILayout.LabelField("Recorder is stuck in WaitingForPlayMode state.", EditorStyles.centeredGreyMiniLabel);
-                
+
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.FlexibleSpace();
                 if (GUILayout.Button("Reset State", GUILayout.Height(20), GUILayout.Width(100)))
@@ -2196,6 +2196,9 @@ namespace Unity.MultiTimelineRecorder
                 GUILayout.FlexibleSpace();
                 EditorGUILayout.EndHorizontal();
             }
+
+            // Distributed rendering section (M5 hook – single call-site change)
+            DrawDistributedSection();
         }
         
         private void DrawStatusSection()
