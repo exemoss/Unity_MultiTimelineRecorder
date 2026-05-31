@@ -89,7 +89,7 @@ namespace DistributedRecorder.Tests
         {
             var item = MakeImageItem(
                 ImageRecorderSettings.ImageRecorderOutputFormat.EXR,
-                exrCompression: UnityEditor.Recorder.CompressionUtility.EXRCompressionType.ZIP,
+                exrCompression: UnityEditor.Recorder.CompressionUtility.EXRCompressionType.Zip,
                 captureAlpha: true);
             var settings = RecorderSettingsBuilderShared.BuildImageSettings(
                 item, 1920, 1080, 24.0, null, null, "output/<Frame>");
@@ -97,7 +97,7 @@ namespace DistributedRecorder.Tests
             {
                 Assert.AreEqual(ImageRecorderSettings.ImageRecorderOutputFormat.EXR,
                     settings.OutputFormat, "OutputFormat EXR");
-                Assert.AreEqual(UnityEditor.Recorder.CompressionUtility.EXRCompressionType.ZIP,
+                Assert.AreEqual(UnityEditor.Recorder.CompressionUtility.EXRCompressionType.Zip,
                     settings.EXRCompression, "EXRCompression");
                 Assert.IsTrue(settings.CaptureAlpha, "CaptureAlpha EXR");
             }
