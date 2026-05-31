@@ -43,8 +43,7 @@ namespace DistributedRecorder.Shared
     ///  - No dependency on <c>Unity.MultiTimelineRecorder</c> types.
     ///  - No <c>UnityEngine.Object</c> references (Camera / RenderTexture etc.).
     ///  - <c>[Serializable]</c> + only primitives / enums → JsonUtility round-trip safe.
-    ///  - Security: all string fields validated by <see cref="InputValidator"/>
-    ///    before reaching <c>MtrRecorderClipBuilder</c>.
+    ///  - Security: all string fields validated by <see cref="InputValidator"/>.
     /// </summary>
     [Serializable]
     public class RecorderJobConfig
