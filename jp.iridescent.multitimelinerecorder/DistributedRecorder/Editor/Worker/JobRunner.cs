@@ -302,9 +302,20 @@ namespace DistributedRecorder.Worker
                 //   The transient path may not record in that case, but we preserve the behaviour
                 //   rather than hard-failing.
 
-                string baseOutputDir = _store.GetOutputDirectory(request.jobId);
+                // GetOutputDirectory creates and returns the ABSOLUTE per-job directory (this is
+                // also what the /files endpoint serves recursively). However, Unity Recorder's
+                // ImageRecorderSettings keeps its output Root = Project, so OutputFile must be a
+                // PROJECT-RELATIVE, forward-slash path. Passing an absolute path makes the Recorder
+                // prepend the project root to it, fail to resolve, and dump frames at the project
+                // root instead (the observed bug). So derive the project-relative form here.
+                string absOutputDir = _store.GetOutputDirectory(request.jobId);
                 if (!string.IsNullOrEmpty(request.outputSubDir))
-                    baseOutputDir = Path.Combine(baseOutputDir, request.outputSubDir);
+                    absOutputDir = Path.Combine(absOutputDir, request.outputSubDir);
+
+                string projRoot = ProjectPaths.ProjectRoot.Replace('\\', '/').TrimEnd('/');
+                string baseOutputDir = absOutputDir.Replace('\\', '/');
+                if (baseOutputDir.StartsWith(projRoot + "/", StringComparison.OrdinalIgnoreCase))
+                    baseOutputDir = baseOutputDir.Substring(projRoot.Length + 1); // -> "Recordings/{jobId}/..."
 
                 // Compute the per-job output file path (same logic as before).
                 string outputFile;
