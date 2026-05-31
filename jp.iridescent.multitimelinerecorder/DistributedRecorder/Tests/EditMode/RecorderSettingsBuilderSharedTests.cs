@@ -99,7 +99,11 @@ namespace DistributedRecorder.Tests
                     settings.OutputFormat, "OutputFormat EXR");
                 Assert.AreEqual(UnityEditor.Recorder.CompressionUtility.EXRCompressionType.Zip,
                     settings.EXRCompression, "EXRCompression");
-                Assert.IsTrue(settings.CaptureAlpha, "CaptureAlpha EXR");
+                // This item has no resolved Camera/RenderTexture, so the builder falls back
+                // to GameView input. GameView cannot capture alpha, so the builder forces
+                // CaptureAlpha off regardless of item.captureAlpha — matching MTR's behavior.
+                Assert.IsFalse(settings.CaptureAlpha,
+                    "GameView input cannot capture alpha; builder must force CaptureAlpha off");
             }
             finally { Object.DestroyImmediate(settings); }
         }

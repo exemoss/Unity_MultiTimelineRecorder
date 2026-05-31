@@ -32,11 +32,14 @@ namespace DistributedRecorder.Tests
 
             MainThreadDispatcher.Enqueue(() => executed = true);
 
-            // Yield one frame so EditorApplication.update fires and flushes.
-            yield return null;
+            // Yield until the dispatcher flushes. The very first Enqueue in a run registers
+            // EditorApplication.update += Flush mid-frame, so the handler may not fire on the
+            // immediate next frame; poll a bounded number of frames to avoid that race.
+            for (int i = 0; i < 10 && !executed; i++)
+                yield return null;
 
             Assert.IsTrue(executed,
-                "Action enqueued via MainThreadDispatcher should have been executed by the next frame.");
+                "Action enqueued via MainThreadDispatcher should have been executed within a few frames.");
         }
 
         [UnityTest]
@@ -135,7 +138,10 @@ namespace DistributedRecorder.Tests
             // When called from the main thread (inline path), the exception propagates
             // directly.  When called from a background thread it is wrapped in an
             // outer Exception with the original as InnerException.
-            var ex = Assert.Throws<Exception>(
+            // Assert.Catch (not Throws) so a derived type is accepted: the inline path
+            // rethrows the raw InvalidOperationException, while the background path wraps
+            // it in a base Exception. Assert.Throws<Exception> would require an exact match.
+            var ex = Assert.Catch<Exception>(
                 () => MainThreadDispatcher.InvokeAndWait<int>(
                     () => throw new InvalidOperationException("boom"),
                     TimeSpan.FromSeconds(5)));
