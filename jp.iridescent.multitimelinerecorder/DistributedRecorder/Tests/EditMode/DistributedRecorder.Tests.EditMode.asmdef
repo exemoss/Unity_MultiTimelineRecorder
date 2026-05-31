@@ -22,6 +22,12 @@
     ],
     "autoReferenced": false,
     "defineConstraints": [],
-    "versionDefines": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.recorder",
+            "expression": "",
+            "define": "UNITY_RECORDER"
+        }
+    ],
     "noEngineReferences": false
 }
