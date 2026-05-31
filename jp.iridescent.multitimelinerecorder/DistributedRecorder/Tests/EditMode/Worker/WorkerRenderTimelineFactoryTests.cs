@@ -296,7 +296,7 @@ namespace DistributedRecorder.Tests.Worker
             finally
             {
                 // s may not have been transferred (exception thrown before Create embeds it).
-                if (s != null) Object.DestroyImmediate(s);
+                if (s != null) UnityEngine.Object.DestroyImmediate(s);
             }
         }
 
