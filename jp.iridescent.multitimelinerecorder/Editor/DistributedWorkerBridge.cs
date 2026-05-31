@@ -55,6 +55,8 @@ namespace Unity.MultiTimelineRecorder
         {
             DistributedRecorder.Worker.FidelityBuilderRegistry.OnBuildImageSettings =
                 BuildImageSettingsFromRequestBridge;
+            DistributedRecorder.Worker.FidelityBuilderRegistry.OnApplyImageSettings =
+                ApplyImageSettingsFromRequestBridge;
         }
 
         // -----------------------------------------------------------------------
@@ -71,6 +73,157 @@ namespace Unity.MultiTimelineRecorder
             var settings = BuildImageSettingsFromRequest(request, outputFile, out errorMessage);
             imageRecorderSettings = settings;
             return settings != null;
+        }
+
+        private static bool ApplyImageSettingsFromRequestBridge(
+            JobRequest request,
+            object     existingSettingsObj,
+            string     outputFile,
+            out string errorMessage)
+        {
+            errorMessage = string.Empty;
+
+            var target = existingSettingsObj as ImageRecorderSettings;
+            if (target == null)
+            {
+                errorMessage =
+                    "[DistributedWorkerBridge] existingSettingsObj は ImageRecorderSettings " +
+                    "にキャストできません。com.unity.recorder のバージョンを確認してください。";
+                return false;
+            }
+
+            return ApplyImageSettingsFromRequest(request, target, outputFile, out errorMessage);
+        }
+
+        /// <summary>
+        /// Applies MTR fidelity settings to an existing <see cref="ImageRecorderSettings"/>
+        /// instance in-place.  This is the mutation path used when the timeline asset
+        /// already contains a persisted RecorderClip sub-asset (baked by the sample factory).
+        /// Mutating a persistent sub-asset ensures Play Mode recording is driven correctly.
+        /// </summary>
+        public static bool ApplyImageSettingsFromRequest(
+            JobRequest request,
+            ImageRecorderSettings target,
+            string outputFile,
+            out string errorMessage)
+        {
+            errorMessage = string.Empty;
+
+            if (request == null)
+            {
+                errorMessage = "request is null.";
+                return false;
+            }
+            if (target == null)
+            {
+                errorMessage = "target ImageRecorderSettings is null.";
+                return false;
+            }
+            if (string.IsNullOrEmpty(request.recorderConfigJson))
+            {
+                errorMessage = "recorderConfigJson is empty; cannot apply MTR-fidelity settings.";
+                return false;
+            }
+
+            // Deserialize RecorderConfigItem
+            MultiRecorderConfig.RecorderConfigItem item;
+            try
+            {
+                item = JsonUtility.FromJson<MultiRecorderConfig.RecorderConfigItem>(
+                    request.recorderConfigJson);
+            }
+            catch (Exception ex)
+            {
+                errorMessage = $"recorderConfigJson deserialize failed: {ex.Message}";
+                return false;
+            }
+
+            if (item == null)
+            {
+                errorMessage = "JsonUtility.FromJson returned null for recorderConfigJson.";
+                return false;
+            }
+
+            // Enum whitelist (same validation as BuildImageSettingsFromRequest)
+            if (!Enum.IsDefined(typeof(RecorderSettingsType), item.recorderType))
+            {
+                errorMessage =
+                    $"recorderConfigJson.recorderType value '{(int)item.recorderType}' is not in the allowed whitelist.";
+                return false;
+            }
+            if (item.recorderType == RecorderSettingsType.Image &&
+                !Enum.IsDefined(typeof(ImageRecorderSettings.ImageRecorderOutputFormat), item.imageFormat))
+            {
+                errorMessage =
+                    $"recorderConfigJson.imageFormat value '{(int)item.imageFormat}' is not in the allowed whitelist.";
+                return false;
+            }
+
+            // Resolve effective dimensions / framerate (same override logic as BuildImageSettingsFromRequest)
+            int    effectiveWidth     = request.effectiveWidth  > 0 ? request.effectiveWidth  : item.width;
+            int    effectiveHeight    = request.effectiveHeight > 0 ? request.effectiveHeight : item.height;
+            double effectiveFrameRate = request.effectiveFrameRate > 0.0 ? request.effectiveFrameRate : item.frameRate;
+
+            // Resolve Camera from scene
+            Camera resolvedCamera = null;
+            if (item.imageSourceType == ImageRecorderSourceType.TargetCamera)
+            {
+                resolvedCamera = ResolveCamera(
+                    request.targetCameraHierarchyPath, request.targetCameraName);
+
+                if (resolvedCamera == null)
+                {
+                    errorMessage =
+                        "[DistributedWorkerBridge] imageSourceType=TargetCamera ですが指定カメラが見つかりません。" +
+                        $" hierarchyPath='{request.targetCameraHierarchyPath}'" +
+                        $" name='{request.targetCameraName}'。" +
+                        "シーンを確認するか、分散実行前にシーンをプロジェクトと同期してください。";
+                    return false;
+                }
+            }
+
+            // Resolve RenderTexture from GUID
+            RenderTexture resolvedRT = null;
+            if (item.imageSourceType == ImageRecorderSourceType.RenderTexture)
+            {
+                if (!string.IsNullOrEmpty(request.renderTextureGuid))
+                {
+                    string rtPath = AssetDatabase.GUIDToAssetPath(request.renderTextureGuid);
+                    if (!string.IsNullOrEmpty(rtPath))
+                        resolvedRT = AssetDatabase.LoadAssetAtPath<RenderTexture>(rtPath);
+                }
+
+                if (resolvedRT == null)
+                {
+                    errorMessage =
+                        $"[DistributedWorkerBridge] imageSourceType=RenderTexture ですが GUID '{request.renderTextureGuid}' の" +
+                        "RenderTexture が見つかりません。プロジェクトを同期してください。";
+                    return false;
+                }
+            }
+
+            // Mutate the existing settings in-place via the shared pure function
+            try
+            {
+                RecorderSettingsBuilderShared.ApplyImageSettings(
+                    target,
+                    item,
+                    effectiveWidth,
+                    effectiveHeight,
+                    effectiveFrameRate,
+                    resolvedCamera,
+                    resolvedRT,
+                    outputFile,
+                    fallbackToGameViewOnMissingRef: false);
+            }
+            catch (Exception ex)
+            {
+                errorMessage =
+                    $"RecorderSettingsBuilderShared.ApplyImageSettings failed: {ex.Message}";
+                return false;
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -250,6 +403,16 @@ namespace Unity.MultiTimelineRecorder
             out string errorMessage)
         {
             imageRecorderSettings = null;
+            errorMessage = "com.unity.recorder パッケージがインストールされていません。";
+            return false;
+        }
+
+        private static bool ApplyImageSettingsFromRequestBridge(
+            JobRequest request,
+            object     existingSettingsObj,
+            string     outputFile,
+            out string errorMessage)
+        {
             errorMessage = "com.unity.recorder パッケージがインストールされていません。";
             return false;
         }

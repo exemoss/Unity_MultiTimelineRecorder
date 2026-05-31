@@ -279,87 +279,112 @@ namespace DistributedRecorder.Worker
 
             if (isMtrPath && request.recorderConfig != null)
             {
-                // MTR path: build RecorderClip.
-                // Prefer the MTR-fidelity path (recorderConfigJson) for faithful reproduction;
-                // fall back to the normalized DTO path for backward compatibility with older Masters.
+                // MTR path: apply recorder settings to the Timeline's pre-baked persistent RecorderClip.
+                //
+                // Root cause of the "zero frames" bug (distributed fidelity path only):
+                //   The previous implementation created a NEW transient (non-persisted)
+                //   ImageRecorderSettings ScriptableObject and attached it to a NEW RecorderTrack.
+                //   Transient ScriptableObjects are NOT reliably serialized across the Play Mode
+                //   boundary even with Domain Reload OFF, so the Recorder never started.
+                //
+                // Fix (this block):
+                //   1. Find the pre-existing baked RecorderClip (persistent sub-asset produced by
+                //      MtrMultiTimelineSampleFactory.AddRecorderClip).
+                //   2. Mutate its persistent settings in-place via OnApplyImageSettings
+                //      (DistributedWorkerBridge.ApplyImageSettingsFromRequest →
+                //       RecorderSettingsBuilderShared.ApplyImageSettings).
+                //   3. Only override OutputFile to the per-job path.
+                //   This mirrors the legacy path (SampleOrbitScene) that is proven to record.
+                //
+                // Fallback:
+                //   When no pre-baked clip exists (e.g. custom scene without the factory clip),
+                //   fall back to the previous BuildAndApply DTO path with a warning.
+                //   The transient path may not record in that case, but we preserve the behaviour
+                //   rather than hard-failing.
+
                 string baseOutputDir = _store.GetOutputDirectory(request.jobId);
                 if (!string.IsNullOrEmpty(request.outputSubDir))
                     baseOutputDir = Path.Combine(baseOutputDir, request.outputSubDir);
 
+                // Compute the per-job output file path (same logic as before).
+                string outputFile;
+                if (!string.IsNullOrEmpty(request.resolvedOutputRelativePath))
+                {
+                    // resolvedOutputRelativePath may contain <Frame>/<Take> wildcards ('<','>'
+                    // are illegal path chars on Windows), so Path.Combine would throw
+                    // "Illegal characters in path". Join manually with '/'.
+                    outputFile = baseOutputDir.Replace('\\', '/').TrimEnd('/')
+                        + "/" + request.resolvedOutputRelativePath.Replace('\\', '/').TrimStart('/');
+                }
+                else
+                {
+                    // Fallback: use the legacy fileNameTemplate from recorderConfig.
+                    outputFile = MtrRecorderClipBuilder.ResolveOutputFilePath(
+                        baseOutputDir, request.recorderConfig);
+                }
+
+                // --- MTR-fidelity path: mutate the pre-baked persistent RecorderClip ---
                 bool usedFidelityPath = false;
 
-                // --- MTR-fidelity path (M3): recorderConfigJson present ---
-                // Uses the FidelityBuilderRegistry delegate (registered at domain reload by
-                // Unity.MultiTimelineRecorder.DistributedWorkerBridge) to avoid a circular
-                // assembly reference DistributedRecorder.Editor → Unity.MultiTimelineRecorder.Editor.
                 if (!string.IsNullOrEmpty(request.recorderConfigJson) &&
-                    FidelityBuilderRegistry.OnBuildImageSettings != null)
+                    FidelityBuilderRegistry.OnApplyImageSettings != null)
                 {
-                    // Determine output file path from resolvedOutputRelativePath (M3) or fallback.
-                    string outputFile;
-                    if (!string.IsNullOrEmpty(request.resolvedOutputRelativePath))
+                    // Find the pre-baked clip first.
+                    preflightRecorderClip = FindRecorderClip(timelineAsset);
+
+                    if (preflightRecorderClip != null && preflightRecorderClip.settings != null)
                     {
-                        // Prepend the job's output base directory to the resolved relative path.
-                        // resolvedOutputRelativePath may contain <Frame>/<Take> wildcards ('<','>'
-                        // are illegal path chars on Windows), so Path.Combine throws "Illegal
-                        // characters in path". Join manually with '/'.
-                        outputFile = baseOutputDir.Replace('\\', '/').TrimEnd('/')
-                            + "/" + request.resolvedOutputRelativePath.Replace('\\', '/').TrimStart('/');
+                        // Mutate the persistent sub-asset in-place.
+                        bool applyOk = FidelityBuilderRegistry.OnApplyImageSettings(
+                            request, preflightRecorderClip.settings, outputFile, out string applyError);
+
+                        if (!applyOk)
+                        {
+                            FailJob(request.jobId,
+                                $"[A4] MTRフィデリティ設定の適用に失敗しました: {applyError}");
+                            return;
+                        }
+
+                        // Adjust the TimelineClip range when a sub-range is specified.
+                        if (request.startTime >= 0.0 && request.endTime > request.startTime)
+                        {
+                            // Find the TimelineClip that wraps our RecorderClip and apply range.
+                            foreach (var track in timelineAsset.GetOutputTracks())
+                            {
+                                if (!(track is RecorderTrack)) continue;
+                                foreach (var tc in track.GetClips())
+                                {
+                                    if (tc.asset == preflightRecorderClip)
+                                    {
+                                        tc.start    = request.startTime;
+                                        tc.duration = request.endTime - request.startTime;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        AppendE2ELog(
+                            $"[JobRunner] MTRフィデリティパス（永続クリップ mutate）: {outputFile}");
+                        usedFidelityPath = true;
                     }
                     else
                     {
-                        // Fallback: use the legacy fileNameTemplate from recorderConfig.
-                        outputFile = MtrRecorderClipBuilder.ResolveOutputFilePath(
-                            baseOutputDir, request.recorderConfig);
+                        // Pre-baked clip not found — fall through to the legacy DTO path with warning.
+                        Debug.LogWarning(
+                            "[JobRunner] [A4] 焼き込み済み RecorderClip が Timeline に見つかりませんでした。" +
+                            "Legacy DTO パスにフォールバックします（transient 設定のため録画されない可能性があります）。" +
+                            "DistributedRecorder > Create MTR Multi-Timeline Sample でサンプルを再生成してください。");
                     }
-
-                    // Invoke the MTR-side bridge to build ImageRecorderSettings.
-                    bool buildOk = FidelityBuilderRegistry.OnBuildImageSettings(
-                        request, outputFile, out object settingsObj, out string buildError);
-
-                    if (!buildOk || settingsObj == null)
-                    {
-                        FailJob(request.jobId,
-                            $"[A4] MTRフィデリティ設定の構築に失敗しました: {buildError}");
-                        return;
-                    }
-
-                    var imageSettings = settingsObj as ImageRecorderSettings;
-                    if (imageSettings == null)
-                    {
-                        FailJob(request.jobId,
-                            "[A4] DistributedWorkerBridge が ImageRecorderSettings を返しませんでした。" +
-                            "com.unity.recorder のバージョンを確認してください。");
-                        return;
-                    }
-
-                    try
-                    {
-                        preflightRecorderClip = MtrRecorderClipBuilder.ApplyToTimeline(
-                            timelineAsset, imageSettings, request.startTime, request.endTime);
-                    }
-                    catch (Exception ex)
-                    {
-                        UnityEngine.Object.DestroyImmediate(imageSettings);
-                        FailJob(request.jobId,
-                            $"[A4] RecorderClip の Timeline への適用に失敗しました: {ex.Message}");
-                        return;
-                    }
-
-                    AppendE2ELog($"[JobRunner] MTRフィデリティパスでRecorderClipを構築しました: {outputFile}");
-                    usedFidelityPath = true;
                 }
 
-                // --- Legacy DTO path: recorderConfig only ---
+                // --- Legacy DTO path: recorderConfig only, OR fidelity fallback ---
                 if (!usedFidelityPath)
                 {
-                    string outputTemplate = MtrRecorderClipBuilder.ResolveOutputFilePath(
-                        baseOutputDir, request.recorderConfig);
-
                     try
                     {
                         preflightRecorderClip = MtrRecorderClipBuilder.BuildAndApply(
-                            request.recorderConfig, outputTemplate, timelineAsset,
+                            request.recorderConfig, outputFile, timelineAsset,
                             request.startTime, request.endTime);
                     }
                     catch (Exception ex)
@@ -369,7 +394,7 @@ namespace DistributedRecorder.Worker
                         return;
                     }
 
-                    AppendE2ELog($"[JobRunner] Legacy DTOパスでRecorderClipを構築しました: {outputTemplate}");
+                    AppendE2ELog($"[JobRunner] Legacy DTOパスでRecorderClipを構築しました: {outputFile}");
                 }
             }
             else
