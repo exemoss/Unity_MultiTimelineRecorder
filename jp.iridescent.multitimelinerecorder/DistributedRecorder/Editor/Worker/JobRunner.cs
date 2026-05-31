@@ -308,9 +308,10 @@ namespace DistributedRecorder.Worker
                 // PROJECT-RELATIVE, forward-slash path. Passing an absolute path makes the Recorder
                 // prepend the project root to it, fail to resolve, and dump frames at the project
                 // root instead (the observed bug). So derive the project-relative form here.
+                // GetOutputDirectory already scopes by jobId (".../Recordings/{jobId}"), so do NOT
+                // append request.outputSubDir (which the Master also sets to the jobId) — that
+                // produced a redundant ".../Recordings/{jobId}/{jobId}" double nesting.
                 string absOutputDir = _store.GetOutputDirectory(request.jobId);
-                if (!string.IsNullOrEmpty(request.outputSubDir))
-                    absOutputDir = Path.Combine(absOutputDir, request.outputSubDir);
 
                 string projRoot = ProjectPaths.ProjectRoot.Replace('\\', '/').TrimEnd('/');
                 string baseOutputDir = absOutputDir.Replace('\\', '/');
@@ -355,6 +356,23 @@ namespace DistributedRecorder.Worker
                                 $"[A4] MTRフィデリティ設定の適用に失敗しました: {applyError}");
                             return;
                         }
+
+                        // Remove any OTHER RecorderTracks so only this job's (mutated) recorder runs.
+                        // An older code version could have baked a second "[DistributedRecorder]"
+                        // track into the timeline; left in place it records a second time (e.g. at
+                        // its old resolution, to the project root). Keep only the track that owns the
+                        // clip we just mutated.
+                        UnityEngine.Timeline.TrackAsset keepTrack = null;
+                        var allRecorderTracks = new System.Collections.Generic.List<UnityEngine.Timeline.TrackAsset>();
+                        foreach (var track in timelineAsset.GetOutputTracks())
+                        {
+                            if (!(track is RecorderTrack)) continue;
+                            allRecorderTracks.Add(track);
+                            foreach (var tc in track.GetClips())
+                                if (tc.asset == preflightRecorderClip) keepTrack = track;
+                        }
+                        foreach (var t in allRecorderTracks)
+                            if (t != keepTrack) timelineAsset.DeleteTrack(t);
 
                         // Adjust the TimelineClip range when a sub-range is specified.
                         if (request.startTime >= 0.0 && request.endTime > request.startTime)
