@@ -337,7 +337,12 @@ namespace DistributedRecorder.Setup
             var dirGo    = new GameObject(directorName);
             var director = dirGo.AddComponent<PlayableDirector>();
             director.playableAsset    = timeline;
-            director.playOnAwake      = true;
+            // worker-recording-fix: set playOnAwake=false so that during distributed recording,
+            // the Worker's SuppressOtherDirectorsAndMuteRecorderTracks does not need to fight
+            // auto-play from other directors in the sample scene (belt-and-suspenders defence
+            // against stray outputs — the Worker also suppresses at runtime, but having the
+            // scene itself default to false prevents any window between scene open and suppression).
+            director.playOnAwake      = false;
             director.extrapolationMode = DirectorWrapMode.None;
 
             // Bind the AnimationTrack to the cube
