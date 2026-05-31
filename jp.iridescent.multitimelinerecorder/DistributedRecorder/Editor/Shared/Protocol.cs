@@ -150,6 +150,22 @@ namespace DistributedRecorder.Shared
         /// </summary>
         public string outputSubDir = string.Empty;
 
+        /// <summary>
+        /// Dispatch timestamp generated once by the Master at batch dispatch time.
+        /// Format: yyyyMMddHHmmss (14 decimal digits, UTC or local time determined by Master).
+        /// All jobs in the same dispatch batch share this value so the parent folder
+        /// is consistent across multiple Timeline recordings.
+        ///
+        /// Worker output: <c>Recordings/{dispatchTimestamp}/{sanitizedTimelineName}/</c>
+        /// Master result: <c>Recordings/Distributed/{dispatchTimestamp}/{sanitizedTimelineName}/</c>
+        ///
+        /// When empty, Worker falls back to the legacy <c>Recordings/{jobId}/</c> path
+        /// (backward compatibility with older Masters).
+        ///
+        /// Validated: exactly 14 decimal digit characters; no path separators.
+        /// </summary>
+        public string dispatchTimestamp = string.Empty;
+
         // -----------------------------------------------------------------------
         // MTR fidelity fields (added in mtr-distributed-integration M3)
         // All fields below are optional for backward compatibility with older Masters.

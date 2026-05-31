@@ -33,6 +33,9 @@ namespace DistributedRecorder.Shared
         private const int MaxCameraNameLength          = 256;
         private const int RenderTextureGuidLength      = 32; // 32-char lowercase hex (AssetDatabase GUID format)
 
+        // worker-recording-fix: dispatchTimestamp
+        private const int DispatchTimestampLength = 14; // yyyyMMddHHmmss
+
         // RecorderJobConfig range constraints
         private const int    MinResolution  = 1;
         private const int    MaxResolution  = 16384;
@@ -326,6 +329,24 @@ namespace DistributedRecorder.Shared
                 {
                     reason = $"effectiveFrameRate must be 0 (use recorderConfigJson value) or > 0 and <= {MaxFrameRate}. Got: {request.effectiveFrameRate}.";
                     return false;
+                }
+            }
+
+            // dispatchTimestamp – optional; exactly 14 decimal digits when present (worker-recording-fix)
+            if (!string.IsNullOrEmpty(request.dispatchTimestamp))
+            {
+                if (request.dispatchTimestamp.Length != DispatchTimestampLength)
+                {
+                    reason = $"dispatchTimestamp must be exactly {DispatchTimestampLength} characters (yyyyMMddHHmmss). Got length: {request.dispatchTimestamp.Length}.";
+                    return false;
+                }
+                foreach (char c in request.dispatchTimestamp)
+                {
+                    if (!char.IsDigit(c))
+                    {
+                        reason = "dispatchTimestamp must contain only decimal digit characters (0-9).";
+                        return false;
+                    }
                 }
             }
 
