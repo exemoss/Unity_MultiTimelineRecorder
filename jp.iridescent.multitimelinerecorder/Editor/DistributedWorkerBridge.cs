@@ -423,7 +423,6 @@ namespace Unity.MultiTimelineRecorder
 
             return assetPath;
         }
-#endif // UNITY_RECORDER
 
         // -----------------------------------------------------------------------
         // Camera resolution (same strategy as JobRunner.FindDirectorByRequest)
