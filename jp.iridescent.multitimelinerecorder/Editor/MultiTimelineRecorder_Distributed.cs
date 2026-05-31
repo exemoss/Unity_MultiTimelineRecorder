@@ -63,6 +63,9 @@ namespace Unity.MultiTimelineRecorder
         // Default relative output root (relative to project root)
         private const string DistOutputRelRoot = "Recordings/Distributed";
 
+        // Maximum length for a sanitized timeline name component in the output path
+        private const int MaxSanitizedTimelineNameLength = 64;
+
         // -----------------------------------------------------------------------
         // UI hook (called from MultiTimelineRecorder.cs DrawRecordControls area)
         // -----------------------------------------------------------------------
@@ -618,6 +621,78 @@ namespace Unity.MultiTimelineRecorder
             return Path.Combine(projectRoot, DistOutputRelRoot, jobId);
         }
 
+        /// <summary>
+        /// Builds the Master-side result output directory using the new naming scheme:
+        /// <c>Recordings/Distributed/{dispatchTimestamp}/{sanitizedTimelineName}/</c>
+        ///
+        /// When <paramref name="dispatchTimestamp"/> is empty (legacy Masters), falls back
+        /// to <see cref="BuildResultOutputDir"/> using <paramref name="jobId"/>.
+        /// </summary>
+        /// <param name="projectRoot">Absolute path to the Unity project root.</param>
+        /// <param name="jobId">Unique job identifier (GUID). Used for the legacy fallback.</param>
+        /// <param name="dispatchTimestamp">
+        /// 14-digit timestamp (yyyyMMddHHmmss) shared across all jobs in the batch.
+        /// When empty, the legacy single-jobId path is used.
+        /// </param>
+        /// <param name="sanitizedTimelineName">
+        /// Pre-sanitized Timeline name sub-folder component (no path separators or "..").
+        /// Typically produced by <see cref="SanitizeTimelineName"/>.
+        /// </param>
+        public static string BuildResultOutputDirTimestamped(
+            string projectRoot,
+            string jobId,
+            string dispatchTimestamp,
+            string sanitizedTimelineName)
+        {
+            if (string.IsNullOrEmpty(dispatchTimestamp))
+                return BuildResultOutputDir(projectRoot, jobId);
+
+            if (string.IsNullOrEmpty(projectRoot))
+                throw new ArgumentNullException(nameof(projectRoot));
+
+            return Path.Combine(projectRoot, DistOutputRelRoot, dispatchTimestamp, sanitizedTimelineName);
+        }
+
+        /// <summary>
+        /// Sanitizes a Timeline (director GameObject) name so it is safe to use as a
+        /// file-system path component.
+        ///
+        /// Rules:
+        ///  - Characters invalid in file names on Windows/macOS/Linux are replaced with '_'.
+        ///  - ".." and "." are replaced with "__".
+        ///  - Leading/trailing whitespace is trimmed.
+        ///  - Result is truncated to <see cref="MaxSanitizedTimelineNameLength"/> characters.
+        ///  - Empty result falls back to "Timeline".
+        ///
+        /// Made public for hermetic testing.
+        /// </summary>
+        public static string SanitizeTimelineName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return "Timeline";
+
+            // Reject path traversal components
+            string trimmed = name.Trim();
+            if (trimmed == ".." || trimmed == ".")
+                trimmed = "__";
+
+            var sb = new System.Text.StringBuilder(trimmed.Length);
+            foreach (char c in trimmed)
+            {
+                // Reject chars that are invalid on Windows (covers most platforms too)
+                bool isInvalid = c < 32
+                    || c == '/' || c == '\\' || c == ':' || c == '*'
+                    || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
+                sb.Append(isInvalid ? '_' : c);
+            }
+
+            string result = sb.ToString();
+            if (result.Length > MaxSanitizedTimelineNameLength)
+                result = result.Substring(0, MaxSanitizedTimelineNameLength);
+
+            return string.IsNullOrEmpty(result) ? "Timeline" : result;
+        }
+
         // -----------------------------------------------------------------------
         // Dispatch entry point
         // -----------------------------------------------------------------------
@@ -677,17 +752,25 @@ namespace Unity.MultiTimelineRecorder
             _sessionSkipHashCheck    = false;
             _sessionSkipVersionCheck = false;
 
+            // Generate a single dispatch timestamp for the whole batch so all Timeline results
+            // land under the same parent folder (worker-recording-fix requirement C).
+            // Format: yyyyMMddHHmmss (14 digits).
+            string batchDispatchTimestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
+
             // Round-robin assignment
             var assignments = AssignRoundRobin(targets, workers);
 
-            Debug.Log($"[DistributedRecorder] {assignments.Count} ジョブを {workers.Count} Worker に round-robin で投入します。");
+            Debug.Log($"[DistributedRecorder] {assignments.Count} ジョブを {workers.Count} Worker に round-robin で投入します。 dispatchTimestamp={batchDispatchTimestamp}");
 
             // Build view models first (before async dispatch) so UI shows them immediately
             var vmsForBatch = new List<MtrJobViewModel>();
             foreach (var (job, worker) in assignments)
             {
-                string jobId = Guid.NewGuid().ToString("N");
-                string outDir = BuildResultOutputDir(ProjectPaths.ProjectRoot, jobId);
+                string jobId                = Guid.NewGuid().ToString("N");
+                string sanitizedName        = SanitizeTimelineName(job.DirectorObjectName);
+                string outDir               = BuildResultOutputDirTimestamped(
+                    ProjectPaths.ProjectRoot, jobId,
+                    batchDispatchTimestamp, sanitizedName);
 
                 var vm = new MtrJobViewModel
                 {
@@ -724,6 +807,7 @@ namespace Unity.MultiTimelineRecorder
                     startTime                  = job.StartTime,
                     endTime                    = job.EndTime,
                     outputSubDir               = vm.JobId,
+                    dispatchTimestamp          = batchDispatchTimestamp,
                     // MTR fidelity fields
                     jobScopeHash               = job.JobScopeHash,
                     recorderConfigJson         = job.RecorderConfigJson,
