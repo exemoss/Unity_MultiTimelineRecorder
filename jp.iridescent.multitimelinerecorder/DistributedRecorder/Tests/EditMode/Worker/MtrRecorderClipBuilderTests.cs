@@ -374,6 +374,173 @@ namespace DistributedRecorder.Tests.Worker
             }
         }
 
+        // -----------------------------------------------------------------------
+        // ApplyToTimeline – recording range (startTime / endTime)
+        // -----------------------------------------------------------------------
+
+        [Test]
+        public void ApplyToTimeline_WithValidRange_SetsClipStartAndDuration()
+        {
+            // Arrange: Timeline with a 10-second duration; record only seconds 2–6.
+            var timeline = ScriptableObject.CreateInstance<TimelineAsset>();
+            timeline.durationMode = TimelineAsset.DurationMode.FixedLength;
+            timeline.fixedDuration = 10.0;
+
+            var imageSettings = MtrRecorderClipBuilder.BuildImageSettings(
+                MakeImageConfig(), TempDir() + "/frame_<Frame>");
+
+            try
+            {
+                var clip = MtrRecorderClipBuilder.ApplyToTimeline(
+                    timeline, imageSettings, startTime: 2.0, endTime: 6.0);
+
+                // Retrieve the TimelineClip that wraps the RecorderClip to inspect start/duration.
+                UnityEngine.Timeline.TimelineClip foundTimelineClip = null;
+                foreach (var track in timeline.GetOutputTracks())
+                {
+                    if (track is RecorderTrack)
+                    {
+                        foreach (var tc in track.GetClips())
+                        {
+                            if (tc.asset == clip) { foundTimelineClip = tc; break; }
+                        }
+                    }
+                    if (foundTimelineClip != null) break;
+                }
+
+                Assert.IsNotNull(foundTimelineClip, "TimelineClip wrapping RecorderClip must exist.");
+                Assert.AreEqual(2.0, foundTimelineClip.start,    1e-6, "clip.start should be startTime");
+                Assert.AreEqual(4.0, foundTimelineClip.duration, 1e-6, "clip.duration should be endTime - startTime");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(imageSettings);
+                UnityEngine.Object.DestroyImmediate(timeline);
+            }
+        }
+
+        [Test]
+        public void ApplyToTimeline_NoRange_UsesFullTimelineDuration()
+        {
+            // When startTime == endTime == 0, clip should span full Timeline duration.
+            var timeline = ScriptableObject.CreateInstance<TimelineAsset>();
+            timeline.durationMode = TimelineAsset.DurationMode.FixedLength;
+            timeline.fixedDuration = 8.0;
+
+            var imageSettings = MtrRecorderClipBuilder.BuildImageSettings(
+                MakeImageConfig(), TempDir() + "/frame_<Frame>");
+
+            try
+            {
+                var clip = MtrRecorderClipBuilder.ApplyToTimeline(
+                    timeline, imageSettings, startTime: 0.0, endTime: 0.0);
+
+                UnityEngine.Timeline.TimelineClip foundTimelineClip = null;
+                foreach (var track in timeline.GetOutputTracks())
+                {
+                    if (track is RecorderTrack)
+                    {
+                        foreach (var tc in track.GetClips())
+                        {
+                            if (tc.asset == clip) { foundTimelineClip = tc; break; }
+                        }
+                    }
+                    if (foundTimelineClip != null) break;
+                }
+
+                Assert.IsNotNull(foundTimelineClip);
+                Assert.AreEqual(0.0, foundTimelineClip.start, 1e-6,    "start should be 0 for full range");
+                Assert.AreEqual(8.0, foundTimelineClip.duration, 1e-6, "duration should equal timeline.duration");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(imageSettings);
+                UnityEngine.Object.DestroyImmediate(timeline);
+            }
+        }
+
+        [Test]
+        public void ApplyToTimeline_EndTimeLessThanStartTime_FallsBackToFullDuration()
+        {
+            // endTime <= startTime is an invalid range; clip should fall back to full Timeline.
+            var timeline = ScriptableObject.CreateInstance<TimelineAsset>();
+            timeline.durationMode = TimelineAsset.DurationMode.FixedLength;
+            timeline.fixedDuration = 5.0;
+
+            var imageSettings = MtrRecorderClipBuilder.BuildImageSettings(
+                MakeImageConfig(), TempDir() + "/frame_<Frame>");
+
+            try
+            {
+                // endTime (1.0) < startTime (3.0) → invalid range
+                var clip = MtrRecorderClipBuilder.ApplyToTimeline(
+                    timeline, imageSettings, startTime: 3.0, endTime: 1.0);
+
+                UnityEngine.Timeline.TimelineClip foundTimelineClip = null;
+                foreach (var track in timeline.GetOutputTracks())
+                {
+                    if (track is RecorderTrack)
+                    {
+                        foreach (var tc in track.GetClips())
+                        {
+                            if (tc.asset == clip) { foundTimelineClip = tc; break; }
+                        }
+                    }
+                    if (foundTimelineClip != null) break;
+                }
+
+                Assert.IsNotNull(foundTimelineClip);
+                Assert.AreEqual(0.0, foundTimelineClip.start, 1e-6,    "fallback: start should be 0");
+                Assert.AreEqual(5.0, foundTimelineClip.duration, 1e-6, "fallback: duration = full timeline");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(imageSettings);
+                UnityEngine.Object.DestroyImmediate(timeline);
+            }
+        }
+
+        [Test]
+        public void BuildAndApply_WithRange_PropagatesStartAndDuration()
+        {
+            // Verify that BuildAndApply correctly passes startTime/endTime through to ApplyToTimeline.
+            var timeline = ScriptableObject.CreateInstance<TimelineAsset>();
+            timeline.durationMode = TimelineAsset.DurationMode.FixedLength;
+            timeline.fixedDuration = 10.0;
+
+            var cfg = MakeImageConfig();
+            RecorderClip clip = null;
+            try
+            {
+                clip = MtrRecorderClipBuilder.BuildAndApply(
+                    cfg, TempDir() + "/frame_<Frame>", timeline,
+                    startTime: 1.5, endTime: 4.5);
+
+                UnityEngine.Timeline.TimelineClip foundTimelineClip = null;
+                foreach (var track in timeline.GetOutputTracks())
+                {
+                    if (track is RecorderTrack)
+                    {
+                        foreach (var tc in track.GetClips())
+                        {
+                            if (tc.asset == clip) { foundTimelineClip = tc; break; }
+                        }
+                    }
+                    if (foundTimelineClip != null) break;
+                }
+
+                Assert.IsNotNull(foundTimelineClip);
+                Assert.AreEqual(1.5, foundTimelineClip.start,    1e-6, "start");
+                Assert.AreEqual(3.0, foundTimelineClip.duration, 1e-6, "duration = endTime - startTime");
+            }
+            finally
+            {
+                if (clip != null && clip.settings != null)
+                    UnityEngine.Object.DestroyImmediate(clip.settings);
+                UnityEngine.Object.DestroyImmediate(timeline);
+            }
+        }
+
 #endif // UNITY_RECORDER
 
         // -----------------------------------------------------------------------

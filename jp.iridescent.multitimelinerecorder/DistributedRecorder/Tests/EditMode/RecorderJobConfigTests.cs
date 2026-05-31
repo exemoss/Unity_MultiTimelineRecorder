@@ -422,11 +422,14 @@ namespace DistributedRecorder.Tests
 
         /// <summary>
         /// A valid MTR-path JobRequest with timelineAssetPath set.
+        /// recorderSettingsAssetPath is intentionally empty to match what the real
+        /// dispatch path (CollectRenderTargets → StartDistributedRecordingAsync) produces.
+        /// The Validate() blocker fix ensures this passes InputValidator.
         /// </summary>
         private static JobRequest MakeValidMtrRequest() => new JobRequest
         {
             jobId                     = "mtr-job-001",
-            recorderSettingsAssetPath = "Assets/Recordings/MyRecorder.asset",
+            recorderSettingsAssetPath = string.Empty,   // real MTR path leaves this empty
             scenePath                 = "Assets/Scenes/Sample.unity",
             projectHash               = new string('d', 64),
             masterUnityVersion        = "6000.2.10f1",
@@ -445,5 +448,72 @@ namespace DistributedRecorder.Tests
                 imageFormat      = DistImageFormat.PNG
             }
         };
+
+        // -----------------------------------------------------------------------
+        // Regression: real dispatch path JobRequest passes InputValidator
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Regression test: verifies that a JobRequest with the exact shape that
+        /// StartDistributedRecordingAsync produces (recorderSettingsAssetPath = empty,
+        /// timelineAssetPath = non-empty, recorderConfig supplied) passes Validate().
+        ///
+        /// This was the Blocker from review iteration 1: the validator previously
+        /// treated recorderSettingsAssetPath as required, so every real MTR job was
+        /// rejected with HTTP 400 at the Worker.
+        /// </summary>
+        [Test]
+        public void Validate_RealDispatchPathRequest_PassesValidation()
+        {
+            // This mirrors what MultiTimelineRecorder_Distributed.StartDistributedRecordingAsync
+            // builds in its JobRequest initializer (jobId from Guid.NewGuid().ToString("N")).
+            var request = new JobRequest
+            {
+                jobId                     = "a1b2c3d4e5f64a3b8c9d0e1f2a3b4c5d", // GUID-N style
+                recorderSettingsAssetPath = string.Empty,                          // NOT set by MTR path
+                scenePath                 = "Assets/Scenes/Shot01.unity",
+                projectHash               = new string('e', 64),
+                masterUnityVersion        = "6000.2.10f1",
+                masterRecorderVersion     = "5.1.2",
+                timelineAssetPath         = "Assets/Timelines/Shot01.playable",
+                directorObjectName        = "ShotDirector",
+                directorHierarchyPath     = "Root/ShotDirector",
+                startTime                 = 1.0,
+                endTime                   = 5.0,
+                outputSubDir              = "a1b2c3d4e5f64a3b8c9d0e1f2a3b4c5d",
+                recorderConfig            = new RecorderJobConfig
+                {
+                    recorderType     = DistRecorderType.Image,
+                    width            = 1920,
+                    height           = 1080,
+                    frameRate        = 24.0,
+                    takeNumber       = 1,
+                    fileNameTemplate = "frame_<Frame>",
+                    imageFormat      = DistImageFormat.PNG
+                }
+            };
+
+            bool ok = InputValidator.Validate(request, out string reason);
+            Assert.IsTrue(ok,
+                $"Real MTR dispatch JobRequest must pass InputValidator. Validation failed: {reason}");
+        }
+
+        /// <summary>
+        /// Verifies the negative case: when BOTH recorderSettingsAssetPath AND
+        /// timelineAssetPath are empty, Validate() must reject the request
+        /// (recording target is unknown).
+        /// </summary>
+        [Test]
+        public void Validate_BothRecordingTargetFieldsEmpty_Fails()
+        {
+            var request = MakeValidRequest(); // has recorderSettingsAssetPath set
+            request.recorderSettingsAssetPath = string.Empty;
+            request.timelineAssetPath         = string.Empty;
+
+            Assert.IsFalse(InputValidator.Validate(request, out string reason),
+                "Validate should fail when both recorderSettingsAssetPath and timelineAssetPath are empty.");
+            StringAssert.Contains("recording target", reason.ToLowerInvariant(),
+                $"Failure reason should mention recording target. Got: {reason}");
+        }
     }
 }
