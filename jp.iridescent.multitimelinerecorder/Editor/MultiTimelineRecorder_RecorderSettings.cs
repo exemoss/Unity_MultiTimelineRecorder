@@ -294,99 +294,38 @@ namespace Unity.MultiTimelineRecorder
         
         // ========== Multi Recorder Mode Methods ==========
         
+        /// <summary>
+        /// Builds an <see cref="ImageRecorderSettings"/> for a multi-recorder config item.
+        ///
+        /// Delegates to <see cref="RecorderSettingsBuilderShared.BuildImageSettings"/> so that
+        /// the local MTR recording path uses the same settings-construction code as the
+        /// distributed Worker (single source of truth — §A worker-recorder-redesign).
+        /// </summary>
         private RecorderSettings CreateImageRecorderSettingsFromConfig(string outputPath, string outputFileName, MultiRecorderConfig.RecorderConfigItem config)
         {
-            var settings = ScriptableObject.CreateInstance<ImageRecorderSettings>();
+            // Combine path + filename the same way RecorderSettingsHelper does.
+            string outputFile;
+            if (!string.IsNullOrEmpty(outputPath) && !string.IsNullOrEmpty(outputFileName))
+                outputFile = outputPath.TrimEnd('/', '\\') + "/" + outputFileName;
+            else if (!string.IsNullOrEmpty(outputFileName))
+                outputFile = outputFileName;
+            else
+                outputFile = outputPath;
+
+            // Local MTR recording passes Camera / RenderTexture by direct reference
+            // (config.imageTargetCamera / config.imageRenderTexture are already resolved in-Editor).
+            // fallbackToGameViewOnMissingRef=true mirrors the original inline behaviour.
+            var settings = RecorderSettingsBuilderShared.BuildImageSettings(
+                config,
+                config.width,
+                config.height,
+                frameRate,
+                config.imageTargetCamera,
+                config.imageRenderTexture,
+                outputFile,
+                fallbackToGameViewOnMissingRef: true);
+
             settings.name = "ImageRecorderSettings";
-            settings.Enabled = true;
-            settings.RecordMode = UnityEditor.Recorder.RecordMode.Manual;
-            settings.OutputFormat = config.imageFormat;
-            settings.CaptureAlpha = config.captureAlpha;
-            
-            if (config.imageFormat == ImageRecorderSettings.ImageRecorderOutputFormat.JPEG)
-            {
-                settings.JpegQuality = config.jpegQuality;
-            }
-            else if (config.imageFormat == ImageRecorderSettings.ImageRecorderOutputFormat.EXR)
-            {
-                settings.EXRCompression = config.exrCompression;
-            }
-            
-            settings.FrameRate = frameRate;
-            settings.CapFrameRate = true;
-            
-            RecorderSettingsHelper.ConfigureOutputPath(settings, outputPath, outputFileName, RecorderSettingsType.Image);
-            
-            // Configure input settings based on source type
-            switch (config.imageSourceType)
-            {
-                case ImageRecorderSourceType.GameView:
-                    settings.imageInputSettings = new GameViewInputSettings
-                    {
-                        OutputWidth = config.width,
-                        OutputHeight = config.height
-                    };
-                    break;
-                    
-                case ImageRecorderSourceType.TargetCamera:
-                    if (config.imageTargetCamera != null)
-                    {
-                        var cameraInputSettings = new CameraInputSettings
-                        {
-                            OutputWidth = config.width,
-                            OutputHeight = config.height,
-                            FlipFinalOutput = false,
-                            CaptureUI = false
-                        };
-                        // Set the camera using the appropriate method or property
-                        var cameraProperty = cameraInputSettings.GetType().GetProperty("Camera") ?? cameraInputSettings.GetType().GetProperty("camera");
-                        if (cameraProperty != null)
-                        {
-                            cameraProperty.SetValue(cameraInputSettings, config.imageTargetCamera);
-                        }
-                        settings.imageInputSettings = cameraInputSettings;
-                    }
-                    else
-                    {
-                        MultiTimelineRecorderLogger.LogWarning($"[MultiTimelineRecorder] Target camera not set for recorder '{config.name}'. Falling back to Game View.");
-                        settings.imageInputSettings = new GameViewInputSettings
-                        {
-                            OutputWidth = config.width,
-                            OutputHeight = config.height
-                        };
-                    }
-                    break;
-                    
-                case ImageRecorderSourceType.RenderTexture:
-                    if (config.imageRenderTexture != null)
-                    {
-                        var renderTextureInputSettings = new RenderTextureInputSettings
-                        {
-                            RenderTexture = config.imageRenderTexture,
-                            FlipFinalOutput = false
-                        };
-                        settings.imageInputSettings = renderTextureInputSettings;
-                    }
-                    else
-                    {
-                        MultiTimelineRecorderLogger.LogWarning($"[MultiTimelineRecorder] Render texture not set for recorder '{config.name}'. Falling back to Game View.");
-                        settings.imageInputSettings = new GameViewInputSettings
-                        {
-                            OutputWidth = config.width,
-                            OutputHeight = config.height
-                        };
-                    }
-                    break;
-                    
-                default:
-                    settings.imageInputSettings = new GameViewInputSettings
-                    {
-                        OutputWidth = config.width,
-                        OutputHeight = config.height
-                    };
-                    break;
-            }
-            
             return settings;
         }
         
