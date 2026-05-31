@@ -17,7 +17,8 @@
         "Unity.Recorder.RecorderLibrary",
         "Unity.Recorder.Timeline",
         "Unity.Recorder.Editor",
-        "Unity.EditorCoroutines.Editor"
+        "Unity.EditorCoroutines.Editor",
+        "DistributedRecorder.Editor"
     ],
     "includePlatforms": [
         "Editor"
