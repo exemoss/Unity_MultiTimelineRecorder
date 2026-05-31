@@ -307,17 +307,31 @@ namespace DistributedRecorder.Worker
             string masterHashToCheck;
             if (isMtrJob && !string.IsNullOrEmpty(request.jobScopeHash))
             {
-                // MTR path: compute job-scope hash and compare against jobScopeHash.
+                // MTR path: compute job-scope hash on the main thread (AssetDatabase.GetDependencies
+                // is main-thread-only).  InvokeAndWait blocks this background listener thread until
+                // the main thread executes the computation.
+                // Implicit fallback to whole-Assets hash is intentionally removed: if the computation
+                // fails or times out we reject the job immediately so the mismatch is visible.
+                string capturedTimeline = request.timelineAssetPath;
+                string capturedScene    = request.scenePath;
                 try
                 {
-                    localHash = ProjectHasher.ComputeJobScope(
-                        request.timelineAssetPath, request.scenePath);
+                    localHash = MainThreadDispatcher.InvokeAndWait(
+                        () => ProjectHasher.ComputeJobScope(capturedTimeline, capturedScene),
+                        TimeSpan.FromSeconds(15));
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogWarning(
-                        $"[Worker] ジョブスコープハッシュ計算失敗 – whole-Assets ハッシュにフォールバック: {ex.Message}");
-                    localHash = ProjectHasher.Compute(ProjectPaths.ProjectRoot);
+                    Debug.LogError(
+                        $"[Worker] ジョブスコープハッシュ計算失敗 – ジョブを拒否します: {ex.Message}");
+                    var hashErrAck = new JobAck
+                    {
+                        jobId    = request.jobId,
+                        accepted = false,
+                        reason   = $"job-scope hash computation failed: {ex.Message}"
+                    };
+                    RespondJson(ctx, 409, ProtocolSerializer.Serialize(hashErrAck));
+                    return;
                 }
                 masterHashToCheck = request.jobScopeHash;
             }
