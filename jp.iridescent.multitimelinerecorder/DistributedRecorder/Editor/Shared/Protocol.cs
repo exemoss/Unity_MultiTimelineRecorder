@@ -13,19 +13,21 @@ namespace DistributedRecorder.Shared
     /// </summary>
     public enum JobState
     {
-        Pending,
+        Pending,      // 0 — wire value: dispatched, Worker has not yet transitioned
+        Running,      // 1 — wire value: Worker is actively recording
+        Completed,    // 2 — wire value: recording finished successfully
+        Failed,       // 3 — wire value: recording failed
+        Cancelled,    // 4 — wire value: cancelled
+        Unreachable,  // 5 — wire value: Worker did not respond
         /// <summary>
         /// Job is waiting in the Master-side dispatch queue for a Worker slot to become
-        /// available.  This state is only set by the Master; Worker never sends it.
+        /// available.  This state is only set by the Master; Worker never sends it over
+        /// the wire.  Placed at the end (ordinal 6) so existing wire ordinals (0–5) are
+        /// unchanged and Master/Worker version skew does not mis-classify states.
         /// Added in dispatch-retry-queue to distinguish "not yet dispatched" from
         /// "dispatched but Worker not yet picked it up" (Pending).
         /// </summary>
-        Queued,
-        Running,
-        Completed,
-        Failed,
-        Cancelled,
-        Unreachable
+        Queued        // 6 — Master-local only; never sent over the wire
     }
 
     // ---------------------------------------------------------------------------
