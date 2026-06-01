@@ -141,6 +141,104 @@ namespace DistributedRecorder.Tests.Master
         }
 
         // -----------------------------------------------------------------------
+        // Busy 503: DispatchFailReason.WorkerBusy
+        // -----------------------------------------------------------------------
+
+        [Test]
+        public async Task DispatchAsync_503WorkerBusy_ReturnsWorkerBusy()
+        {
+            // Worker returns HTTP 503 with a "Worker is busy" body.
+            string ackJson = MakeRejectedAckJson("job-busy-test",
+                "Worker is busy executing job 'abc123'. Try again when the current job completes.");
+
+            var transport = new FakeTransport(
+                healthJson:  MakeHealthJson(),
+                postAction:  _ => throw Make503Exception(ackJson));
+
+            var dispatcher = new JobDispatcher(transport, _tempProjectRoot);
+            var result = await dispatcher.DispatchAsync(
+                MakeWorker(), MakeRequest("job-busy-test"), skipVersionCheck: true);
+
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual(DispatchFailReason.WorkerBusy, result.FailReason,
+                $"Expected WorkerBusy but got {result.FailReason}. ErrorMessage: {result.ErrorMessage}");
+            StringAssert.Contains("Worker is busy", result.ErrorMessage);
+        }
+
+        [Test]
+        public async Task DispatchAsync_503WorkerBusy_ViaStatusCodeNotBody_ReturnsWorkerBusy()
+        {
+            // HTTP 503 with an accepted=false ack that does NOT mention "Worker is busy"
+            // in the reason string.  Classification must rely on the HTTP status code alone.
+            string ackJson = MakeRejectedAckJson("job-busy-sc-test", "Temporarily unavailable");
+
+            var transport = new FakeTransport(
+                healthJson:  MakeHealthJson(),
+                postAction:  _ => throw Make503Exception(ackJson));
+
+            var dispatcher = new JobDispatcher(transport, _tempProjectRoot);
+            var result = await dispatcher.DispatchAsync(
+                MakeWorker(), MakeRequest("job-busy-sc-test"), skipVersionCheck: true);
+
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual(DispatchFailReason.WorkerBusy, result.FailReason,
+                $"HTTP 503 must map to WorkerBusy regardless of reason text. Got {result.FailReason}.");
+        }
+
+        [Test]
+        public void ClassifyRejection_HttpStatusCode503_ReturnsWorkerBusy()
+        {
+            // Unit-test ClassifyRejection directly (internal accessor)
+            var ack = new JobAck { jobId = "j", accepted = false, reason = "some other message" };
+            var result = JobDispatcher.ClassifyRejection("j", ack, httpStatusCode: 503);
+
+            Assert.AreEqual(DispatchFailReason.WorkerBusy, result.FailReason,
+                "Status 503 must map to WorkerBusy even when reason text is unrelated.");
+        }
+
+        [Test]
+        public void ClassifyRejection_ReasonContainsBusy_NoStatusCode_ReturnsWorkerBusy()
+        {
+            // reason string contains "Worker is busy" even when status code is unknown (0)
+            var ack = new JobAck { jobId = "j", accepted = false, reason = "Worker is busy executing job X." };
+            var result = JobDispatcher.ClassifyRejection("j", ack, httpStatusCode: 0);
+
+            Assert.AreEqual(DispatchFailReason.WorkerBusy, result.FailReason);
+        }
+
+        [Test]
+        public void ClassifyRejection_409HashMismatch_NotMisrouted()
+        {
+            // Confirm that HTTP 409 + hash-mismatch reason is still classified as HashMismatch,
+            // not WorkerBusy, after the 503 check was added.
+            var ack = new JobAck
+            {
+                jobId    = "j",
+                accepted = false,
+                reason   = "Project hash mismatch (local=aaaa, master=bbbb)."
+            };
+            var result = JobDispatcher.ClassifyRejection("j", ack, httpStatusCode: 409);
+
+            Assert.AreEqual(DispatchFailReason.HashMismatch, result.FailReason,
+                "409 + hash-mismatch reason must not be misrouted to WorkerBusy.");
+        }
+
+        [Test]
+        public void ClassifyRejection_409VersionMismatch_NotMisrouted()
+        {
+            var ack = new JobAck
+            {
+                jobId    = "j",
+                accepted = false,
+                reason   = "Version mismatch detected: Unity local=6000.2.10f1 remote=5.0.0"
+            };
+            var result = JobDispatcher.ClassifyRejection("j", ack, httpStatusCode: 409);
+
+            Assert.AreEqual(DispatchFailReason.VersionMismatch, result.FailReason,
+                "409 + version-mismatch reason must not be misrouted to WorkerBusy.");
+        }
+
+        // -----------------------------------------------------------------------
         // Duplicate / other rejection 409: DispatchFailReason.WorkerRejected
         // -----------------------------------------------------------------------
 
@@ -253,6 +351,12 @@ namespace DistributedRecorder.Tests.Master
             => new TransportException(
                 $"POST /jobs returned HTTP 409: {body}",
                 httpStatusCode: 409,
+                body: body);
+
+        private static TransportException Make503Exception(string body)
+            => new TransportException(
+                $"POST /jobs returned HTTP 503: {body}",
+                httpStatusCode: 503,
                 body: body);
 
         private static WorkerInfo MakeWorker() => new WorkerInfo
