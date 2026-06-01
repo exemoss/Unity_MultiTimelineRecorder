@@ -95,16 +95,18 @@ namespace DistributedRecorder.Master
             }
             catch (TransportException ex)
             {
-                // Workers return HTTP 409 with a JobAck body for version/hash/duplicate
-                // rejections.  Try to deserialise the body before falling back to a
-                // generic NetworkError so the UI can show the correct override dialog.
+                // Workers return HTTP 409 or 503 with a JobAck body for
+                // version/hash/duplicate rejections and busy responses.
+                // Try to deserialise the body before falling back to NetworkError
+                // so the UI can show the correct override dialog and the scheduler
+                // can distinguish transient busy (WorkerBusy) from permanent failures.
                 if (!string.IsNullOrEmpty(ex.Body))
                 {
                     try
                     {
                         var rejectedAck = ProtocolSerializer.Deserialize<JobAck>(ex.Body);
                         if (rejectedAck != null && !rejectedAck.accepted)
-                            return ClassifyRejection(request.jobId, rejectedAck);
+                            return ClassifyRejection(request.jobId, rejectedAck, ex.HttpStatusCode);
                     }
                     catch
                     {
@@ -129,11 +131,26 @@ namespace DistributedRecorder.Master
         /// override dialog.
         ///
         /// Called from both the HTTP-success path (2xx body with accepted=false,
-        /// which should not normally occur) and the HTTP-409 exception path.
+        /// which should not normally occur) and the HTTP-4xx/5xx exception path.
+        ///
+        /// <param name="httpStatusCode">
+        /// The HTTP status code from the response (0 if unknown / success-path call).
+        /// When 503, the reason is classified as <see cref="DispatchFailReason.WorkerBusy"/>
+        /// regardless of the reason string content.
+        /// Added in dispatch-retry-queue to separate transient busy (503) from
+        /// permanent rejections (409).
+        /// </param>
         /// </summary>
-        private static DispatchResult ClassifyRejection(string jobId, JobAck ack)
+        public static DispatchResult ClassifyRejection(string jobId, JobAck ack, int httpStatusCode = 0)
         {
             string reason = ack.reason ?? string.Empty;
+
+            // HTTP 503: Worker is busy executing another job.
+            // This is a transient condition – the scheduler will re-queue the job.
+            // Check status code first so we do NOT misroute to WorkerRejected even
+            // if the reason string happens to contain other keywords.
+            if (httpStatusCode == 503 || reason.IndexOf("Worker is busy", StringComparison.OrdinalIgnoreCase) >= 0)
+                return DispatchResult.Fail(jobId, DispatchFailReason.WorkerBusy, reason);
 
             // Hash mismatch: Worker reason contains "Project hash mismatch"
             if (reason.IndexOf("Project hash mismatch", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -144,7 +161,7 @@ namespace DistributedRecorder.Master
             if (reason.IndexOf("Version mismatch", StringComparison.OrdinalIgnoreCase) >= 0)
                 return DispatchResult.Fail(jobId, DispatchFailReason.VersionMismatch, reason);
 
-            // Everything else (duplicate job-id, busy worker, etc.)
+            // Everything else (duplicate job-id, unknown errors, etc.) is a permanent rejection.
             return DispatchResult.Fail(jobId, DispatchFailReason.WorkerRejected, reason);
         }
     }
@@ -164,7 +181,16 @@ namespace DistributedRecorder.Master
         HashMismatch,
         HashError,
         NetworkError,
-        WorkerRejected
+        WorkerRejected,
+        /// <summary>
+        /// Worker is currently executing another job (HTTP 503 "Worker is busy").
+        /// Unlike permanent rejections (409), this is a transient condition.
+        /// The Master scheduler should hold the job in the pending queue and
+        /// re-dispatch once the Worker signals completion.
+        ///
+        /// Added in dispatch-retry-queue to separate busy-503 from permanent-409.
+        /// </summary>
+        WorkerBusy
     }
 
     public class DispatchResult
