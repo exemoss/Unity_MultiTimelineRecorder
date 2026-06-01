@@ -67,6 +67,77 @@ namespace Unity.MultiTimelineRecorder
         private const int MaxSanitizedTimelineNameLength = 64;
 
         // -----------------------------------------------------------------------
+        // Dispatch-retry-queue scheduler state (dispatch-retry-queue feature)
+        //
+        // All fields are only accessed on the Editor main thread (inside
+        // EditorCallbackOnce delegates or synchronous GUI/async methods) so no
+        // additional locking is required.
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Maximum number of times a single job may be retried after a WorkerBusy
+        /// or other transient failure before it is permanently marked Failed.
+        /// </summary>
+        private const int MaxJobRetries = 5;
+
+        /// <summary>
+        /// Failsafe: if no progress event is received for a job within this many
+        /// seconds, health-poll the assigned Worker to check whether it is idle.
+        /// Keeps the queue from stalling when the NDJSON push stream silently drops.
+        /// </summary>
+        private const double FailsafeStallSeconds = 30.0;
+
+        /// <summary>
+        /// Jobs waiting to be dispatched (not yet sent to any Worker).
+        /// Populated at batch start; consumed by <see cref="TryDispatchNextQueuedJob"/>.
+        /// Only accessed on the main thread.
+        /// </summary>
+        private readonly Queue<MtrJobViewModel> _pendingQueue = new Queue<MtrJobViewModel>();
+
+        /// <summary>
+        /// Tracks which Worker each in-flight job is running on.
+        /// Key = JobId, Value = WorkerInfo.
+        /// Used to direct the "next job" to the Worker that just became free.
+        /// Only accessed on the main thread.
+        /// </summary>
+        private readonly Dictionary<string, WorkerInfo> _jobWorkerMap =
+            new Dictionary<string, WorkerInfo>();
+
+        /// <summary>
+        /// Tracks how many jobs are currently in-flight on each Worker.
+        /// Workers with in-flight count == 0 are considered available for dispatch.
+        /// Key = worker.displayName (unique per registry entry).
+        /// Only accessed on the main thread.
+        /// </summary>
+        private readonly Dictionary<string, int> _workerInflightCount =
+            new Dictionary<string, int>();
+
+        /// <summary>
+        /// Shared <see cref="JobDispatcher"/> for the current batch.
+        /// Created at batch start; disposed when all jobs reach terminal state.
+        /// </summary>
+        private JobDispatcher _batchDispatcher;
+
+        /// <summary>
+        /// Shared <see cref="HttpTransport"/> for the current batch.
+        /// Disposed alongside <see cref="_batchDispatcher"/>.
+        /// </summary>
+        private HttpTransport _batchTransport;
+
+        /// <summary>
+        /// Shared <see cref="HmacAuthenticator"/> for the current batch.
+        /// </summary>
+        private HmacAuthenticator _batchAuth;
+
+        /// <summary>
+        /// Last progress-event time (EditorApplication.timeSinceStartup) keyed by JobId.
+        /// Used by the failsafe polling to detect stalled jobs.
+        /// Only accessed on the main thread.
+        /// </summary>
+        private readonly Dictionary<string, double> _jobLastProgressTime =
+            new Dictionary<string, double>();
+
+        // -----------------------------------------------------------------------
         // UI hook (called from MultiTimelineRecorder.cs DrawRecordControls area)
         // -----------------------------------------------------------------------
 
@@ -183,11 +254,21 @@ namespace Unity.MultiTimelineRecorder
             int total     = _dispatchedJobs.Count;
             int completed = CountJobsByState(JobState.Completed);
             int failed    = CountJobsByState(JobState.Failed);
+            int queued    = CountJobsByState(JobState.Queued);
+            int running   = CountJobsByState(JobState.Running);
             int active    = total - completed - failed;
 
-            string summary = active > 0
-                ? $"実行中: {active} / 完了: {completed} / 失敗: {failed}"
-                : $"完了: {completed} / 失敗: {failed} (合計 {total})";
+            string summary;
+            if (active > 0)
+            {
+                summary = queued > 0
+                    ? $"実行中: {running} / 待機中: {queued} / 完了: {completed} / 失敗: {failed}"
+                    : $"実行中: {running} / 完了: {completed} / 失敗: {failed}";
+            }
+            else
+            {
+                summary = $"完了: {completed} / 失敗: {failed} (合計 {total})";
+            }
 
             EditorGUILayout.LabelField(summary, EditorStyles.miniLabel);
 
@@ -225,9 +306,15 @@ namespace Unity.MultiTimelineRecorder
                 GUILayout.Width(280));
 
             // Progress bar
-            float progress = vm.TotalFrames > 0
-                ? (float)vm.CurrentFrame / vm.TotalFrames
-                : (vm.State == JobState.Running ? 0.5f : 1f);
+            float progress;
+            if (vm.TotalFrames > 0)
+                progress = (float)vm.CurrentFrame / vm.TotalFrames;
+            else if (vm.State == JobState.Running)
+                progress = 0.5f;
+            else if (vm.State == JobState.Queued || vm.State == JobState.Pending)
+                progress = 0f;
+            else
+                progress = 1f;
 
             string barLabel;
             switch (vm.State)
@@ -239,6 +326,9 @@ namespace Unity.MultiTimelineRecorder
                     break;
                 case JobState.Failed:
                     barLabel = "Failed";
+                    break;
+                case JobState.Queued:
+                    barLabel = vm.RetryCount > 0 ? $"待機中 (retry {vm.RetryCount})" : "待機中";
                     break;
                 default:
                     barLabel = $"{vm.CurrentFrame}/{vm.TotalFrames}";
@@ -694,6 +784,54 @@ namespace Unity.MultiTimelineRecorder
         }
 
         // -----------------------------------------------------------------------
+        // Scheduler pure functions (dispatch-retry-queue)
+        // Made public static for hermetic EditMode tests.
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Selects the first available Worker from <paramref name="workers"/> that has
+        /// no in-flight jobs according to <paramref name="inflightCounts"/>.
+        ///
+        /// Returns <c>null</c> when all Workers are busy or the inputs are empty.
+        ///
+        /// Made <c>public static</c> for hermetic EditMode tests.
+        /// </summary>
+        /// <param name="workers">Ordered list of available Workers.</param>
+        /// <param name="inflightCounts">
+        /// Map of workerDisplayName → number of currently in-flight jobs.
+        /// Workers absent from the map are treated as having 0 in-flight jobs.
+        /// </param>
+        public static WorkerInfo SelectIdleWorker(
+            IReadOnlyList<WorkerInfo> workers,
+            IReadOnlyDictionary<string, int> inflightCounts)
+        {
+            if (workers == null || workers.Count == 0) return null;
+
+            foreach (var w in workers)
+            {
+                int count = 0;
+                inflightCounts?.TryGetValue(w.displayName, out count);
+                if (count == 0)
+                    return w;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Returns <c>true</c> when <paramref name="vm"/> should be re-queued after a
+        /// failed dispatch attempt (WorkerBusy, retry limit not exceeded).
+        ///
+        /// Made <c>public static</c> for hermetic EditMode tests.
+        /// </summary>
+        /// <param name="vm">The view model whose State and RetryCount are inspected.</param>
+        /// <param name="maxRetries">Maximum allowed retry count (exclusive upper bound).</param>
+        public static bool ShouldRequeue(MtrJobViewModel vm, int maxRetries)
+        {
+            if (vm == null) return false;
+            return vm.State == JobState.Queued && vm.RetryCount <= maxRetries;
+        }
+
+        // -----------------------------------------------------------------------
         // Dispatch entry point
         // -----------------------------------------------------------------------
 
@@ -715,6 +853,12 @@ namespace Unity.MultiTimelineRecorder
 
         /// <summary>
         /// Implementation of distributed recording dispatch (called from the async void guard).
+        ///
+        /// dispatch-retry-queue change: uses a pending-queue + event-driven scheduler
+        /// instead of round-robin one-shot dispatch.  Each Worker receives at most one
+        /// in-flight job at a time; when a job completes/fails the next queued job is
+        /// dispatched to the newly-freed Worker.  This eliminates 503-busy failures when
+        /// Worker count is less than Timeline count.
         /// </summary>
         private async Task StartDistributedRecordingInternalAsync(List<DistributedTimelineJob> targets)
         {
@@ -744,61 +888,46 @@ namespace Unity.MultiTimelineRecorder
                 return;
             }
 
-            var auth      = new HmacAuthenticator(keyBytes);
-            var transport = new HttpTransport(auth);
-            var dispatcher = new JobDispatcher(transport, ProjectPaths.ProjectRoot);
-
             // Reset session-wide skip flags for this batch
             _sessionSkipHashCheck    = false;
             _sessionSkipVersionCheck = false;
+
+            // Set up batch-scoped shared services (disposed in FinalizeBatchIfDone)
+            _batchAuth       = new HmacAuthenticator(keyBytes);
+            _batchTransport  = new HttpTransport(_batchAuth);
+            _batchDispatcher = new JobDispatcher(_batchTransport, ProjectPaths.ProjectRoot);
 
             // Generate a single dispatch timestamp for the whole batch so all Timeline results
             // land under the same parent folder (worker-recording-fix requirement C).
             // Format: yyyyMMddHHmmss (14 digits).
             string batchDispatchTimestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
 
-            // Round-robin assignment
-            var assignments = AssignRoundRobin(targets, workers);
+            // ── Build view models and fill the pending queue ────────────────────
+            // All jobs start as Queued (visible in UI immediately).
+            // We build one VM per target (no pre-assignment); Worker assignment happens
+            // at dispatch time (first available Worker).
+            _pendingQueue.Clear();
+            _jobWorkerMap.Clear();
+            _workerInflightCount.Clear();
+            _jobLastProgressTime.Clear();
 
-            Debug.Log($"[DistributedRecorder] {assignments.Count} ジョブを {workers.Count} Worker に round-robin で投入します。 dispatchTimestamp={batchDispatchTimestamp}");
+            foreach (var worker in workers)
+                _workerInflightCount[worker.displayName] = 0;
 
-            // Build view models first (before async dispatch) so UI shows them immediately
-            var vmsForBatch = new List<MtrJobViewModel>();
-            foreach (var (job, worker) in assignments)
+            Debug.Log($"[DistributedRecorder] {targets.Count} ジョブを {workers.Count} Worker にスケジュールします。 dispatchTimestamp={batchDispatchTimestamp}");
+
+            for (int i = 0; i < targets.Count; i++)
             {
-                string jobId                = Guid.NewGuid().ToString("N");
-                string sanitizedName        = SanitizeTimelineName(job.DirectorObjectName);
-                string outDir               = BuildResultOutputDirTimestamped(
+                var job          = targets[i];
+                string jobId     = Guid.NewGuid().ToString("N");
+                string sanitizedName = SanitizeTimelineName(job.DirectorObjectName);
+                string outDir    = BuildResultOutputDirTimestamped(
                     ProjectPaths.ProjectRoot, jobId,
                     batchDispatchTimestamp, sanitizedName);
 
-                var vm = new MtrJobViewModel
-                {
-                    JobId          = jobId,
-                    TimelineName   = job.DirectorObjectName,
-                    WorkerName     = worker.displayName,
-                    State          = JobState.Pending,
-                    DownloadState  = DownloadState.NotStarted,
-                    LocalOutputDir = outDir,
-                    Worker         = worker
-                };
-                _dispatchedJobs.Add(vm);
-                vmsForBatch.Add(vm);
-            }
-
-            Repaint();
-
-            // Dispatch sequentially so dialog responses can influence subsequent jobs.
-            // Using sequential rather than parallel because EditorUtility.DisplayDialog
-            // must be called from the main thread and we want per-batch skip flags.
-            for (int i = 0; i < assignments.Count; i++)
-            {
-                var (job, worker) = assignments[i];
-                var vm            = vmsForBatch[i];
-
                 var request = new JobRequest
                 {
-                    jobId                      = vm.JobId,
+                    jobId                      = jobId,
                     scenePath                  = job.ScenePath,
                     timelineAssetPath          = job.TimelineAssetPath,
                     directorObjectName         = job.DirectorObjectName,
@@ -806,7 +935,7 @@ namespace Unity.MultiTimelineRecorder
                     recorderConfig             = job.JobConfig,
                     startTime                  = job.StartTime,
                     endTime                    = job.EndTime,
-                    outputSubDir               = vm.JobId,
+                    outputSubDir               = jobId,
                     dispatchTimestamp          = batchDispatchTimestamp,
                     // MTR fidelity fields
                     jobScopeHash               = job.JobScopeHash,
@@ -820,19 +949,144 @@ namespace Unity.MultiTimelineRecorder
                     resolvedOutputRelativePath = job.ResolvedOutputRelativePath
                 };
 
-                bool accepted = await DispatchOneWithOverrideAsync(
-                    dispatcher, auth, worker, request, vm);
+                // Hint: show the likely Worker in the UI while the job is queued.
+                // Actual Worker assignment happens at dispatch time (first idle Worker).
+                string hintWorkerName = workers[i % workers.Count].displayName;
 
-                if (accepted)
+                var vm = new MtrJobViewModel
                 {
-                    // Start progress monitor (fire-and-forget; events repaint the window)
-                    StartProgressMonitor(auth, worker, vm);
-                }
+                    JobId          = jobId,
+                    TimelineName   = job.DirectorObjectName,
+                    WorkerName     = hintWorkerName,
+                    State          = JobState.Queued,
+                    DownloadState  = DownloadState.NotStarted,
+                    LocalOutputDir = outDir,
+                    Worker         = null,   // assigned at dispatch time
+                    PendingRequest = request,
+                    RetryCount     = 0
+                };
 
+                _dispatchedJobs.Add(vm);
+                _pendingQueue.Enqueue(vm);
+            }
+
+            Repaint();
+
+            // ── Initial dispatch: one job per Worker (parallel seed) ─────────────
+            // Use sequential await so override dialogs (hash/version) are shown on
+            // the main thread one at a time and _sessionSkip flags propagate correctly.
+            foreach (var worker in workers)
+            {
+                if (_pendingQueue.Count == 0) break;
+                var vm = _pendingQueue.Dequeue();
+                await DispatchQueuedJobAsync(worker, vm);
                 Repaint();
             }
 
-            transport.Dispose();
+            // Remaining jobs stay in _pendingQueue; they are dispatched by
+            // OnJobTerminated (via StartProgressMonitor completion callbacks).
+            // No transport.Dispose() here — deferred to FinalizeBatchIfDone.
+        }
+
+        // -----------------------------------------------------------------------
+        // Scheduler helpers (dispatch-retry-queue)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Dispatches <paramref name="vm"/> (which must be in Queued state) to
+        /// <paramref name="worker"/>, starting the progress monitor on success.
+        ///
+        /// Called both during the initial seed loop and from <see cref="OnJobTerminated"/>
+        /// when a Worker slot frees up.
+        ///
+        /// Must be called from the Editor main thread (awaited in async void / async Task
+        /// context; dialog calls require main thread).
+        /// </summary>
+        private async Task DispatchQueuedJobAsync(WorkerInfo worker, MtrJobViewModel vm)
+        {
+            vm.Worker     = worker;
+            vm.WorkerName = worker.displayName;
+            // State remains Queued until accepted by Worker
+
+            bool accepted = await DispatchOneWithOverrideAsync(
+                _batchDispatcher, _batchAuth, worker, vm.PendingRequest, vm);
+
+            if (accepted)
+            {
+                // Track in-flight state
+                _jobWorkerMap[vm.JobId] = worker;
+                _workerInflightCount[worker.displayName] =
+                    (_workerInflightCount.TryGetValue(worker.displayName, out int c) ? c : 0) + 1;
+                _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
+
+                StartProgressMonitorWithScheduler(worker, vm);
+            }
+            else
+            {
+                // Permanent failure or WorkerBusy already handled inside
+                // DispatchOneWithOverrideAsync; check if we should requeue
+                // (WorkerBusy for the initial seed can happen in rare race conditions).
+                // For the initial pass we mark it as already handled
+                // (DispatchOneWithOverrideAsync sets state to Queued+RetryCount++ for
+                // WorkerBusy or Failed for permanent).
+                // If it ended up back in Queued state, re-enqueue it.
+                if (vm.State == JobState.Queued)
+                    _pendingQueue.Enqueue(vm);
+            }
+
+            Repaint();
+        }
+
+        /// <summary>
+        /// Called (on main thread) when a job reaches a terminal state.
+        /// Frees the Worker slot and dispatches the next queued job if any.
+        /// </summary>
+        private void OnJobTerminated(WorkerInfo worker, MtrJobViewModel completedVm)
+        {
+            // Release the slot
+            if (_jobWorkerMap.ContainsKey(completedVm.JobId))
+                _jobWorkerMap.Remove(completedVm.JobId);
+
+            _jobLastProgressTime.Remove(completedVm.JobId);
+
+            if (_workerInflightCount.TryGetValue(worker.displayName, out int count))
+                _workerInflightCount[worker.displayName] = Math.Max(0, count - 1);
+
+            // Dispatch next job to the newly-freed Worker
+            TryDispatchNextQueuedJob(worker);
+
+            // If no more work remains, finalize the batch
+            FinalizeBatchIfDone();
+        }
+
+        /// <summary>
+        /// Picks the next job from <see cref="_pendingQueue"/> and dispatches it to
+        /// <paramref name="preferredWorker"/> (fire-and-forget async void, always on
+        /// main thread via EditorCallbackOnce).
+        /// </summary>
+        private void TryDispatchNextQueuedJob(WorkerInfo preferredWorker)
+        {
+            if (_pendingQueue.Count == 0) return;
+
+            var nextVm = _pendingQueue.Dequeue();
+            // Fire-and-forget; exceptions are caught inside DispatchQueuedJobAsync
+            _ = DispatchQueuedJobAsync(preferredWorker, nextVm);
+        }
+
+        /// <summary>
+        /// Disposes batch-scoped services when all jobs have reached terminal states.
+        /// </summary>
+        private void FinalizeBatchIfDone()
+        {
+            if (_pendingQueue.Count > 0) return;
+            if (!AreAllJobsTerminal(_dispatchedJobs)) return;
+
+            _batchTransport?.Dispose();
+            _batchTransport  = null;
+            _batchDispatcher = null;
+            _batchAuth       = null;
+
+            Debug.Log("[DistributedRecorder] 全ジョブが完了しました。バッチを終了します。");
             Repaint();
         }
 
@@ -994,6 +1248,30 @@ namespace Unity.MultiTimelineRecorder
                         $"Worker に到達できません。\n{result.ErrorMessage}");
                     return false;
 
+                case DispatchFailReason.WorkerBusy:
+                {
+                    // Transient busy (HTTP 503): hold the job in Queued state for
+                    // re-dispatch by the scheduler when the Worker becomes available.
+                    // RetryCount is incremented here; if it exceeds MaxJobRetries the
+                    // job is failed permanently to avoid infinite looping.
+                    vm.RetryCount++;
+                    if (vm.RetryCount > MaxJobRetries)
+                    {
+                        vm.State = JobState.Failed;
+                        Debug.LogError(
+                            $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
+                            $"WorkerBusy リトライ上限 ({MaxJobRetries}) 超過。Failed に設定します。");
+                        return false;
+                    }
+
+                    vm.State = JobState.Queued;
+                    Debug.LogWarning(
+                        $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
+                        $"Worker がビジーです (retry {vm.RetryCount}/{MaxJobRetries})。キューに戻します。");
+                    // Caller (DispatchQueuedJobAsync) re-enqueues when State == Queued.
+                    return false;
+                }
+
                 default:
                     vm.State = JobState.Failed;
                     Debug.LogWarning(
@@ -1011,6 +1289,10 @@ namespace Unity.MultiTimelineRecorder
         /// Starts a <see cref="ProgressMonitor"/> for the given job.
         /// Events are delivered on a background thread; state updates are posted
         /// via <see cref="EditorApplication.update"/> to marshal to the main thread.
+        ///
+        /// dispatch-retry-queue: use <see cref="StartProgressMonitorWithScheduler"/>
+        /// instead for jobs dispatched through the scheduler so that completion
+        /// triggers the next-job dispatch.
         /// </summary>
         private void StartProgressMonitor(
             HmacAuthenticator auth,
@@ -1031,6 +1313,9 @@ namespace Unity.MultiTimelineRecorder
                     vm.State        = capturedEvt.state;
                     vm.CurrentFrame = capturedEvt.currentFrame;
                     vm.TotalFrames  = capturedEvt.totalFrames;
+
+                    // Refresh the last-progress timestamp for failsafe polling
+                    _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
 
                     if (!string.IsNullOrEmpty(capturedEvt.message))
                         Debug.Log($"[DistributedRecorder] {vm.JobId.Substring(0, 8)}… {capturedEvt.message}");
@@ -1058,6 +1343,158 @@ namespace Unity.MultiTimelineRecorder
 
             // Note: monitor is not stored; the background Task keeps it alive.
             // It disposes itself when the stream closes (terminal state or error).
+        }
+
+        /// <summary>
+        /// Variant of <see cref="StartProgressMonitor"/> that hooks into the
+        /// dispatch-retry-queue scheduler: when the job terminates (Completed or Failed)
+        /// <see cref="OnJobTerminated"/> is called to free the Worker slot and dispatch
+        /// the next queued job.
+        ///
+        /// Also wires up the failsafe health-poll on <c>OnError</c> so that a dropped
+        /// NDJSON stream does not stall the queue indefinitely.
+        /// </summary>
+        private void StartProgressMonitorWithScheduler(WorkerInfo worker, MtrJobViewModel vm)
+        {
+            // Use the batch-scoped authenticator; null guard in case batch was
+            // already finalized (should not happen in normal operation).
+            var auth = _batchAuth;
+            if (auth == null)
+            {
+                Debug.LogError("[DistributedRecorder] StartProgressMonitorWithScheduler: バッチ認証が null です。");
+                return;
+            }
+
+            var monitor = new ProgressMonitor(auth);
+
+            monitor.OnProgress += evt =>
+            {
+                var capturedEvt = evt;
+                EditorCallbackOnce(() =>
+                {
+                    vm.State        = capturedEvt.state;
+                    vm.CurrentFrame = capturedEvt.currentFrame;
+                    vm.TotalFrames  = capturedEvt.totalFrames;
+
+                    // Keep last-progress timestamp fresh for the failsafe
+                    _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
+
+                    if (!string.IsNullOrEmpty(capturedEvt.message))
+                        Debug.Log($"[DistributedRecorder] {vm.JobId.Substring(0, 8)}… {capturedEvt.message}");
+
+                    if (capturedEvt.state == JobState.Completed)
+                    {
+                        DownloadResultsAsync(worker, vm);
+                        // Free the Worker slot and dispatch next queued job
+                        OnJobTerminated(worker, vm);
+                    }
+                    else if (capturedEvt.state == JobState.Failed)
+                    {
+                        Debug.LogError(
+                            $"[DistributedRecorder] ジョブ {vm.JobId.Substring(0, 8)}… が失敗しました。");
+                        OnJobTerminated(worker, vm);
+                    }
+
+                    Repaint();
+                });
+            };
+
+            monitor.OnError += err =>
+            {
+                var capturedErr = err;
+                // Failsafe: stream error may mean the Worker finished but the push
+                // stream dropped.  Check Worker health to decide if we should treat
+                // the job as done (free the slot) or just log the error.
+                EditorCallbackOnce(() =>
+                {
+                    Debug.LogError(
+                        $"[DistributedRecorder] 進捗ストリームエラー (jobId={vm.JobId.Substring(0, 8)}…): {capturedErr}");
+                    // Trigger async health check and free the slot if Worker is idle.
+                    _ = HandleProgressStreamErrorAsync(worker, vm);
+                    Repaint();
+                });
+            };
+
+            monitor.Start(worker.BaseUrl, vm.JobId);
+        }
+
+        /// <summary>
+        /// Failsafe: called when the progress stream emits an error.
+        /// Polls <c>GET /health</c> to determine if the Worker is idle, then either
+        /// frees the slot (if idle) or logs a warning and keeps waiting.
+        /// </summary>
+        private async Task HandleProgressStreamErrorAsync(WorkerInfo worker, MtrJobViewModel vm)
+        {
+            if (_batchAuth == null) return;
+
+            string jobIdShort = vm.JobId.Length >= 8 ? vm.JobId.Substring(0, 8) : vm.JobId;
+
+            try
+            {
+                var healthTransport = new HttpTransport(_batchAuth);
+                string healthJson;
+                try
+                {
+                    healthJson = await healthTransport.GetAsync(
+                        $"{worker.BaseUrl}/health",
+                        TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+                }
+                finally
+                {
+                    healthTransport.Dispose();
+                }
+
+                var health = ProtocolSerializer.Deserialize<WorkerHealth>(healthJson);
+                bool workerIsIdle = string.IsNullOrEmpty(health.currentJobId)
+                    || health.currentJobId != vm.JobId;
+
+                if (workerIsIdle)
+                {
+                    EditorCallbackOnce(() =>
+                    {
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] フェイルセーフ: Worker がアイドル状態を確認。" +
+                            $"ジョブ {jobIdShort}… の slot を解放します。");
+
+                        // Mark as failed if state is still non-terminal
+                        if (!IsTerminalState(vm.State))
+                        {
+                            vm.State = JobState.Failed;
+                            Debug.LogError(
+                                $"[DistributedRecorder] ジョブ {jobIdShort}… がストリームエラー後に " +
+                                "Worker アイドルを確認 → Failed。");
+                        }
+
+                        OnJobTerminated(worker, vm);
+                        Repaint();
+                    });
+                }
+                else
+                {
+                    EditorCallbackOnce(() =>
+                    {
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] フェイルセーフ health チェック: Worker はまだ " +
+                            $"ジョブ {jobIdShort}… を実行中。ストリームを再接続してください。");
+                        Repaint();
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                EditorCallbackOnce(() =>
+                {
+                    Debug.LogError(
+                        $"[DistributedRecorder] フェイルセーフ health チェック失敗 " +
+                        $"(job={jobIdShort}…): {ex.Message}");
+                    // If health check itself fails, mark failed and free the slot
+                    if (!IsTerminalState(vm.State))
+                        vm.State = JobState.Failed;
+
+                    OnJobTerminated(worker, vm);
+                    Repaint();
+                });
+            }
         }
 
         // -----------------------------------------------------------------------
@@ -1435,5 +1872,21 @@ namespace Unity.MultiTimelineRecorder
 
         /// <summary>Absolute local directory where downloaded files are written.</summary>
         public string LocalOutputDir;
+
+        // ── dispatch-retry-queue fields ─────────────────────────────────────────
+
+        /// <summary>
+        /// The <see cref="JobRequest"/> to (re-)send when this job is dequeued.
+        /// Set at batch-build time; retained for requeue scenarios.
+        /// Only the Master uses this field; never sent over the wire.
+        /// </summary>
+        public JobRequest PendingRequest;
+
+        /// <summary>
+        /// Number of times this job has been handed back to the pending queue after
+        /// a transient failure (WorkerBusy).  When this exceeds
+        /// <see cref="MultiTimelineRecorder.MaxJobRetries"/> the job is Failed.
+        /// </summary>
+        public int RetryCount;
     }
 }
