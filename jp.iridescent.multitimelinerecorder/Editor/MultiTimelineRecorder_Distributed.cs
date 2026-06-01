@@ -789,24 +789,46 @@ namespace Unity.MultiTimelineRecorder
         // -----------------------------------------------------------------------
 
         /// <summary>
-        /// Selects the first available Worker from <paramref name="workers"/> that has
-        /// no in-flight jobs according to <paramref name="inflightCounts"/>.
+        /// Selects the first idle Worker from <paramref name="workers"/>: tries
+        /// <paramref name="preferredWorker"/> first, then falls back to the first
+        /// Worker with 0 in-flight jobs according to <paramref name="inflightCounts"/>.
         ///
         /// Returns <c>null</c> when all Workers are busy or the inputs are empty.
         ///
         /// Made <c>public static</c> for hermetic EditMode tests.
+        ///
+        /// This function drives the actual dispatch path inside
+        /// <see cref="TryDispatchNextQueuedJob"/>: when the preferred (just-freed)
+        /// Worker is already busy again (e.g. a concurrent dispatch raced in), the
+        /// scheduler transparently picks an alternative idle Worker instead of
+        /// giving up.  Replaces the earlier "preferredWorker-only" implementation
+        /// that had this gap (dispatch-retry-queue iteration 2 fix for Major-2 review
+        /// item).
         /// </summary>
         /// <param name="workers">Ordered list of available Workers.</param>
+        /// <param name="preferredWorker">
+        /// The Worker that was freed most recently.  Tried first.
+        /// May be <c>null</c> (treated as no preference).
+        /// </param>
         /// <param name="inflightCounts">
         /// Map of workerDisplayName → number of currently in-flight jobs.
         /// Workers absent from the map are treated as having 0 in-flight jobs.
         /// </param>
         public static WorkerInfo SelectIdleWorker(
             IReadOnlyList<WorkerInfo> workers,
+            WorkerInfo preferredWorker,
             IReadOnlyDictionary<string, int> inflightCounts)
         {
             if (workers == null || workers.Count == 0) return null;
 
+            // Check preferred Worker first
+            if (preferredWorker != null)
+            {
+                inflightCounts?.TryGetValue(preferredWorker.displayName, out int pc);
+                if (pc == 0) return preferredWorker;
+            }
+
+            // Fall back: first idle Worker in registry order
             foreach (var w in workers)
             {
                 int count = 0;
@@ -815,20 +837,6 @@ namespace Unity.MultiTimelineRecorder
                     return w;
             }
             return null;
-        }
-
-        /// <summary>
-        /// Returns <c>true</c> when <paramref name="vm"/> should be re-queued after a
-        /// failed dispatch attempt (WorkerBusy, retry limit not exceeded).
-        ///
-        /// Made <c>public static</c> for hermetic EditMode tests.
-        /// </summary>
-        /// <param name="vm">The view model whose State and RetryCount are inspected.</param>
-        /// <param name="maxRetries">Maximum allowed retry count (exclusive upper bound).</param>
-        public static bool ShouldRequeue(MtrJobViewModel vm, int maxRetries)
-        {
-            if (vm == null) return false;
-            return vm.State == JobState.Queued && vm.RetryCount <= maxRetries;
         }
 
         // -----------------------------------------------------------------------
@@ -949,9 +957,11 @@ namespace Unity.MultiTimelineRecorder
                     resolvedOutputRelativePath = job.ResolvedOutputRelativePath
                 };
 
-                // Hint: show the likely Worker in the UI while the job is queued.
-                // Actual Worker assignment happens at dispatch time (first idle Worker).
-                string hintWorkerName = workers[i % workers.Count].displayName;
+                // Hint: show a likely Worker in the UI while the job is queued.
+                // Suffixed with "（予定）" to make clear this is not the final assignment.
+                // Actual Worker is determined at dispatch time (first idle Worker) and
+                // vm.WorkerName is overwritten in DispatchQueuedJobAsync.
+                string hintWorkerName = workers[i % workers.Count].displayName + "（予定）";
 
                 var vm = new MtrJobViewModel
                 {
@@ -1023,18 +1033,54 @@ namespace Unity.MultiTimelineRecorder
             }
             else
             {
-                // Permanent failure or WorkerBusy already handled inside
-                // DispatchOneWithOverrideAsync; check if we should requeue
-                // (WorkerBusy for the initial seed can happen in rare race conditions).
-                // For the initial pass we mark it as already handled
-                // (DispatchOneWithOverrideAsync sets state to Queued+RetryCount++ for
-                // WorkerBusy or Failed for permanent).
-                // If it ended up back in Queued state, re-enqueue it.
+                // DispatchOneWithOverrideAsync sets:
+                //   vm.State = JobState.Queued  → WorkerBusy (transient), re-enqueue
+                //   vm.State = terminal          → permanent rejection / exception / retry-limit
+                //
+                // In both cases _workerInflightCount was NOT incremented (accepted==false),
+                // so we must NOT decrement it here.  We call AfterFailedDispatch which
+                // only triggers the next-job dispatch + FinalizeBatchIfDone without
+                // touching the in-flight counts.
                 if (vm.State == JobState.Queued)
                     _pendingQueue.Enqueue(vm);
+
+                // Terminal failure (permanent reject, exception, retry-limit exceeded):
+                // the Worker slot is free but OnJobTerminated must NOT be called because
+                // the in-flight count was never incremented.  Use the lightweight path that
+                // only advances the queue and checks for batch completion.
+                // (dispatch-retry-queue iteration 2 – Blocker fix: eliminates the stall where
+                // a permanently-rejected job leaves the queue frozen because no slot-release
+                // signal was ever sent.)
+                if (IsTerminalState(vm.State))
+                    AfterFailedDispatch(worker);
             }
 
             Repaint();
+        }
+
+        /// <summary>
+        /// Called when a dispatch attempt ends in terminal failure <em>before</em> the job
+        /// was ever accepted (i.e. <see cref="_workerInflightCount"/> was never incremented
+        /// for this attempt).
+        ///
+        /// Unlike <see cref="OnJobTerminated"/>, this method does <b>not</b> decrement the
+        /// in-flight counter – doing so would underflow because the job was never counted as
+        /// in-flight.  It only advances the pending queue by trying to dispatch the next job
+        /// to <paramref name="worker"/> and then checks whether the batch is complete.
+        ///
+        /// Scenarios covered:
+        ///   • Permanent rejection (hash/version/duplicate/unknown) – vm.State=Failed
+        ///   • Dispatch exception – vm.State=Failed
+        ///   • WorkerBusy retry-limit exceeded – vm.State=Failed
+        ///
+        /// (dispatch-retry-queue iteration 2 – Blocker AC-6 fix)
+        /// </summary>
+        private void AfterFailedDispatch(WorkerInfo worker)
+        {
+            // Try to give the next queued job to the now-available Worker.
+            TryDispatchNextQueuedJob(worker);
+            // Check whether all jobs (including any just-failed one) are done.
+            FinalizeBatchIfDone();
         }
 
         /// <summary>
@@ -1060,17 +1106,36 @@ namespace Unity.MultiTimelineRecorder
         }
 
         /// <summary>
-        /// Picks the next job from <see cref="_pendingQueue"/> and dispatches it to
-        /// <paramref name="preferredWorker"/> (fire-and-forget async void, always on
-        /// main thread via EditorCallbackOnce).
+        /// Picks the next job from <see cref="_pendingQueue"/> and dispatches it to an
+        /// idle Worker (fire-and-forget, always called on main thread).
+        ///
+        /// Prefers <paramref name="preferredWorker"/> (the just-freed Worker); if that
+        /// Worker is already busy again (e.g. a concurrent seed dispatch raced in),
+        /// <see cref="SelectIdleWorker"/> scans the full registry for any idle Worker.
+        /// If no idle Worker exists the queue item is put back at the front and the
+        /// method returns – the next <see cref="OnJobTerminated"/> call will retry.
+        ///
+        /// dispatch-retry-queue iteration 2: uses <see cref="SelectIdleWorker"/> so the
+        /// scheduler is not locked to a single freed Worker; fixes the multi-Worker
+        /// "preferredWorker fixed" weakness noted in the review (Major-2).
         /// </summary>
         private void TryDispatchNextQueuedJob(WorkerInfo preferredWorker)
         {
             if (_pendingQueue.Count == 0) return;
 
+            // Find an idle Worker (prefer the freed one, fall back to any idle)
+            var workers = _distWorkerRegistry?.EnabledWorkers;
+            WorkerInfo target = SelectIdleWorker(workers, preferredWorker, _workerInflightCount);
+            if (target == null)
+            {
+                // All Workers are busy – leave the item in the queue; it will be retried
+                // when the next Worker slot is freed via OnJobTerminated/AfterFailedDispatch.
+                return;
+            }
+
             var nextVm = _pendingQueue.Dequeue();
             // Fire-and-forget; exceptions are caught inside DispatchQueuedJobAsync
-            _ = DispatchQueuedJobAsync(preferredWorker, nextVm);
+            _ = DispatchQueuedJobAsync(target, nextVm);
         }
 
         /// <summary>
