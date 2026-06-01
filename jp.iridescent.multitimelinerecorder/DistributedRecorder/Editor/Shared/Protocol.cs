@@ -14,6 +14,13 @@ namespace DistributedRecorder.Shared
     public enum JobState
     {
         Pending,
+        /// <summary>
+        /// Job is waiting in the Master-side dispatch queue for a Worker slot to become
+        /// available.  This state is only set by the Master; Worker never sends it.
+        /// Added in dispatch-retry-queue to distinguish "not yet dispatched" from
+        /// "dispatched but Worker not yet picked it up" (Pending).
+        /// </summary>
+        Queued,
         Running,
         Completed,
         Failed,
