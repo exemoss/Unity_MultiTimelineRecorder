@@ -824,7 +824,8 @@ namespace Unity.MultiTimelineRecorder
             // Check preferred Worker first
             if (preferredWorker != null)
             {
-                inflightCounts?.TryGetValue(preferredWorker.displayName, out int pc);
+                int pc = 0;
+                inflightCounts?.TryGetValue(preferredWorker.displayName, out pc);
                 if (pc == 0) return preferredWorker;
             }
 
