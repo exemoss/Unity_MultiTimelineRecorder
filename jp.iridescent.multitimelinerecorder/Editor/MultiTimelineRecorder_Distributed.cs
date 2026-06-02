@@ -995,7 +995,7 @@ namespace Unity.MultiTimelineRecorder
             }
 
             // Remaining jobs stay in _pendingQueue; they are dispatched by
-            // OnJobTerminated (via StartProgressMonitor completion callbacks).
+            // OnJobTerminated (via StartProgressMonitorWithScheduler completion callbacks).
             // No transport.Dispose() here — deferred to FinalizeBatchIfDone.
         }
 
@@ -1352,67 +1352,7 @@ namespace Unity.MultiTimelineRecorder
         // -----------------------------------------------------------------------
 
         /// <summary>
-        /// Starts a <see cref="ProgressMonitor"/> for the given job.
-        /// Events are delivered on a background thread; state updates are posted
-        /// via <see cref="EditorApplication.update"/> to marshal to the main thread.
-        ///
-        /// dispatch-retry-queue: use <see cref="StartProgressMonitorWithScheduler"/>
-        /// instead for jobs dispatched through the scheduler so that completion
-        /// triggers the next-job dispatch.
-        /// </summary>
-        private void StartProgressMonitor(
-            HmacAuthenticator auth,
-            WorkerInfo worker,
-            MtrJobViewModel vm)
-        {
-            var monitor = new ProgressMonitor(auth);
-
-            monitor.OnProgress += evt =>
-            {
-                // ProgressMonitor fires events on a background thread.
-                // Marshal the state update to the main thread via EditorApplication.update.
-                var capturedEvt = evt;
-
-                // Use an Action variable so the delegate can remove itself (self-unregistering).
-                EditorCallbackOnce(() =>
-                {
-                    vm.State        = capturedEvt.state;
-                    vm.CurrentFrame = capturedEvt.currentFrame;
-                    vm.TotalFrames  = capturedEvt.totalFrames;
-
-                    // Refresh the last-progress timestamp for failsafe polling
-                    _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
-
-                    if (!string.IsNullOrEmpty(capturedEvt.message))
-                        Debug.Log($"[DistributedRecorder] {vm.JobId.Substring(0, 8)}… {capturedEvt.message}");
-
-                    if (capturedEvt.state == JobState.Completed)
-                        DownloadResultsAsync(worker, vm);
-                    else if (capturedEvt.state == JobState.Failed)
-                        Debug.LogError($"[DistributedRecorder] ジョブ {vm.JobId.Substring(0, 8)}… が失敗しました。");
-
-                    Repaint();
-                });
-            };
-
-            monitor.OnError += err =>
-            {
-                var capturedErr = err;
-                EditorCallbackOnce(() =>
-                {
-                    Debug.LogError($"[DistributedRecorder] 進捗ストリームエラー: {capturedErr}");
-                    Repaint();
-                });
-            };
-
-            monitor.Start(worker.BaseUrl, vm.JobId);
-
-            // Note: monitor is not stored; the background Task keeps it alive.
-            // It disposes itself when the stream closes (terminal state or error).
-        }
-
-        /// <summary>
-        /// Variant of <see cref="StartProgressMonitor"/> that hooks into the
+        /// Starts a <see cref="ProgressMonitor"/> that hooks into the
         /// dispatch-retry-queue scheduler: when the job terminates (Completed or Failed)
         /// <see cref="OnJobTerminated"/> is called to free the Worker slot and dispatch
         /// the next queued job.
