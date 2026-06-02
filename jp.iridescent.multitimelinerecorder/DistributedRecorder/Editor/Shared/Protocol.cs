@@ -371,4 +371,60 @@ namespace DistributedRecorder.Shared
         public static string Serialize<T>(T obj)   => JsonUtility.ToJson(obj);
         public static T      Deserialize<T>(string json) => JsonUtility.FromJson<T>(json);
     }
+
+    // ---------------------------------------------------------------------------
+    // Path sanitization (shared between Master and Worker)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Shared Timeline-name sanitizer used by both the Master
+    /// (<c>MultiTimelineRecorder.SanitizeTimelineName</c>) and the Worker
+    /// (<c>JobStore.SanitizeTimelineName</c>) to guarantee identical output path
+    /// components on both sides.
+    ///
+    /// Previously duplicated verbatim in each file (F2/F14 refactor-audit).
+    /// Logic is identical to the original Master implementation (authoritative copy).
+    /// </summary>
+    public static class PathSanitizer
+    {
+        /// <summary>
+        /// Sanitizes <paramref name="raw"/> so it is safe to use as a file-system
+        /// path component on Windows, macOS, and Linux.
+        ///
+        /// Rules (identical to the original Master + Worker implementations):
+        ///  - Leading/trailing whitespace is trimmed.
+        ///  - Exact <c>".."</c> and <c>"."</c> strings are replaced with <c>"__"</c>.
+        ///  - Characters invalid on Windows (control chars, <c>/ \ : * ? " &lt; &gt; |</c>)
+        ///    are replaced with <c>'_'</c>.
+        ///  - Result is truncated to <paramref name="maxLen"/> characters (default 64).
+        ///  - Empty result (including whitespace-only input) falls back to
+        ///    <c>"Timeline"</c>.
+        /// </summary>
+        /// <param name="raw">The raw timeline / director name from the scene.</param>
+        /// <param name="maxLen">Maximum character length of the returned string.</param>
+        public static string SanitizeName(string raw, int maxLen = 64)
+        {
+            if (string.IsNullOrEmpty(raw))
+                return "Timeline";
+
+            string trimmed = raw.Trim();
+            if (trimmed == ".." || trimmed == ".")
+                trimmed = "__";
+
+            var sb = new System.Text.StringBuilder(trimmed.Length);
+            foreach (char c in trimmed)
+            {
+                bool isInvalid = c < 32
+                    || c == '/' || c == '\\' || c == ':' || c == '*'
+                    || c == '?' || c == '"'  || c == '<' || c == '>' || c == '|';
+                sb.Append(isInvalid ? '_' : c);
+            }
+
+            string result = sb.ToString();
+            if (result.Length > maxLen)
+                result = result.Substring(0, maxLen);
+
+            return string.IsNullOrEmpty(result) ? "Timeline" : result;
+        }
+    }
 }

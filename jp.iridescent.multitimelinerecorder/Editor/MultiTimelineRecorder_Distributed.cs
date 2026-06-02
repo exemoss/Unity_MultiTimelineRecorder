@@ -747,41 +747,14 @@ namespace Unity.MultiTimelineRecorder
         /// Sanitizes a Timeline (director GameObject) name so it is safe to use as a
         /// file-system path component.
         ///
-        /// Rules:
-        ///  - Characters invalid in file names on Windows/macOS/Linux are replaced with '_'.
-        ///  - ".." and "." are replaced with "__".
-        ///  - Leading/trailing whitespace is trimmed.
-        ///  - Result is truncated to <see cref="MaxSanitizedTimelineNameLength"/> characters.
-        ///  - Empty result falls back to "Timeline".
+        /// Delegates to <see cref="DistributedRecorder.Shared.PathSanitizer.SanitizeName"/>
+        /// with <see cref="MaxSanitizedTimelineNameLength"/> as the length cap, ensuring
+        /// Master and Worker produce identical output path components (F2/F14).
         ///
         /// Made public for hermetic testing.
         /// </summary>
         public static string SanitizeTimelineName(string name)
-        {
-            if (string.IsNullOrEmpty(name))
-                return "Timeline";
-
-            // Reject path traversal components
-            string trimmed = name.Trim();
-            if (trimmed == ".." || trimmed == ".")
-                trimmed = "__";
-
-            var sb = new System.Text.StringBuilder(trimmed.Length);
-            foreach (char c in trimmed)
-            {
-                // Reject chars that are invalid on Windows (covers most platforms too)
-                bool isInvalid = c < 32
-                    || c == '/' || c == '\\' || c == ':' || c == '*'
-                    || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
-                sb.Append(isInvalid ? '_' : c);
-            }
-
-            string result = sb.ToString();
-            if (result.Length > MaxSanitizedTimelineNameLength)
-                result = result.Substring(0, MaxSanitizedTimelineNameLength);
-
-            return string.IsNullOrEmpty(result) ? "Timeline" : result;
-        }
+            => DistributedRecorder.Shared.PathSanitizer.SanitizeName(name, MaxSanitizedTimelineNameLength);
 
         // -----------------------------------------------------------------------
         // Scheduler pure functions (dispatch-retry-queue)

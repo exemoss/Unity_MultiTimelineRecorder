@@ -124,7 +124,7 @@ namespace DistributedRecorder.Worker
                 if (!string.IsNullOrEmpty(req?.dispatchTimestamp) &&
                     !string.IsNullOrEmpty(req?.directorObjectName))
                 {
-                    string sanitizedName = SanitiseTimelineName(req.directorObjectName);
+                    string sanitizedName = SanitizeTimelineName(req.directorObjectName);
                     string dir = Path.Combine(_recordingsRoot,
                         req.dispatchTimestamp, sanitizedName);
                     Directory.CreateDirectory(dir);
@@ -151,34 +151,12 @@ namespace DistributedRecorder.Worker
 
         /// <summary>
         /// Sanitizes a Timeline name so it is safe to use as a path component.
-        /// Mirrors <see cref="MultiTimelineRecorder.SanitizeTimelineName"/> from the Master side
-        /// so both produce identical results for the same input (F7 acceptance criterion).
+        /// Delegates to <see cref="DistributedRecorder.Shared.PathSanitizer.SanitizeName"/>
+        /// (the single authoritative implementation shared by Master and Worker).
+        /// Renamed from <c>SanitiseTimelineName</c> to the US-English spelling (F2/F14).
         /// </summary>
-        public static string SanitiseTimelineName(string name)
-        {
-            if (string.IsNullOrEmpty(name))
-                return "Timeline";
-
-            string trimmed = name.Trim();
-            if (trimmed == ".." || trimmed == ".")
-                trimmed = "__";
-
-            const int maxLen = 64;
-            var sb = new System.Text.StringBuilder(trimmed.Length);
-            foreach (char c in trimmed)
-            {
-                bool isInvalid = c < 32
-                    || c == '/' || c == '\\' || c == ':' || c == '*'
-                    || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
-                sb.Append(isInvalid ? '_' : c);
-            }
-
-            string result = sb.ToString();
-            if (result.Length > maxLen)
-                result = result.Substring(0, maxLen);
-
-            return string.IsNullOrEmpty(result) ? "Timeline" : result;
-        }
+        public static string SanitizeTimelineName(string name)
+            => DistributedRecorder.Shared.PathSanitizer.SanitizeName(name);
 
         // --- completed-job count (for auto-restart logic) -----------------------
 

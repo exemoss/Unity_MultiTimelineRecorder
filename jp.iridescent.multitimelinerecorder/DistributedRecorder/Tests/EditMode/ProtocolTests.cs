@@ -295,7 +295,36 @@ namespace DistributedRecorder.Tests
         }
 
         // -----------------------------------------------------------------------
-        // JobStore.SanitiseTimelineName matches Master.SanitizeTimelineName
+        // PathSanitizer.SanitizeName – shared implementation (F2/F14)
+        // -----------------------------------------------------------------------
+
+        [Test]
+        [TestCase("Director_A",   "Director_A")]
+        [TestCase("Shot 01",      "Shot 01")]
+        [TestCase("bad/path",     "bad_path")]
+        [TestCase("bad\\path",    "bad_path")]
+        [TestCase("bad:name",     "bad_name")]
+        [TestCase("../traversal", ".._traversal")]
+        [TestCase("",             "Timeline")]
+        [TestCase("   ",          "Timeline")]
+        [TestCase("..",           "__")]
+        [TestCase(".",            "__")]
+        public void PathSanitizer_SanitizeName_Various(string input, string expected)
+        {
+            string result = DistributedRecorder.Shared.PathSanitizer.SanitizeName(input);
+            Assert.AreEqual(expected, result, $"input='{input}'");
+        }
+
+        [Test]
+        public void PathSanitizer_SanitizeName_TruncatesToMaxLen()
+        {
+            string longName = new string('a', 80);
+            string result   = DistributedRecorder.Shared.PathSanitizer.SanitizeName(longName, maxLen: 64);
+            Assert.AreEqual(64, result.Length, "Result must be truncated to maxLen=64");
+        }
+
+        // -----------------------------------------------------------------------
+        // JobStore.SanitizeTimelineName matches Master.SanitizeTimelineName (F7 parity)
         // -----------------------------------------------------------------------
 
         [Test]
@@ -304,11 +333,12 @@ namespace DistributedRecorder.Tests
         [TestCase("bad/path")]
         [TestCase("")]
         [TestCase("..")]
-        public void SanitiseTimelineName_WorkerAndMasterProduceSameResult(string input)
+        public void SanitizeTimelineName_WorkerAndMasterProduceSameResult(string input)
         {
-            // Both sides must produce identical output for F7 (output path consistency)
+            // Both sides must produce identical output for F7 (output path consistency).
+            // Both now delegate to PathSanitizer.SanitizeName (F2/F14).
             string master = Unity.MultiTimelineRecorder.MultiTimelineRecorder.SanitizeTimelineName(input);
-            string worker = DistributedRecorder.Worker.JobStore.SanitiseTimelineName(input);
+            string worker = DistributedRecorder.Worker.JobStore.SanitizeTimelineName(input);
             Assert.AreEqual(master, worker,
                 $"input='{input}': Master='{master}' Worker='{worker}'");
         }
