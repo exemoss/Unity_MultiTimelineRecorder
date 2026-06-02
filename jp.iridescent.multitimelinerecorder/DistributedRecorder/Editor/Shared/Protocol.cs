@@ -31,6 +31,43 @@ namespace DistributedRecorder.Shared
     }
 
     // ---------------------------------------------------------------------------
+    // JobState helpers
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Extension methods for <see cref="JobState"/>.
+    ///
+    /// Provides a single authoritative terminal-state predicate so that Master
+    /// code (<c>MultiTimelineRecorder.IsTerminalState</c>,
+    /// <c>AreAllJobsTerminal</c>) and any future Worker consumers share the same
+    /// definition (F8 refactor-audit).
+    ///
+    /// Terminal states: <see cref="JobState.Completed"/>,
+    /// <see cref="JobState.Failed"/>, <see cref="JobState.Cancelled"/>,
+    /// <see cref="JobState.Unreachable"/>.
+    /// Non-terminal: <see cref="JobState.Pending"/>, <see cref="JobState.Running"/>,
+    /// <see cref="JobState.Queued"/>.
+    ///
+    /// Note: <see cref="JobStore.CompletedJobCount"/> counts only Completed+Failed
+    /// (a narrower "done" concept for auto-restart logic) and is intentionally
+    /// different from this predicate — see its documentation for details.
+    /// </summary>
+    public static class JobStateExtensions
+    {
+        /// <summary>
+        /// Returns <c>true</c> when the job has reached a terminal state and
+        /// will not transition further under normal operation.
+        /// </summary>
+        public static bool IsTerminal(this JobState state)
+        {
+            return state == JobState.Completed
+                || state == JobState.Failed
+                || state == JobState.Cancelled
+                || state == JobState.Unreachable;
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // Job Request / Ack
     // ---------------------------------------------------------------------------
 

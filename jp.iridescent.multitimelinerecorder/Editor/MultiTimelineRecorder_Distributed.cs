@@ -1574,13 +1574,18 @@ namespace Unity.MultiTimelineRecorder
             return false;
         }
 
-        private static bool IsTerminalState(JobState state)
-        {
-            return state == JobState.Completed
-                || state == JobState.Failed
-                || state == JobState.Cancelled
-                || state == JobState.Unreachable;
-        }
+        /// <summary>
+        /// Returns <c>true</c> when <paramref name="state"/> is a terminal state.
+        ///
+        /// Delegates to <see cref="DistributedRecorder.Shared.JobStateExtensions.IsTerminal"/>
+        /// (the single shared definition in Protocol.cs) so Master and any future
+        /// consumers share identical terminal-state semantics (F8).
+        ///
+        /// Made <c>public static</c> for hermetic tests
+        /// (see <see cref="AreAllJobsTerminal"/>).
+        /// </summary>
+        public static bool IsTerminalState(JobState state)
+            => state.IsTerminal();
 
         private int CountJobsByState(JobState state)
             => CountJobsInState(_dispatchedJobs, state);
