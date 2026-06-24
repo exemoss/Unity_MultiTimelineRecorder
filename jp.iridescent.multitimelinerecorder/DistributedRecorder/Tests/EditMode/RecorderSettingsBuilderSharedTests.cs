@@ -497,6 +497,351 @@ namespace DistributedRecorder.Tests
             }
         }
 
+        // -----------------------------------------------------------------------
+        // BuildMovieSettings — movie-recorder-support §B
+        // -----------------------------------------------------------------------
+
+        private static MovieRecorderSettingsConfig MakeMovieConfig(
+            MovieRecorderSettings.VideoRecorderOutputFormat format = MovieRecorderSettings.VideoRecorderOutputFormat.MP4,
+            int width = 1920, int height = 1080, int frameRate = 24,
+            bool captureAudio = false, bool captureAlpha = false)
+        {
+            return new MovieRecorderSettingsConfig
+            {
+                outputFormat  = format,
+                width         = width,
+                height        = height,
+                frameRate     = frameRate,
+                captureAudio  = captureAudio,
+                captureAlpha  = captureAlpha,
+                capFrameRate  = true,
+                videoBitrateMode = VideoBitrateMode.High
+            };
+        }
+
+        private static MultiRecorderConfig.RecorderConfigItem MakeMovieItem(
+            int width = 1920, int height = 1080, int frameRate = 24,
+            ImageRecorderSourceType sourceType = ImageRecorderSourceType.GameView)
+        {
+            return new MultiRecorderConfig.RecorderConfigItem
+            {
+                recorderType    = RecorderSettingsType.Movie,
+                width           = width,
+                height          = height,
+                frameRate       = frameRate,
+                imageSourceType = sourceType,
+                fileName        = "output",
+                name            = "Test Movie Recorder",
+                movieConfig     = MakeMovieConfig(width: width, height: height, frameRate: frameRate)
+            };
+        }
+
+        // ---- OutputFormat -------------------------------------------------------
+
+        [Test]
+        public void BuildMovieSettings_Mp4Format_SetsOutputFormatMp4()
+        {
+            var item   = MakeMovieItem();
+            var config = MakeMovieConfig(MovieRecorderSettings.VideoRecorderOutputFormat.MP4);
+            var settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                item, config, 1920, 1080, 24.0, null, null, "Recordings/job/output");
+            try
+            {
+                Assert.AreEqual(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.MP4,
+                    settings.OutputFormat, "OutputFormat MP4");
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
+        [Test]
+        public void BuildMovieSettings_WebMFormat_SetsOutputFormatWebM()
+        {
+            var item   = MakeMovieItem();
+            var config = MakeMovieConfig(MovieRecorderSettings.VideoRecorderOutputFormat.WebM);
+            var settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                item, config, 1920, 1080, 24.0, null, null, "Recordings/job/output");
+            try
+            {
+                Assert.AreEqual(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.WebM,
+                    settings.OutputFormat, "OutputFormat WebM");
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
+        // ---- FrameRate ----------------------------------------------------------
+
+        [Test]
+        public void BuildMovieSettings_FrameRate30_SetsFrameRate()
+        {
+            var item   = MakeMovieItem(frameRate: 30);
+            var config = MakeMovieConfig(frameRate: 30);
+            var settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                item, config, 1920, 1080, 30.0, null, null, "Recordings/job/output");
+            try
+            {
+                Assert.AreEqual(30.0f, settings.FrameRate, 0.01f, "FrameRate 30");
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
+        // ---- Resolution ---------------------------------------------------------
+
+        [Test]
+        public void BuildMovieSettings_Width3840Height2160_SetsResolution()
+        {
+            var item   = MakeMovieItem(width: 3840, height: 2160);
+            var config = MakeMovieConfig(width: 3840, height: 2160);
+            var settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                item, config, 3840, 2160, 30.0, null, null, "Recordings/job/output");
+            try
+            {
+                Assert.AreEqual(3840, settings.ImageInputSettings.OutputWidth,  "Width 4K");
+                Assert.AreEqual(2160, settings.ImageInputSettings.OutputHeight, "Height 4K");
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
+        // ---- CaptureAudio -------------------------------------------------------
+
+        [Test]
+        public void BuildMovieSettings_CaptureAudioTrue_SetsCaptureAudio()
+        {
+            var item   = MakeMovieItem();
+            var config = MakeMovieConfig(captureAudio: true);
+            var settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                item, config, 1920, 1080, 24.0, null, null, "Recordings/job/output");
+            try
+            {
+                Assert.IsTrue(settings.CaptureAudio, "CaptureAudio should be true");
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
+        // ---- Input source -------------------------------------------------------
+
+        [Test]
+        public void BuildMovieSettings_GameViewSource_UsesGameViewInputSettings()
+        {
+            var item   = MakeMovieItem(sourceType: ImageRecorderSourceType.GameView);
+            var config = MakeMovieConfig();
+            var settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                item, config, 1920, 1080, 24.0, null, null, "Recordings/job/output");
+            try
+            {
+                Assert.IsInstanceOf<GameViewInputSettings>(
+                    settings.ImageInputSettings,
+                    "GameView source must use GameViewInputSettings.");
+                Assert.IsFalse(settings.CaptureAlpha,
+                    "GameView: CaptureAlpha must be false");
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
+        [Test]
+        public void BuildMovieSettings_RenderTextureSource_WithRT_UsesRenderTextureInputSettings()
+        {
+            var item   = MakeMovieItem(sourceType: ImageRecorderSourceType.RenderTexture);
+            var config = MakeMovieConfig();
+            var rt = new RenderTexture(64, 64, 0);
+            var settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                item, config, 64, 64, 24.0, null, rt, "Recordings/job/output");
+            try
+            {
+                Assert.IsInstanceOf<RenderTextureInputSettings>(
+                    settings.ImageInputSettings,
+                    "RenderTexture source must use RenderTextureInputSettings.");
+                var rtInput = settings.ImageInputSettings as RenderTextureInputSettings;
+                Assert.AreSame(rt, rtInput?.RenderTexture, "RenderTexture must be set.");
+            }
+            finally
+            {
+                Object.DestroyImmediate(settings);
+                rt.Release();
+                Object.DestroyImmediate(rt);
+            }
+        }
+
+        [Test]
+        public void BuildMovieSettings_TargetCameraMissing_FallbackDisabled_ThrowsInvalidOperationException()
+        {
+            var item   = MakeMovieItem(sourceType: ImageRecorderSourceType.TargetCamera);
+            var config = MakeMovieConfig();
+            Assert.Throws<System.InvalidOperationException>(() =>
+            {
+                var s = RecorderSettingsBuilderShared.BuildMovieSettings(
+                    item, config, 1920, 1080, 24.0, null, null, "Recordings/job/output",
+                    fallbackToGameViewOnMissingRef: false);
+                Object.DestroyImmediate(s);
+            });
+        }
+
+        // ---- OutputFile (no <Frame> wildcard for Movie) -------------------------
+
+        [Test]
+        public void BuildMovieSettings_OutputFile_NoFrameWildcard()
+        {
+            var item   = MakeMovieItem();
+            var config = MakeMovieConfig();
+            const string expectedPath = "Recordings/job/output";
+            var settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                item, config, 1920, 1080, 24.0, null, null, expectedPath);
+            try
+            {
+                // The path must not contain <Frame>
+                StringAssert.DoesNotContain(
+                    "<Frame>",
+                    settings.OutputFile.Replace('\\', '/'),
+                    "Movie OutputFile must not contain <Frame> wildcard.");
+                StringAssert.StartsWith(
+                    expectedPath,
+                    settings.OutputFile.Replace('\\', '/'),
+                    "OutputFile should match the provided path.");
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
+        // ---- Error paths --------------------------------------------------------
+
+        [Test]
+        public void BuildMovieSettings_NullItem_ThrowsArgumentNullException()
+        {
+            var config = MakeMovieConfig();
+            Assert.Throws<System.ArgumentNullException>(() =>
+                RecorderSettingsBuilderShared.BuildMovieSettings(
+                    null, config, 1920, 1080, 24.0, null, null, "output"));
+        }
+
+        [Test]
+        public void BuildMovieSettings_NullConfig_ThrowsArgumentNullException()
+        {
+            var item = MakeMovieItem();
+            Assert.Throws<System.ArgumentNullException>(() =>
+                RecorderSettingsBuilderShared.BuildMovieSettings(
+                    item, null, 1920, 1080, 24.0, null, null, "output"));
+        }
+
+        [Test]
+        public void BuildMovieSettings_NonMovieType_ThrowsNotSupportedException()
+        {
+            var item = new MultiRecorderConfig.RecorderConfigItem
+            {
+                recorderType = RecorderSettingsType.Image,
+                movieConfig  = MakeMovieConfig()
+            };
+            Assert.Throws<System.NotSupportedException>(() =>
+                RecorderSettingsBuilderShared.BuildMovieSettings(
+                    item, MakeMovieConfig(), 1920, 1080, 24.0, null, null, "output"));
+        }
+
+        // ---- MOV platform guard — can only verify at compile time on Windows x64 -
+
+        [Test]
+        public void MovieRecorderSettingsConfig_Validate_MovOnCurrentPlatform_DoesNotRejectOnWindowsX64()
+        {
+            // On Windows x64 (this test machine), MOV should pass Validate().
+            // On Linux or Windows ARM64 it would return false (not reachable from this run).
+            // This test documents the expected behaviour for the CI environment.
+#if UNITY_EDITOR_WIN && !UNITY_ARM
+            var config = new MovieRecorderSettingsConfig
+            {
+                outputFormat = MovieRecorderSettings.VideoRecorderOutputFormat.MOV,
+                width        = 1920,
+                height       = 1080,
+                frameRate    = 24,
+                captureAlpha = false,
+            };
+            bool valid = config.Validate(out string error);
+            Assert.IsTrue(valid,
+                $"MOV should be valid on Windows x64 (Recorder 5.1.2 supports ProRes on Windows x64). Error: {error}");
+#else
+            // Not Windows x64 — just pass to avoid false failure on other platforms.
+            Assert.Pass("This test only verifies Windows x64 behaviour.");
+#endif
+        }
+
+        // ---- ResolveOutputRelativePath — Movie has no <Frame> -------------------
+
+        [Test]
+        public void ResolveOutputRelativePath_MovieItem_DoesNotContainFrameWildcard()
+        {
+            // Arrange: a Movie item whose fileName contains <Frame> (common user mistake)
+            var item = new MultiRecorderConfig.RecorderConfigItem
+            {
+                recorderType = RecorderSettingsType.Movie,
+                fileName     = "output_<Frame>",
+                name         = "MovieRecorder",
+                takeNumber   = 1,
+                width        = 1920,
+                height       = 1080,
+                movieConfig  = MakeMovieConfig()
+            };
+
+            // Act
+            string resolved = Unity.MultiTimelineRecorder.MultiTimelineRecorder.ResolveOutputRelativePath(
+                item, "Assets/Scenes/Test.unity", null);
+
+            // Assert: <Frame> must not be in the resolved path for Movie
+            StringAssert.DoesNotContain(
+                "<Frame>", resolved,
+                "Movie output path must not contain <Frame> wildcard.");
+        }
+
+        [Test]
+        public void ResolveOutputRelativePath_ImageItem_PreservesFrameWildcard()
+        {
+            var item = new MultiRecorderConfig.RecorderConfigItem
+            {
+                recorderType = RecorderSettingsType.Image,
+                fileName     = "frame_<Frame>",
+                name         = "ImageRecorder",
+                takeNumber   = 1,
+                width        = 1920,
+                height       = 1080
+            };
+
+            string resolved = Unity.MultiTimelineRecorder.MultiTimelineRecorder.ResolveOutputRelativePath(
+                item, "Assets/Scenes/Test.unity", null);
+
+            StringAssert.Contains(
+                "<Frame>", resolved,
+                "Image output path must preserve <Frame> wildcard for Recorder.");
+        }
+
+        // ---- IsSupportedRecorderItem -------------------------------------------
+
+        [Test]
+        public void IsSupportedRecorderItem_MovieType_ReturnsTrue()
+        {
+            var item = new MultiRecorderConfig.RecorderConfigItem
+            {
+                recorderType = RecorderSettingsType.Movie
+            };
+            Assert.IsTrue(
+                Unity.MultiTimelineRecorder.MultiTimelineRecorder.IsSupportedRecorderItem(item),
+                "Movie type should be supported.");
+        }
+
+        [Test]
+        public void IsSupportedRecorderItem_ImageType_ReturnsTrue()
+        {
+            var item = new MultiRecorderConfig.RecorderConfigItem
+            {
+                recorderType = RecorderSettingsType.Image
+            };
+            Assert.IsTrue(
+                Unity.MultiTimelineRecorder.MultiTimelineRecorder.IsSupportedRecorderItem(item),
+                "Image type should be supported.");
+        }
+
+        [Test]
+        public void IsSupportedRecorderItem_NullItem_ReturnsFalse()
+        {
+            Assert.IsFalse(
+                Unity.MultiTimelineRecorder.MultiTimelineRecorder.IsSupportedRecorderItem(null));
+        }
+
 #endif // UNITY_RECORDER
     }
 }
