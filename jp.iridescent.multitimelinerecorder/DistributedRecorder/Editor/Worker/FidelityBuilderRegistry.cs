@@ -50,6 +50,17 @@ namespace DistributedRecorder.Worker
         /// </summary>
         public static BuildSettingsDelegate OnBuildImageSettings;
 
+        /// <summary>
+        /// The registered Movie settings builder.  Null until
+        /// <c>Unity.MultiTimelineRecorder.DistributedWorkerBridge.RegisterDelegate</c>
+        /// is called.
+        ///
+        /// Signature identical to <see cref="OnBuildImageSettings"/>.  The boxed out-param
+        /// carries a <see cref="UnityEditor.Recorder.MovieRecorderSettings"/> on success.
+        /// Refs: movie-recorder-support §B
+        /// </summary>
+        public static BuildSettingsDelegate OnBuildMovieSettings;
+
         // -----------------------------------------------------------------------
         // worker-recording-fix: MTR headless render pipeline delegate
         // -----------------------------------------------------------------------

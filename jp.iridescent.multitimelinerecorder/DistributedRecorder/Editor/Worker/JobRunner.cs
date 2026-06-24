@@ -321,41 +321,98 @@ namespace DistributedRecorder.Worker
                 outputFile = baseOutputDir.TrimEnd('/') + "/frame_<Frame>";
             }
 
-            // ----- A4: Build fresh ImageRecorderSettings from recorderConfigJson -------------
+            // ----- A4: Build fresh RecorderSettings from recorderConfigJson ------------------
             // Single-source path: RecorderSettingsBuilderShared via DistributedWorkerBridge.
+            // Supports Image (ImageRecorderSettings) and Movie (MovieRecorderSettings).
             // Camera/RT resolution failure → hard fail (no GameView fallback per §F-4).
-            ImageRecorderSettings builtSettings = null;
+            //
+            // Movie constraint: 1 Job = 1 Machine = 1 output file. Frame-range splitting
+            // is not used (WholeJobSplitter only). This is enforced at Master dispatch
+            // level; JobRunner does not re-check it here.
+            RecorderSettings builtSettings = null;
 
             if (isMtrPath)
             {
-                if (FidelityBuilderRegistry.OnBuildImageSettings == null)
+                // Determine the recorder type from the JSON to select the correct builder.
+                // We do a lightweight peek-parse rather than a full deserialize here.
+                Unity.MultiTimelineRecorder.RecorderSettingsType recorderType =
+                    Unity.MultiTimelineRecorder.RecorderSettingsType.Image; // default
+                try
                 {
-                    FailJob(request.jobId,
-                        "[A4] FidelityBuilderRegistry.OnBuildImageSettings が未登録です。" +
-                        "DistributedWorkerBridge の InitializeOnLoad が完了しているか確認してください。");
-                    return;
+                    var peeked = JsonUtility.FromJson<Unity.MultiTimelineRecorder.MultiRecorderConfig.RecorderConfigItem>(
+                        request.recorderConfigJson);
+                    if (peeked != null)
+                        recorderType = peeked.recorderType;
+                }
+                catch
+                {
+                    // If peek fails the builder will catch it too and produce a proper error.
                 }
 
-                bool buildOk = FidelityBuilderRegistry.OnBuildImageSettings(
-                    request, outputFile, out object settingsObj, out string buildError);
-
-                if (!buildOk || settingsObj == null)
+                if (recorderType == Unity.MultiTimelineRecorder.RecorderSettingsType.Movie)
                 {
-                    FailJob(request.jobId,
-                        $"[A4] ImageRecorderSettings の構築に失敗しました: {buildError}");
-                    return;
-                }
+                    // Movie path
+                    if (FidelityBuilderRegistry.OnBuildMovieSettings == null)
+                    {
+                        FailJob(request.jobId,
+                            "[A4] FidelityBuilderRegistry.OnBuildMovieSettings が未登録です。" +
+                            "DistributedWorkerBridge の InitializeOnLoad が完了しているか確認してください。");
+                        return;
+                    }
 
-                builtSettings = settingsObj as ImageRecorderSettings;
-                if (builtSettings == null)
+                    bool buildOk = FidelityBuilderRegistry.OnBuildMovieSettings(
+                        request, outputFile, out object settingsObj, out string buildError);
+
+                    if (!buildOk || settingsObj == null)
+                    {
+                        FailJob(request.jobId,
+                            $"[A4] MovieRecorderSettings の構築に失敗しました: {buildError}");
+                        return;
+                    }
+
+                    builtSettings = settingsObj as RecorderSettings;
+                    if (builtSettings == null)
+                    {
+                        FailJob(request.jobId,
+                            "[A4] OnBuildMovieSettings が RecorderSettings 以外の型を返しました。" +
+                            "com.unity.recorder のバージョンを確認してください。");
+                        return;
+                    }
+
+                    AppendE2ELog($"[JobRunner] MovieRecorderSettings を構築しました: outputFile={outputFile}");
+                }
+                else
                 {
-                    FailJob(request.jobId,
-                        "[A4] OnBuildImageSettings が ImageRecorderSettings 以外の型を返しました。" +
-                        "com.unity.recorder のバージョンを確認してください。");
-                    return;
-                }
+                    // Image path (default)
+                    if (FidelityBuilderRegistry.OnBuildImageSettings == null)
+                    {
+                        FailJob(request.jobId,
+                            "[A4] FidelityBuilderRegistry.OnBuildImageSettings が未登録です。" +
+                            "DistributedWorkerBridge の InitializeOnLoad が完了しているか確認してください。");
+                        return;
+                    }
 
-                AppendE2ELog($"[JobRunner] ImageRecorderSettings を構築しました: outputFile={outputFile}");
+                    bool buildOk = FidelityBuilderRegistry.OnBuildImageSettings(
+                        request, outputFile, out object settingsObj, out string buildError);
+
+                    if (!buildOk || settingsObj == null)
+                    {
+                        FailJob(request.jobId,
+                            $"[A4] ImageRecorderSettings の構築に失敗しました: {buildError}");
+                        return;
+                    }
+
+                    builtSettings = settingsObj as RecorderSettings;
+                    if (builtSettings == null)
+                    {
+                        FailJob(request.jobId,
+                            "[A4] OnBuildImageSettings が RecorderSettings 以外の型を返しました。" +
+                            "com.unity.recorder のバージョンを確認してください。");
+                        return;
+                    }
+
+                    AppendE2ELog($"[JobRunner] ImageRecorderSettings を構築しました: outputFile={outputFile}");
+                }
             }
 
             // ----- A4 (legacy path): find existing RecorderClip in the scene Timeline --------

@@ -63,6 +63,9 @@ namespace DistributedRecorder.Worker
         /// <see cref="RecorderTrack"/> / <see cref="RecorderClip"/> that drives the
         /// supplied <paramref name="settings"/>.
         ///
+        /// Accepts <see cref="RecorderSettings"/> base type so both Image and Movie
+        /// recorder settings can be used without overloads.
+        ///
         /// The settings object is embedded as a sub-asset via
         /// <c>AssetDatabase.AddObjectToAsset</c> so it survives the Play Mode boundary.
         ///
@@ -70,8 +73,9 @@ namespace DistributedRecorder.Worker
         /// caller can later pass it to <see cref="Delete"/>.</para>
         /// </summary>
         /// <param name="settings">
-        /// Pre-built <see cref="ImageRecorderSettings"/> (ownership is transferred: the
-        /// object will be destroyed together with the temp timeline in <see cref="Delete"/>).
+        /// Pre-built <see cref="RecorderSettings"/> (Image or Movie; ownership is
+        /// transferred: the object will be destroyed together with the temp timeline in
+        /// <see cref="Delete"/>).
         /// </param>
         /// <param name="timelineDuration">
         /// Duration in seconds of the temp timeline (matches the source Timeline).
@@ -88,7 +92,7 @@ namespace DistributedRecorder.Worker
         /// </param>
         /// <returns>Project-relative asset path (e.g. <c>"Assets/_DistRecorder_Temp/job-xyz.playable"</c>).</returns>
         public static string Create(
-            ImageRecorderSettings settings,
+            RecorderSettings settings,
             double timelineDuration,
             double startTime,
             double endTime,
