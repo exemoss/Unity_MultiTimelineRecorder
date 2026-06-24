@@ -215,13 +215,13 @@ namespace Unity.MultiTimelineRecorder
                 // CollectRenderTargets() is called only at dispatch time (button click in
                 // DrawRecordControls). Here we just show a cheap count so the UI can
                 // display an informational hint without heavy processing every frame.
-                int imageTimelineCount = CountImageTimelinesCheap();
+                int imageTimelineCount = CountSupportedTimelinesCheap();
 
                 if (imageTimelineCount == 0 && selectedDirectorIndices.Count > 0)
                 {
                     EditorGUILayout.HelpBox(
-                        "分散対応の Image Recorder が選択 Timeline に見つかりません。\n" +
-                        "対応形式: Image Sequence のみ（Movie等はスキップ）。",
+                        "分散対応の Recorder が選択 Timeline に見つかりません。\n" +
+                        "対応形式: Image Sequence / Movie（AOV・FBX 等はスキップ）。",
                         MessageType.Warning);
                 }
                 else if (imageTimelineCount > 0)
@@ -387,8 +387,14 @@ namespace Unity.MultiTimelineRecorder
 
         /// <summary>
         /// Collects render-targets from the currently selected + enabled Timeline
-        /// directors.  Only <see cref="RecorderSettingsType.Image"/> items are
-        /// included; other types are skipped with a log message.
+        /// directors.  <see cref="RecorderSettingsType.Image"/> and
+        /// <see cref="RecorderSettingsType.Movie"/> items are included; other types
+        /// (AOV / FBX / Animation / Alembic) are skipped with a log message.
+        ///
+        /// Movie note: 1 Timeline = 1 Job = 1 Machine. Frame-range splitting is not
+        /// applied (WholeJobSplitter only). This is mandatory for simulation-dependent
+        /// content (MagicaCloth2 etc.) and for video file coherence.
+        /// Refs: movie-recorder-support §A / plan.md F5
         /// </summary>
         internal List<DistributedTimelineJob> CollectRenderTargets()
         {
@@ -411,23 +417,24 @@ namespace Unity.MultiTimelineRecorder
                 var config = GetTimelineRecorderConfig(idx);
                 var enabledItems = config.GetEnabledRecorders();
 
-                // Find first Image item
-                MultiRecorderConfig.RecorderConfigItem imageItem = null;
+                // Find the first supported item (Image or Movie).
+                // AOV / FBX / Animation / Alembic remain unsupported and are skipped.
+                MultiRecorderConfig.RecorderConfigItem supportedItem = null;
                 foreach (var item in enabledItems)
                 {
-                    if (item.recorderType == RecorderSettingsType.Image)
+                    if (IsSupportedRecorderItem(item))
                     {
-                        imageItem = item;
+                        supportedItem = item;
                         break;
                     }
-                    // Non-image types: log skip
+                    // Unsupported types: log skip
                     Debug.Log(
                         $"[DistributedRecorder] Timeline '{director.gameObject.name}': " +
                         $"Recorder '{item.name}' (type={item.recorderType}) は未対応形式のためスキップします。" +
-                        " 現在は Image Sequence のみ対応しています。");
+                        " 現在は Image Sequence および Movie に対応しています。");
                 }
 
-                if (imageItem == null)
+                if (supportedItem == null)
                     continue;
 
                 // Resolve recording range via SignalEmitter or full timeline
@@ -463,7 +470,7 @@ namespace Unity.MultiTimelineRecorder
                 string hierarchyPath = BuildHierarchyPath(director.gameObject);
 
                 // Map RecorderConfigItem → RecorderJobConfig (legacy DTO, kept for backward compat)
-                var jobConfig = MapToRecorderJobConfig(imageItem);
+                var jobConfig = MapToRecorderJobConfig(supportedItem);
 
                 // Resolve Timeline asset path
                 string timelineAssetPath = string.Empty;
@@ -473,25 +480,25 @@ namespace Unity.MultiTimelineRecorder
                 // --- MTR fidelity: resolve new fields ---
 
                 // Serialize full config (without Object references; they are sent as path/GUID)
-                string recorderConfigJson = JsonUtility.ToJson(imageItem);
+                string recorderConfigJson = JsonUtility.ToJson(supportedItem);
 
                 // Resolve camera reference to hierarchy path / name
                 string targetCameraHierarchyPath = string.Empty;
                 string targetCameraName = string.Empty;
-                if (imageItem.imageSourceType == ImageRecorderSourceType.TargetCamera &&
-                    imageItem.imageTargetCamera != null)
+                if (supportedItem.imageSourceType == ImageRecorderSourceType.TargetCamera &&
+                    supportedItem.imageTargetCamera != null)
                 {
-                    var camGo = imageItem.imageTargetCamera.gameObject;
+                    var camGo = supportedItem.imageTargetCamera.gameObject;
                     targetCameraHierarchyPath = BuildHierarchyPath(camGo);
                     targetCameraName          = camGo.name;
                 }
 
                 // Resolve RenderTexture to GUID
                 string renderTextureGuid = string.Empty;
-                if (imageItem.imageSourceType == ImageRecorderSourceType.RenderTexture &&
-                    imageItem.imageRenderTexture != null)
+                if (supportedItem.imageSourceType == ImageRecorderSourceType.RenderTexture &&
+                    supportedItem.imageRenderTexture != null)
                 {
-                    string rtPath = AssetDatabase.GetAssetPath(imageItem.imageRenderTexture);
+                    string rtPath = AssetDatabase.GetAssetPath(supportedItem.imageRenderTexture);
                     if (!string.IsNullOrEmpty(rtPath))
                         renderTextureGuid = AssetDatabase.AssetPathToGUID(rtPath);
                 }
@@ -509,17 +516,19 @@ namespace Unity.MultiTimelineRecorder
                 }
                 else
                 {
-                    effectiveWidth  = imageItem.width;
-                    effectiveHeight = imageItem.height;
+                    effectiveWidth  = supportedItem.width;
+                    effectiveHeight = supportedItem.height;
                 }
 
                 // Effective frame rate always comes from global MTR settings (same as
                 // CreateImageRecorderSettingsFromConfig which uses `this.settings.frameRate`)
-                double effectiveFrameRate = globalSettings != null ? globalSettings.frameRate : imageItem.frameRate;
+                double effectiveFrameRate = globalSettings != null ? globalSettings.frameRate : supportedItem.frameRate;
 
-                // Resolve output path: process Take/Scene wildcards now; preserve <Frame> for Recorder
+                // Resolve output path:
+                //  - Image: process Take/Scene wildcards; preserve <Frame> for Recorder
+                //  - Movie: process all wildcards; no <Frame> wildcard (single output file)
                 string resolvedOutputRelativePath = ResolveOutputRelativePath(
-                    imageItem, activeScenePath, director);
+                    supportedItem, activeScenePath, director);
 
                 // Compute job-scope hash (timeline + deps + scene only, no whole-Assets scan)
                 string jobScopeHash = string.Empty;
@@ -570,8 +579,12 @@ namespace Unity.MultiTimelineRecorder
 
         /// <summary>
         /// Maps a <see cref="MultiRecorderConfig.RecorderConfigItem"/> to a
-        /// <see cref="RecorderJobConfig"/>.  Only Image type is supported;
-        /// call <see cref="IsImageRecorderItem"/> before calling this method.
+        /// <see cref="RecorderJobConfig"/>.  Supports Image and Movie types.
+        /// Call <see cref="IsSupportedRecorderItem"/> before calling this method.
+        ///
+        /// Movie items produce a lossy DTO (recorderType = Image is a placeholder;
+        /// the real type travels via <c>recorderConfigJson</c>). This is intentional
+        /// — the lossy DTO is deprecated and the wire path uses recorderConfigJson.
         ///
         /// Made <c>public static</c> so the hermetic EditMode tests can reach it
         /// without instantiating the EditorWindow.
@@ -582,6 +595,9 @@ namespace Unity.MultiTimelineRecorder
             if (item == null)
                 throw new ArgumentNullException(nameof(item));
 
+            // The recorderType in the lossy DTO is left as Image for Movie items
+            // because DistRecorderType.Movie is not yet defined (plan.md scope-out).
+            // The actual type is carried by recorderConfigJson.recorderType.
             return new RecorderJobConfig
             {
                 recorderType     = DistRecorderType.Image,
@@ -597,9 +613,23 @@ namespace Unity.MultiTimelineRecorder
 
         /// <summary>
         /// Returns <c>true</c> when the item uses a recorder type that is currently
-        /// supported for distributed dispatch (Image Sequence only).
+        /// supported for distributed dispatch (Image Sequence or Movie).
+        ///
+        /// AOV / FBX / Animation / Alembic remain unsupported and return false.
         ///
         /// Made <c>public static</c> for hermetic tests.
+        /// </summary>
+        public static bool IsSupportedRecorderItem(MultiRecorderConfig.RecorderConfigItem item)
+        {
+            if (item == null) return false;
+            return item.recorderType == RecorderSettingsType.Image
+                || item.recorderType == RecorderSettingsType.Movie;
+        }
+
+        /// <summary>
+        /// Returns <c>true</c> when the item is an Image Sequence recorder.
+        /// Kept for backward compatibility with existing tests and callers.
+        /// New code should prefer <see cref="IsSupportedRecorderItem"/>.
         /// </summary>
         public static bool IsImageRecorderItem(MultiRecorderConfig.RecorderConfigItem item)
         {
@@ -1538,11 +1568,12 @@ namespace Unity.MultiTimelineRecorder
 
         /// <summary>
         /// Cheaply counts the number of selected timelines that have at least one
-        /// enabled Image recorder item, without calling <see cref="CollectRenderTargets"/>
-        /// (which invokes AssetDatabase, JsonUtility, and hash computation).
-        /// Safe to call every OnGUI frame.
+        /// enabled supported recorder item (Image or Movie), without calling
+        /// <see cref="CollectRenderTargets"/> (which invokes AssetDatabase, JsonUtility,
+        /// and hash computation). Safe to call every OnGUI frame.
+        /// Renamed internally from CountImageTimelinesCheap to reflect Movie support.
         /// </summary>
-        private int CountImageTimelinesCheap()
+        private int CountSupportedTimelinesCheap()
         {
             if (selectedDirectorIndices == null || selectedDirectorIndices.Count == 0)
                 return 0;
@@ -1554,10 +1585,10 @@ namespace Unity.MultiTimelineRecorder
                 var enabled = config.GetEnabledRecorders();
                 foreach (var item in enabled)
                 {
-                    if (IsImageRecorderItem(item))
+                    if (IsSupportedRecorderItem(item))
                     {
                         count++;
-                        break; // one Image item is enough to count this timeline
+                        break; // one supported item is enough to count this timeline
                     }
                 }
             }
@@ -1671,7 +1702,11 @@ namespace Unity.MultiTimelineRecorder
                 ? director.playableAsset.name
                 : "Timeline";
 
-            // Build the wildcard context; PreserveFrameWildcard=true so <Frame> is kept intact.
+            // Movie recordings produce a single file — do NOT preserve <Frame> wildcard.
+            // Image recordings preserve <Frame> so the Recorder substitutes per-frame numbers.
+            bool isMovie = item.recorderType == RecorderSettingsType.Movie;
+
+            // Build the wildcard context.
             var ctx = new WildcardContext
             {
                 SceneName              = sceneName,
@@ -1679,8 +1714,8 @@ namespace Unity.MultiTimelineRecorder
                 TakeNumber             = item.takeNumber,
                 Width                  = item.width,
                 Height                 = item.height,
-                RecorderType           = RecorderSettingsType.Image,
-                PreserveFrameWildcard  = true,
+                RecorderType           = item.recorderType,
+                PreserveFrameWildcard  = !isMovie,   // false for Movie: resolve <Frame> away
                 RecorderDisplayName    = item.name,
                 RecorderName           = item.name
             };
@@ -1700,7 +1735,12 @@ namespace Unity.MultiTimelineRecorder
                 rawPath = item.fileName;
             }
 
-            // Process all wildcards except <Frame>
+            // For Movie: strip any <Frame> wildcard that may be in the template
+            // (e.g. if the user typed "frame_<Frame>" for a Movie item).
+            if (isMovie)
+                rawPath = rawPath.Replace("<Frame>", string.Empty).TrimEnd('_', '-', ' ');
+
+            // Process wildcards (PreserveFrameWildcard controls <Frame> handling)
             string processed = WildcardProcessor.ProcessWildcards(rawPath, ctx);
 
             // Sanitize: strip leading slashes, normalize separators
@@ -1708,10 +1748,10 @@ namespace Unity.MultiTimelineRecorder
 
             // Safety: reject absolute paths or ".." (should not happen after wildcard
             // processing, but defend-in-depth).
-            // NOTE: `processed` may still contain the <Frame> wildcard (and '<','>' are
-            // illegal path chars on Windows), so we MUST NOT call System.IO.Path APIs
-            // here — Path.IsPathRooted throws "Illegal characters in path". Detect an
-            // absolute/rooted path manually instead (leading slash, drive letter, or UNC).
+            // NOTE: for Image, `processed` may still contain the <Frame> wildcard (and
+            // '<','>' are illegal path chars on Windows), so we MUST NOT call
+            // System.IO.Path APIs here — Path.IsPathRooted throws "Illegal characters in
+            // path". Detect an absolute/rooted path manually instead.
             bool isRooted = processed.Length > 0
                 && (processed[0] == '/' || processed[0] == '\\'
                     || (processed.Length >= 2 && processed[1] == ':')
@@ -1721,8 +1761,10 @@ namespace Unity.MultiTimelineRecorder
                 Debug.LogWarning(
                     $"[DistributedRecorder] resolvedOutputRelativePath was absolute after processing; " +
                     $"falling back to safe default. Original: {rawPath}");
-                processed = $"{sceneName}_{timelineName}/{item.fileName}";
-                processed = WildcardProcessor.ProcessWildcards(processed, ctx);
+                string fallback = isMovie
+                    ? $"{sceneName}_{timelineName}/{item.name}"
+                    : $"{sceneName}_{timelineName}/{item.fileName}";
+                processed = WildcardProcessor.ProcessWildcards(fallback, ctx);
                 processed = processed.Replace('\\', '/').TrimStart('/');
             }
 
@@ -1737,7 +1779,9 @@ namespace Unity.MultiTimelineRecorder
                 Debug.LogWarning(
                     $"[DistributedRecorder] resolvedOutputRelativePath contained '..'; " +
                     $"falling back to safe default. Original: {rawPath}");
-                processed = $"{sceneName}_{item.name}_{item.takeNumber}/<Frame>";
+                processed = isMovie
+                    ? $"{sceneName}_{item.name}_{item.takeNumber}"
+                    : $"{sceneName}_{item.name}_{item.takeNumber}/<Frame>";
             }
 
             return processed;
