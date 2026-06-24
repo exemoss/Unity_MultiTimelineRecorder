@@ -151,11 +151,21 @@ namespace Unity.MultiTimelineRecorder
                 return false;
             }
             
-            // Platform-specific validation
+            // Platform-specific validation for MOV (ProRes).
+            // Recorder 5.1.2: ProResWrapper is available on Windows x64 and macOS.
+            // The old guard "#if !UNITY_EDITOR_OSX" was incorrect — ProRes works on
+            // Windows x64 too (via native ProResWrapper.dll).
+            // We now rely on Recorder's own SupportsCurrentPlatform() check when the
+            // settings object is actually used; here we only reject Linux and ARM64
+            // where ProRes is definitely unsupported.
+            // Refs: movie-recorder-support §B / ユーザー確定仕様 U2 訂正
             if (outputFormat == MovieRecorderSettings.VideoRecorderOutputFormat.MOV)
             {
-                #if !UNITY_EDITOR_OSX
-                errorMessage = "MOV format is only supported on macOS";
+                #if UNITY_EDITOR_LINUX
+                errorMessage = "MOV/ProRes format is not supported on Linux.";
+                return false;
+                #elif UNITY_EDITOR_WIN && UNITY_ARM
+                errorMessage = "MOV/ProRes format is not supported on Windows ARM64.";
                 return false;
                 #endif
             }
