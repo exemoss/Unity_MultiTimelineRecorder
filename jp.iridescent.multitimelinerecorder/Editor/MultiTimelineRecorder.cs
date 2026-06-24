@@ -1,3 +1,7 @@
+// Allow DistributedRecorder test assembly to access internal helpers.
+// Refs: movie-recorder-support §F (ResolveOutputRelativePath test access)
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("DistributedRecorder.Tests.EditMode")]
+
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -2146,8 +2150,8 @@ namespace Unity.MultiTimelineRecorder
                     ? _distWorkerRegistry.EnabledWorkers.Count
                     : 0;
 
-                // Lightweight Image-target count (no CollectRenderTargets / AssetDatabase):
-                int imageTimelineCount = CountImageTimelinesCheap();
+                // Lightweight supported-recorder count (Image+Movie; no CollectRenderTargets / AssetDatabase):
+                int imageTimelineCount = CountSupportedTimelinesCheap();
 
                 canRecord = currentState == RecordState.Idle
                     && !EditorApplication.isPlaying
