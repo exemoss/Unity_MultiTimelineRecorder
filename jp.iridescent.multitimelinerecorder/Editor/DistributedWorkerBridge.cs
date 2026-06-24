@@ -65,6 +65,10 @@ namespace Unity.MultiTimelineRecorder
             // worker-recording-fix: register the MTR headless render pipeline starter
             DistributedRecorder.Worker.FidelityBuilderRegistry.OnStartHeadlessRender =
                 StartHeadlessRenderBridge;
+
+            // movie-recorder-support: register the Movie settings builder
+            DistributedRecorder.Worker.FidelityBuilderRegistry.OnBuildMovieSettings =
+                BuildMovieSettingsFromRequestBridge;
 #endif
         }
 
@@ -81,6 +85,18 @@ namespace Unity.MultiTimelineRecorder
         {
             var settings = BuildImageSettingsFromRequest(request, outputFile, out errorMessage);
             imageRecorderSettings = settings;
+            return settings != null;
+        }
+
+        // movie-recorder-support: bridge shim for Movie settings
+        private static bool BuildMovieSettingsFromRequestBridge(
+            JobRequest request,
+            string     outputFile,
+            out object movieRecorderSettings,
+            out string errorMessage)
+        {
+            var settings = BuildMovieSettingsFromRequest(request, outputFile, out errorMessage);
+            movieRecorderSettings = settings;
             return settings != null;
         }
 
@@ -214,11 +230,153 @@ namespace Unity.MultiTimelineRecorder
         }
 
         // -----------------------------------------------------------------------
+        // movie-recorder-support: Movie settings builder
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Builds a <see cref="MovieRecorderSettings"/> from the MTR fidelity fields
+        /// in the <see cref="JobRequest"/>.
+        ///
+        /// Parallel to <see cref="BuildImageSettingsFromRequest"/>.
+        /// Validation uses <see cref="MovieRecorderSettingsConfig.Validate"/> which
+        /// enforces platform support for MOV/ProRes (Windows x64 + macOS = allowed;
+        /// Linux + Windows ARM64 = rejected). See movie-recorder-support §B.
+        ///
+        /// Audio note: captureAudio is passed through from the deserialized movieConfig.
+        /// Whether audio actually records in headless Play Mode is unverified —
+        /// treat no-audio result as a Tester/real-machine item.
+        /// </summary>
+        public static MovieRecorderSettings BuildMovieSettingsFromRequest(
+            JobRequest request,
+            string     outputFile,
+            out string errorMessage)
+        {
+            errorMessage = string.Empty;
+
+            if (request == null)
+            {
+                errorMessage = "request is null.";
+                return null;
+            }
+            if (string.IsNullOrEmpty(request.recorderConfigJson))
+            {
+                errorMessage = "recorderConfigJson is empty; cannot build Movie settings.";
+                return null;
+            }
+
+            // Deserialize RecorderConfigItem (carries movieConfig as a sub-field)
+            MultiRecorderConfig.RecorderConfigItem item;
+            try
+            {
+                item = JsonUtility.FromJson<MultiRecorderConfig.RecorderConfigItem>(
+                    request.recorderConfigJson);
+            }
+            catch (Exception ex)
+            {
+                errorMessage = $"recorderConfigJson deserialize failed: {ex.Message}";
+                return null;
+            }
+
+            if (item == null)
+            {
+                errorMessage = "JsonUtility.FromJson returned null for recorderConfigJson.";
+                return null;
+            }
+
+            // Enum whitelist: reject unknown recorderType
+            if (!Enum.IsDefined(typeof(RecorderSettingsType), item.recorderType))
+            {
+                errorMessage = $"recorderConfigJson.recorderType value '{(int)item.recorderType}' is not in the allowed whitelist.";
+                return null;
+            }
+
+            if (item.recorderType != RecorderSettingsType.Movie)
+            {
+                errorMessage = $"BuildMovieSettingsFromRequest called with recorderType={item.recorderType}; expected Movie.";
+                return null;
+            }
+
+            // Validate MovieRecorderOutputFormat enum whitelist
+            if (!Enum.IsDefined(typeof(MovieRecorderSettings.VideoRecorderOutputFormat), item.movieConfig.outputFormat))
+            {
+                errorMessage = $"recorderConfigJson.movieConfig.outputFormat value '{(int)item.movieConfig.outputFormat}' is not in the allowed whitelist.";
+                return null;
+            }
+
+            // Apply effective width/height/frameRate from request (overrides item values)
+            int    effectiveWidth     = request.effectiveWidth  > 0 ? request.effectiveWidth  : item.width;
+            int    effectiveHeight    = request.effectiveHeight > 0 ? request.effectiveHeight : item.height;
+            double effectiveFrameRate = request.effectiveFrameRate > 0.0 ? request.effectiveFrameRate : item.frameRate;
+
+            // Resolve Camera from scene (same logic as Image path)
+            Camera resolvedCamera = null;
+            if (item.imageSourceType == ImageRecorderSourceType.TargetCamera)
+            {
+                resolvedCamera = ResolveCamera(
+                    request.targetCameraHierarchyPath, request.targetCameraName);
+
+                if (resolvedCamera == null)
+                {
+                    errorMessage =
+                        "[DistributedWorkerBridge] imageSourceType=TargetCamera ですが指定カメラが見つかりません。" +
+                        $" hierarchyPath='{request.targetCameraHierarchyPath}'" +
+                        $" name='{request.targetCameraName}'。" +
+                        "シーンを確認するか、分散実行前にシーンをプロジェクトと同期してください。";
+                    return null;
+                }
+            }
+
+            // Resolve RenderTexture from GUID (same as Image path)
+            RenderTexture resolvedRT = null;
+            if (item.imageSourceType == ImageRecorderSourceType.RenderTexture)
+            {
+                if (!string.IsNullOrEmpty(request.renderTextureGuid))
+                {
+                    string rtPath = AssetDatabase.GUIDToAssetPath(request.renderTextureGuid);
+                    if (!string.IsNullOrEmpty(rtPath))
+                        resolvedRT = AssetDatabase.LoadAssetAtPath<RenderTexture>(rtPath);
+                }
+
+                if (resolvedRT == null)
+                {
+                    errorMessage =
+                        $"[DistributedWorkerBridge] imageSourceType=RenderTexture ですが GUID '{request.renderTextureGuid}' の" +
+                        "RenderTexture が見つかりません。プロジェクトを同期してください。";
+                    return null;
+                }
+            }
+
+            // Build settings via the shared pure function
+            MovieRecorderSettings settings;
+            try
+            {
+                settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                    item,
+                    item.movieConfig,
+                    effectiveWidth,
+                    effectiveHeight,
+                    effectiveFrameRate,
+                    resolvedCamera,
+                    resolvedRT,
+                    outputFile,
+                    fallbackToGameViewOnMissingRef: false);
+            }
+            catch (Exception ex)
+            {
+                errorMessage = $"RecorderSettingsBuilderShared.BuildMovieSettings failed: {ex.Message}";
+                return null;
+            }
+
+            return settings;
+        }
+
+        // -----------------------------------------------------------------------
         // worker-recording-fix: headless render pipeline (MTR core, EditorWindow-free)
         // -----------------------------------------------------------------------
 
         /// <summary>
         /// Bridge shim matching <see cref="DistributedRecorder.Worker.FidelityBuilderRegistry.StartHeadlessRenderDelegate"/>.
+        /// Accepts <see cref="RecorderSettings"/> base type to support both Image and Movie.
         /// Already inside the outer #if UNITY_RECORDER block.
         /// </summary>
         private static string StartHeadlessRenderBridge(
@@ -228,9 +386,9 @@ namespace Unity.MultiTimelineRecorder
             double                                 frameRate,
             out string                             errorMessage)
         {
-            if (!(imageRecorderSettings is ImageRecorderSettings settings))
+            if (!(imageRecorderSettings is RecorderSettings settings))
             {
-                errorMessage = "imageRecorderSettings is not an ImageRecorderSettings instance.";
+                errorMessage = "imageRecorderSettings is not a RecorderSettings instance.";
                 return null;
             }
             return StartHeadlessRender(director, settings, timelineDuration, frameRate, out errorMessage);
@@ -252,9 +410,14 @@ namespace Unity.MultiTimelineRecorder
         /// Returns the project-relative temp asset path for caller to clean up via
         /// <c>AssetDatabase.DeleteAsset</c> after Edit Mode is restored.
         /// </summary>
+        /// <summary>
+        /// Accepts <see cref="RecorderSettings"/> base type to support both Image and Movie.
+        /// The overloaded version with <see cref="ImageRecorderSettings"/> is kept for
+        /// backward-compat callers (local tests etc.); it delegates here.
+        /// </summary>
         public static string StartHeadlessRender(
             UnityEngine.Playables.PlayableDirector director,
-            ImageRecorderSettings                  settings,
+            RecorderSettings                       settings,
             double                                 timelineDuration,
             double                                 frameRate,
             out string                             errorMessage)
@@ -268,7 +431,7 @@ namespace Unity.MultiTimelineRecorder
             }
             if (settings == null)
             {
-                errorMessage = "imageRecorderSettings is null.";
+                errorMessage = "recorderSettings is null.";
                 return null;
             }
 
@@ -476,6 +639,17 @@ namespace Unity.MultiTimelineRecorder
             out string errorMessage)
         {
             imageRecorderSettings = null;
+            errorMessage = "com.unity.recorder パッケージがインストールされていません。";
+            return false;
+        }
+
+        private static bool BuildMovieSettingsFromRequestBridge(
+            JobRequest request,
+            string     outputFile,
+            out object movieRecorderSettings,
+            out string errorMessage)
+        {
+            movieRecorderSettings = null;
             errorMessage = "com.unity.recorder パッケージがインストールされていません。";
             return false;
         }
