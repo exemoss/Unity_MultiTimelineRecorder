@@ -453,13 +453,15 @@ namespace Unity.MultiTimelineRecorder
             }
             EditorGUILayout.EndHorizontal();
 
-            // Iterate over a snapshot to allow safe removal during the loop.
-            // DrawWorkerVersionBadges receives EnabledWorkers (read-only projection),
-            // so we use _distWorkerRegistry.workers directly for the delete operation.
+            // Iterate the raw registry workers list (not EnabledWorkers) so self-detection
+            // and the delete button apply to every registered Worker, including disabled
+            // ones. The raw list can contain null slots (Unity serialization), so guard
+            // against null before dereferencing (plan acceptance: null elements must not throw).
             WorkerInfo workerToDelete = null;
 
             foreach (var worker in workers)
             {
+                if (worker == null) continue;
                 EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
 
                 // Worker name
@@ -657,6 +659,7 @@ namespace Unity.MultiTimelineRecorder
 
             foreach (var worker in workers)
             {
+                if (worker == null) continue;
                 var status = await dispatcher.GetWorkerVersionStatusAsync(worker);
                 _workerVersionStatus[worker.displayName] = status;
                 Repaint();
