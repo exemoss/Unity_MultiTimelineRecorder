@@ -984,7 +984,12 @@ namespace Unity.MultiTimelineRecorder
             var probeTasks = new Task<bool>[workers.Count];
             for (int pi = 0; pi < workers.Count; pi++)
                 probeTasks[pi] = _batchDispatcher.ProbeAsync(workers[pi]);
-            bool[] probeResults = await Task.WhenAll(probeTasks).ConfigureAwait(false);
+            // NOTE: must NOT use ConfigureAwait(false) here. The continuation below calls
+            // Unity main-thread-only APIs (Repaint, dispatch, AssetDatabase via DispatchQueuedJobAsync).
+            // ConfigureAwait(false) resumed the continuation on a ThreadPool thread, causing
+            // "Repaint can only be called from the main thread" and aborting the whole batch
+            // (jobs stuck Queued). Resume on the captured Unity synchronization context instead.
+            bool[] probeResults = await Task.WhenAll(probeTasks);
 
             var onlineWorkers = new List<WorkerInfo>();
             for (int pi = 0; pi < workers.Count; pi++)
