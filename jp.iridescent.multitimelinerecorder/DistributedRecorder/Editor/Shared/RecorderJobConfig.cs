@@ -15,8 +15,12 @@ namespace DistributedRecorder.Shared
     public enum DistRecorderType
     {
         /// <summary>Image sequence (PNG / JPEG / EXR).</summary>
-        Image
-        // Movie  — reserved for next milestone
+        Image,
+        /// <summary>
+        /// Movie file (MP4 / MOV-ProRes / WebM). Appended at the tail so existing
+        /// ordinals stay wire-compatible. Refs: movie-recorder-support.
+        /// </summary>
+        Movie
     }
 
     /// <summary>

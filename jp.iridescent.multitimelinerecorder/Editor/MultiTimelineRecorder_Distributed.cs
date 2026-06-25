@@ -595,12 +595,18 @@ namespace Unity.MultiTimelineRecorder
             if (item == null)
                 throw new ArgumentNullException(nameof(item));
 
-            // The recorderType in the lossy DTO is left as Image for Movie items
-            // because DistRecorderType.Movie is not yet defined (plan.md scope-out).
-            // The actual type is carried by recorderConfigJson.recorderType.
+            // movie-recorder-support: carry the recorder type in the Shared DTO so the
+            // Worker (JobRunner, in DistributedRecorder.Editor) can branch on Image vs Movie
+            // WITHOUT referencing Unity.MultiTimelineRecorder types across the asmdef boundary
+            // (that assembly references DistributedRecorder.Editor, so a reference back would
+            // be circular). The full per-type settings still travel in recorderConfigJson;
+            // this is only the lightweight discriminator.
+            var distRecorderType = item.recorderType == RecorderSettingsType.Movie
+                ? DistRecorderType.Movie
+                : DistRecorderType.Image;
             return new RecorderJobConfig
             {
-                recorderType     = DistRecorderType.Image,
+                recorderType     = distRecorderType,
                 width            = item.width,
                 height           = item.height,
                 frameRate        = item.frameRate,

@@ -333,23 +333,17 @@ namespace DistributedRecorder.Worker
 
             if (isMtrPath)
             {
-                // Determine the recorder type from the JSON to select the correct builder.
-                // We do a lightweight peek-parse rather than a full deserialize here.
-                Unity.MultiTimelineRecorder.RecorderSettingsType recorderType =
-                    Unity.MultiTimelineRecorder.RecorderSettingsType.Image; // default
-                try
-                {
-                    var peeked = JsonUtility.FromJson<Unity.MultiTimelineRecorder.MultiRecorderConfig.RecorderConfigItem>(
-                        request.recorderConfigJson);
-                    if (peeked != null)
-                        recorderType = peeked.recorderType;
-                }
-                catch
-                {
-                    // If peek fails the builder will catch it too and produce a proper error.
-                }
+                // Select Image vs Movie builder using the Shared-side discriminator
+                // (request.recorderConfig.recorderType), set by the Master in
+                // MapToRecorderJobConfig. JobRunner lives in DistributedRecorder.Editor and
+                // MUST NOT reference Unity.MultiTimelineRecorder types: that assembly already
+                // references this one, so referencing it back is a circular asmdef dependency
+                // (CS0234). The full per-type settings still travel in recorderConfigJson and
+                // are built by DistributedWorkerBridge on the MTR side.
+                bool isMovie = request.recorderConfig != null
+                    && request.recorderConfig.recorderType == DistRecorderType.Movie;
 
-                if (recorderType == Unity.MultiTimelineRecorder.RecorderSettingsType.Movie)
+                if (isMovie)
                 {
                     // Movie path
                     if (FidelityBuilderRegistry.OnBuildMovieSettings == null)
