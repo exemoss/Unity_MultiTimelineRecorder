@@ -265,6 +265,108 @@ namespace DistributedRecorder.Tests.Master
         }
 
         // -----------------------------------------------------------------------
+        // §B Blocker (iter2) – stall regression: pump must fire after Unreachable
+        //   failover re-enqueue.
+        //
+        // The production path (DispatchQueuedJobAsync → AfterFailedDispatch →
+        // TryDispatchNextQueuedJob → DispatchQueuedJobAsync) requires
+        // EditorApplication.update and cannot be driven synchronously in EditMode.
+        //
+        // We verify the *prerequisite pure-function invariants* that make the pump
+        // terminate correctly once it does fire:
+        //   • After W1 fails, HasUntried(onlineWorkers={W1}, tried={W1}) == false
+        //     → TryDispatchNextQueuedJob dequeues and terminals the job (no infinite loop).
+        //   • SelectIdleWorker(onlineWorkers={W1}, pref=null, counts, tried={W1}) == null
+        //     → confirms no candidate is selected after all online Workers are tried.
+        //   • With 2 online Workers, after W1 fails, HasUntried({W1,W2},{W1})==true
+        //     and SelectIdleWorker selects W2 → pump can proceed.
+        //
+        // End-to-end stall scenarios AC-2(a)/AC-2(b) are verified by the Tester.
+        // -----------------------------------------------------------------------
+
+        [Test]
+        public void HasUntried_AllOnlineTried_ReturnsFalse_StallSafetyInvariant()
+        {
+            // Simulates: online={W1}, job tried W1 (Unreachable).
+            // HasUntried must return false so TryDispatchNextQueuedJob can terminal the job.
+            var onlineWorkers = new List<WorkerInfo> { MakeWorker("W1") };
+            var tried         = new HashSet<string> { "W1" };
+
+            bool result = MultiTimelineRecorder.HasUntried(onlineWorkers, tried);
+
+            Assert.IsFalse(result,
+                "HasUntried must be false when all online Workers have been tried. " +
+                "This invariant ensures TryDispatchNextQueuedJob terminates the job " +
+                "rather than leaving it in the queue (Blocker stall scenario AC-2a).");
+        }
+
+        [Test]
+        public void HasUntried_NotAllOnlineTried_ReturnsTrue()
+        {
+            // online={W1,W2}, tried={W1} → W2 is still untried → true.
+            var onlineWorkers = new List<WorkerInfo> { MakeWorker("W1"), MakeWorker("W2") };
+            var tried         = new HashSet<string> { "W1" };
+
+            bool result = MultiTimelineRecorder.HasUntried(onlineWorkers, tried);
+
+            Assert.IsTrue(result,
+                "HasUntried must be true when W2 has not been tried yet.");
+        }
+
+        [Test]
+        public void SelectIdleWorker_AllOnlineTried_ReturnsNull_TerminalOnPump()
+        {
+            // Simulates TryDispatchNextQueuedJob after all online Workers are tried:
+            // SelectIdleWorker must return null so the job is terminalled.
+            // online={W1}, tried={W1}, W1 is idle (inflight=0).
+            var onlineWorkers = new List<WorkerInfo> { MakeWorker("W1") };
+            var counts        = new Dictionary<string, int> { ["W1"] = 0 };
+            var tried         = new HashSet<string> { "W1" };
+
+            var selected = MultiTimelineRecorder.SelectIdleWorker(onlineWorkers, null, counts, tried);
+
+            Assert.IsNull(selected,
+                "SelectIdleWorker must return null when the only online Worker " +
+                "is in TriedWorkers. TryDispatchNextQueuedJob then dequeues+terminates " +
+                "the job, avoiding the stall (Blocker AC-2a).");
+        }
+
+        [Test]
+        public void SelectIdleWorker_TwoOnline_FirstTried_SelectsSecond_FailoverContinues()
+        {
+            // Simulates TryDispatchNextQueuedJob after first online Worker fails:
+            // W1 tried (Unreachable), W2 online+idle → W2 selected → failover proceeds.
+            // This is the AC-2(b) "two workers, both failover" scenario first step.
+            var onlineWorkers = new List<WorkerInfo> { MakeWorker("W1"), MakeWorker("W2") };
+            var counts        = new Dictionary<string, int> { ["W1"] = 0, ["W2"] = 0 };
+            var tried         = new HashSet<string> { "W1" };
+
+            var selected = MultiTimelineRecorder.SelectIdleWorker(
+                onlineWorkers, null, counts, tried);
+
+            Assert.IsNotNull(selected,
+                "SelectIdleWorker must select W2 when W1 is tried and W2 is untried+idle.");
+            Assert.AreEqual("W2", selected.displayName,
+                "W2 must be selected since W1 is excluded by TriedWorkers.");
+        }
+
+        [Test]
+        public void SelectIdleWorker_TwoOnline_BothTried_ReturnsNull_BothJobsCanTerminal()
+        {
+            // AC-2(b): two online Workers, both tried for the same job → terminal.
+            var onlineWorkers = new List<WorkerInfo> { MakeWorker("W1"), MakeWorker("W2") };
+            var counts        = new Dictionary<string, int> { ["W1"] = 0, ["W2"] = 0 };
+            var tried         = new HashSet<string> { "W1", "W2" };
+
+            var selected = MultiTimelineRecorder.SelectIdleWorker(
+                onlineWorkers, null, counts, tried);
+
+            Assert.IsNull(selected,
+                "SelectIdleWorker must return null when all online Workers are tried. " +
+                "TryDispatchNextQueuedJob will terminal the job (AC-2b deadlock prevention).");
+        }
+
+        // -----------------------------------------------------------------------
         // Helpers
         // -----------------------------------------------------------------------
 
