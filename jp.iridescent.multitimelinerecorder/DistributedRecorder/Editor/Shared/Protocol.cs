@@ -397,6 +397,46 @@ namespace DistributedRecorder.Shared
     }
 
     // ---------------------------------------------------------------------------
+    // Recorder-align (worker-recorder-version-align)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Request sent by Master → Worker via POST /align-recorder.
+    ///
+    /// Security design:
+    ///  - <see cref="targetRecorderVersion"/> contains only the semver version string;
+    ///    the package name (<c>com.unity.recorder</c>) is fixed in code on the Worker
+    ///    side and is never accepted over the wire (prevents manifest injection).
+    ///  - Validated by <see cref="InputValidator.IsValidRecorderVersion"/> before use.
+    ///  - Endpoint requires HMAC authentication (not included in the /health skip list).
+    /// </summary>
+    [Serializable]
+    public class AlignRecorderRequest
+    {
+        /// <summary>
+        /// Target semver version string for com.unity.recorder,
+        /// e.g. "5.1.2". Must match <c>^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$</c>.
+        /// </summary>
+        public string targetRecorderVersion = string.Empty;
+    }
+
+    /// <summary>
+    /// Immediate 202 acknowledgement from Worker after receiving POST /align-recorder.
+    ///
+    /// The align operation is asynchronous: Worker returns 202 immediately and performs
+    /// the package update in the background. Master re-polls GET /health until
+    /// <see cref="WorkerHealth.recorderVersion"/> reaches the target or a timeout elapses.
+    /// </summary>
+    [Serializable]
+    public class AlignRecorderAck
+    {
+        /// <summary>Whether the request was accepted for async processing.</summary>
+        public bool   accepted;
+        /// <summary>Human-readable reason when <see cref="accepted"/> is false.</summary>
+        public string reason = string.Empty;
+    }
+
+    // ---------------------------------------------------------------------------
     // Serialization helpers
     // ---------------------------------------------------------------------------
 

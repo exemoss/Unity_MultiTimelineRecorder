@@ -513,6 +513,41 @@ namespace DistributedRecorder.Shared
             return true;
         }
 
+        // --- worker-recorder-version-align --------------------------------------
+
+        /// <summary>
+        /// Semver whitelist pattern for recorder version strings.
+        /// Accepts: X.Y.Z or X.Y.Z-prerelease (e.g. "5.1.2", "5.1.2-pre.1").
+        ///
+        /// Explicitly rejects git URLs, file: references, path traversal (..), HTTP URLs,
+        /// arbitrary package names, and empty strings — preventing manifest injection
+        /// if the string were ever passed to Client.Add.
+        /// </summary>
+        private static readonly Regex SemverPattern =
+            new Regex(@"^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Returns true when <paramref name="version"/> is a valid registry semver string
+        /// for <c>com.unity.recorder</c>.
+        ///
+        /// Only strings matching <c>^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$</c> are accepted.
+        /// git URLs, <c>file:</c> references, path separators, and arbitrary text are rejected.
+        ///
+        /// Called by <see cref="WorkerHttpListener"/> before passing the version to
+        /// <c>RecorderPackageInstaller.StartInstallVersion</c>.
+        /// </summary>
+        /// <param name="version">Version string received from the network.</param>
+        /// <returns>True when the string is a safe semver-only token.</returns>
+        public static bool IsValidRecorderVersion(string version)
+        {
+            if (string.IsNullOrEmpty(version))
+                return false;
+            // Hard length cap: semver strings longer than 32 chars are suspicious.
+            if (version.Length > 32)
+                return false;
+            return SemverPattern.IsMatch(version);
+        }
+
         private static bool IsAlphanumericOrHyphen(string s)
         {
             foreach (char c in s)
