@@ -57,6 +57,25 @@ namespace Unity.MultiTimelineRecorder
         private bool _sessionSkipHashCheck;
         private bool _sessionSkipVersionCheck;
 
+        // --- worker-recorder-version-align state --------------------------------
+
+        /// <summary>
+        /// Cached version status for each Worker, refreshed by the probe button or
+        /// automatically after DrawDistributedSection is first shown each session.
+        /// Key = worker.displayName.
+        /// </summary>
+        private readonly Dictionary<string, WorkerVersionStatus> _workerVersionStatus =
+            new Dictionary<string, WorkerVersionStatus>();
+
+        /// <summary>Workers currently undergoing an align operation (display spinner).</summary>
+        private readonly HashSet<string> _aligningWorkers = new HashSet<string>();
+
+        /// <summary>
+        /// Last status message from an align operation, keyed by worker.displayName.
+        /// </summary>
+        private readonly Dictionary<string, string> _alignStatusMessages =
+            new Dictionary<string, string>();
+
         // EditorPrefs keys (MTR window scope)
         private const string PrefKeyDistMode     = "MTR.DistributedMode";
         private const string PrefKeyDistRegistry = "MTR.DistributedRegistryGuid";
@@ -223,6 +242,9 @@ namespace Unity.MultiTimelineRecorder
                     EditorGUILayout.LabelField(
                         $"有効 Worker: {enabledWorkerCount} 台",
                         EditorStyles.miniLabel);
+
+                    // ── Worker version badges (worker-recorder-version-align) ──
+                    DrawWorkerVersionBadges(_distWorkerRegistry.EnabledWorkers);
                 }
 
                 // ── Lightweight target count (no CollectRenderTargets / AssetDatabase) ──
@@ -362,6 +384,234 @@ namespace Unity.MultiTimelineRecorder
             }
 
             EditorGUILayout.EndHorizontal();
+        }
+
+        // -----------------------------------------------------------------------
+        // Worker version badges (worker-recorder-version-align)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Draws per-Worker version badges and the "揃える" (align) button.
+        ///
+        /// For each enabled Worker:
+        ///  - If version status is known: shows recorder / Unity version,
+        ///    a red badge if recorder mismatches, a warning if Unity mismatches.
+        ///  - If aligning: shows a spinner message.
+        ///  - "バージョン確認" button (re-)fetches /health for all Workers.
+        ///  - "揃える" button appears when recorder mismatches and Worker is reachable.
+        ///    Clicking shows an EditorUtility.DisplayDialog to confirm, then sends
+        ///    POST /align-recorder and starts polling /health.
+        ///
+        /// All async work uses the shared key (same as dispatch); if the key is not
+        /// loaded the button shows an error. No ConfigureAwait(false) (main-thread).
+        /// </summary>
+        private void DrawWorkerVersionBadges(IReadOnlyList<WorkerInfo> workers)
+        {
+            EditorGUILayout.Space(4);
+
+            // Header row
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("Worker バージョン", EditorStyles.boldLabel, GUILayout.Width(140));
+            if (GUILayout.Button("バージョン確認", GUILayout.Width(90)))
+                _ = RefreshAllWorkerVersionsAsync(workers);
+            EditorGUILayout.EndHorizontal();
+
+            foreach (var worker in workers)
+            {
+                EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
+
+                // Worker name
+                EditorGUILayout.LabelField(worker.displayName, GUILayout.Width(120));
+
+                bool isAligning = _aligningWorkers.Contains(worker.displayName);
+
+                if (isAligning)
+                {
+                    // Show spinner / status message
+                    _alignStatusMessages.TryGetValue(worker.displayName, out string msg);
+                    EditorGUILayout.LabelField(
+                        string.IsNullOrEmpty(msg) ? "アライン中…" : msg,
+                        EditorStyles.miniLabel);
+                }
+                else if (_workerVersionStatus.TryGetValue(worker.displayName, out var status))
+                {
+                    if (!status.Reachable)
+                    {
+                        // Unreachable
+                        var prevColor = GUI.color;
+                        GUI.color = Color.gray;
+                        EditorGUILayout.LabelField("オフライン", EditorStyles.miniLabel, GUILayout.Width(60));
+                        GUI.color = prevColor;
+                    }
+                    else
+                    {
+                        // Recorder version badge
+                        var prevColor = GUI.color;
+                        if (status.RecorderMismatch)
+                            GUI.color = new Color(1f, 0.4f, 0.4f);
+                        EditorGUILayout.LabelField(
+                            $"Recorder: {status.WorkerRecorderVersion}",
+                            EditorStyles.miniLabel,
+                            GUILayout.Width(130));
+                        GUI.color = prevColor;
+
+                        // Unity version (warning only — cannot auto-align)
+                        if (status.UnityMismatch)
+                        {
+                            GUI.color = new Color(1f, 0.8f, 0.2f);
+                            EditorGUILayout.LabelField(
+                                $"Unity: {status.WorkerUnityVersion} ≠ {status.MasterUnityVersion}",
+                                EditorStyles.miniLabel);
+                            GUI.color = prevColor;
+                        }
+                        else
+                        {
+                            EditorGUILayout.LabelField(
+                                "Unity: OK",
+                                EditorStyles.miniLabel,
+                                GUILayout.Width(60));
+                        }
+
+                        // Align button — only when recorder mismatches
+                        if (status.RecorderMismatch)
+                        {
+                            string targetVer = status.MasterRecorderVersion;
+                            if (GUILayout.Button($"{targetVer} に揃える", GUILayout.Width(110)))
+                            {
+                                bool confirmed = EditorUtility.DisplayDialog(
+                                    "com.unity.recorder バージョンを揃える",
+                                    $"Worker '{worker.displayName}' の com.unity.recorder を\n" +
+                                    $"  現在: {status.WorkerRecorderVersion}\n" +
+                                    $"  目標: {targetVer}\n" +
+                                    "に変更します。\n\n" +
+                                    "Worker の Unity Editor がドメインリロードするため、\n" +
+                                    "実行中のジョブがあれば先に完了させてください。",
+                                    "揃える",
+                                    "キャンセル");
+
+                                if (confirmed)
+                                    _ = AlignWorkerRecorderVersionAsync(worker, targetVer);
+                            }
+                        }
+                        else
+                        {
+                            EditorGUILayout.LabelField("Recorder: OK", EditorStyles.miniLabel, GUILayout.Width(80));
+                        }
+                    }
+
+                    // Last align status message
+                    if (_alignStatusMessages.TryGetValue(worker.displayName, out string lastMsg)
+                        && !string.IsNullOrEmpty(lastMsg))
+                    {
+                        EditorGUILayout.LabelField(lastMsg, EditorStyles.miniLabel);
+                    }
+                }
+                else
+                {
+                    // Not yet probed
+                    EditorGUILayout.LabelField("未確認 → 「バージョン確認」を押してください", EditorStyles.miniLabel);
+                }
+
+                EditorGUILayout.EndHorizontal();
+            }
+        }
+
+        /// <summary>
+        /// Fetches /health for all <paramref name="workers"/> in sequence and caches
+        /// the results in <see cref="_workerVersionStatus"/>.
+        ///
+        /// Uses the batch shared key if a batch is active, otherwise loads the key once.
+        /// Does NOT use ConfigureAwait(false) — continuations must stay on the main thread.
+        /// </summary>
+        private async Task RefreshAllWorkerVersionsAsync(IReadOnlyList<WorkerInfo> workers)
+        {
+            if (!SharedKeyLoader.TryLoad(out byte[] keyBytes, out string keyError))
+            {
+                Debug.LogError($"[DistributedRecorder] バージョン確認: 共有キーのロードに失敗しました: {keyError}");
+                return;
+            }
+
+            using var transport  = new HttpTransport(new HmacAuthenticator(keyBytes));
+            var       dispatcher = new JobDispatcher(transport, ProjectPaths.ProjectRoot);
+
+            foreach (var worker in workers)
+            {
+                var status = await dispatcher.GetWorkerVersionStatusAsync(worker);
+                _workerVersionStatus[worker.displayName] = status;
+                Repaint();
+            }
+        }
+
+        /// <summary>
+        /// Sends POST /align-recorder to <paramref name="worker"/>, then polls /health
+        /// until the version matches <paramref name="targetVersion"/> or a timeout elapses.
+        ///
+        /// Must be called from the main thread (no ConfigureAwait(false)).
+        /// Shows a final success/error dialog when done.
+        /// </summary>
+        private async Task AlignWorkerRecorderVersionAsync(WorkerInfo worker, string targetVersion)
+        {
+            if (!SharedKeyLoader.TryLoad(out byte[] keyBytes, out string keyError))
+            {
+                EditorUtility.DisplayDialog(
+                    "アラインエラー",
+                    $"共有キーのロードに失敗しました: {keyError}",
+                    "OK");
+                return;
+            }
+
+            _aligningWorkers.Add(worker.displayName);
+            _alignStatusMessages[worker.displayName] = "POST /align-recorder 送信中…";
+            Repaint();
+
+            using var transport  = new HttpTransport(new HmacAuthenticator(keyBytes));
+            var       dispatcher = new JobDispatcher(transport, ProjectPaths.ProjectRoot);
+
+            var (result, message) = await dispatcher.AlignRecorderAsync(
+                worker, targetVersion,
+                progressMsg =>
+                {
+                    _alignStatusMessages[worker.displayName] = progressMsg;
+                    Repaint();
+                });
+
+            _aligningWorkers.Remove(worker.displayName);
+
+            switch (result)
+            {
+                case JobDispatcher.AlignResult.Success:
+                    _alignStatusMessages[worker.displayName] = $"完了: {message}";
+                    // Refresh badge
+                    var updatedStatus = await dispatcher.GetWorkerVersionStatusAsync(worker);
+                    _workerVersionStatus[worker.displayName] = updatedStatus;
+                    break;
+
+                case JobDispatcher.AlignResult.Rejected:
+                    _alignStatusMessages[worker.displayName] = $"拒否: {message}";
+                    EditorUtility.DisplayDialog(
+                        "アライン拒否",
+                        $"Worker '{worker.displayName}' がリクエストを拒否しました:\n{message}",
+                        "OK");
+                    break;
+
+                case JobDispatcher.AlignResult.Timeout:
+                    _alignStatusMessages[worker.displayName] = $"タイムアウト: {message}";
+                    EditorUtility.DisplayDialog(
+                        "アラインタイムアウト",
+                        message,
+                        "OK");
+                    break;
+
+                case JobDispatcher.AlignResult.NetworkError:
+                    _alignStatusMessages[worker.displayName] = $"ネットワークエラー: {message}";
+                    EditorUtility.DisplayDialog(
+                        "アラインエラー",
+                        $"Worker '{worker.displayName}' との通信に失敗しました:\n{message}",
+                        "OK");
+                    break;
+            }
+
+            Repaint();
         }
 
         // -----------------------------------------------------------------------
