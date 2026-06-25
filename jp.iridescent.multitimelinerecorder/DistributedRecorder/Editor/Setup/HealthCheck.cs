@@ -12,6 +12,15 @@ using UnityEngine;
 namespace DistributedRecorder.Setup
 {
     /// <summary>
+    /// Cached version data for a single registered Worker, obtained from GET /health.
+    /// </summary>
+    internal sealed class WorkerVersionCache
+    {
+        public bool   Online          { get; set; }
+        public string RecorderVersion { get; set; } = string.Empty;
+        public string UnityVersion    { get; set; } = string.Empty;
+    }
+    /// <summary>
     /// Defines the possible health status for a single check item.
     /// </summary>
     public enum HealthStatus
@@ -54,9 +63,10 @@ namespace DistributedRecorder.Setup
         // HTTP timeout for /health probes
         private static readonly TimeSpan HealthProbeTimeout = TimeSpan.FromSeconds(3);
 
-        // Cached worker health results
-        private static Dictionary<string, bool> _workerOnlineCache  = new Dictionary<string, bool>();
-        private static bool                     _workerCheckRunning = false;
+        // Cached worker health results — keyed by BaseUrl
+        private static Dictionary<string, bool>               _workerOnlineCache   = new Dictionary<string, bool>();
+        private static Dictionary<string, WorkerVersionCache> _workerVersionCache  = new Dictionary<string, WorkerVersionCache>();
+        private static bool                                   _workerCheckRunning  = false;
 
         // ------------------------------------------------------------------
         // Public API
@@ -93,21 +103,23 @@ namespace DistributedRecorder.Setup
             {
                 var registry = AssetDatabase.LoadAssetAtPath<WorkerRegistryAsset>(
                     WorkerRegistryAutoFactory.DefaultAssetPath);
-                if (registry == null) { _workerOnlineCache.Clear(); return; }
+                if (registry == null) { _workerOnlineCache.Clear(); _workerVersionCache.Clear(); return; }
 
-                var newCache = new Dictionary<string, bool>(StringComparer.Ordinal);
-                var tasks    = new List<Task>();
+                var newOnlineCache  = new Dictionary<string, bool>(StringComparer.Ordinal);
+                var newVersionCache = new Dictionary<string, WorkerVersionCache>(StringComparer.Ordinal);
+                var tasks           = new List<Task>();
 
                 foreach (var worker in registry.workers)
                 {
                     if (worker == null) continue;
-                    string url       = $"{worker.BaseUrl}/health";
-                    string key       = worker.BaseUrl;
-                    tasks.Add(ProbeWorkerHealth(url, key, newCache));
+                    string url = $"{worker.BaseUrl}/health";
+                    string key = worker.BaseUrl;
+                    tasks.Add(ProbeWorkerHealth(url, key, newOnlineCache, newVersionCache));
                 }
 
                 await Task.WhenAll(tasks);
-                _workerOnlineCache = newCache;
+                _workerOnlineCache  = newOnlineCache;
+                _workerVersionCache = newVersionCache;
             }
             finally
             {
@@ -263,22 +275,112 @@ namespace DistributedRecorder.Setup
 
         private static HealthCheckItem CheckVersionMatch()
         {
-            var registry = FindRegistry();
-            if (registry == null)
-                return new HealthCheckItem { Label = "バージョン一致確認", Status = HealthStatus.NotApplicable, Detail = "レジストリなし" };
+            string masterUnity    = VersionChecker.UnityVersion;
+            string masterRecorder = VersionChecker.RecorderVersion;
 
-            // Version mismatch detection is done at job dispatch time via VersionChecker.MatchesLocal.
-            // In Setup Hub we can only report local versions and suggest sync.
-            string localUnity    = VersionChecker.UnityVersion;
-            string localRecorder = VersionChecker.RecorderVersion;
+            // Base item: Master versions
+            if (string.IsNullOrEmpty(masterRecorder))
+            {
+                return new HealthCheckItem
+                {
+                    Label    = "バージョン確認",
+                    Status   = HealthStatus.Warning,
+                    Detail   = $"Master — Unity {masterUnity} / Recorder 未インストール",
+                    FixLabel = "インストール",
+                    FixAction = () => RecorderPackageInstaller.StartInstall(),
+                };
+            }
+
+            var registry = FindRegistry();
+
+            // No registered workers — show Master versions only.
+            if (registry == null || registry.workers == null || registry.workers.Count == 0)
+            {
+                return new HealthCheckItem
+                {
+                    Label  = "バージョン確認",
+                    Status = HealthStatus.Ok,
+                    Detail = $"Master — Recorder {masterRecorder} / Unity {masterUnity} (Worker 未登録)",
+                };
+            }
+
+            // Aggregate Worker version comparisons from the cached probe results.
+            int totalWorkers    = 0;
+            int mismatchWorkers = 0;
+            int offlineWorkers  = 0;
+            var mismatchLines   = new System.Text.StringBuilder();
+
+            foreach (var worker in registry.workers)
+            {
+                if (worker == null) continue;
+                totalWorkers++;
+
+                if (!_workerVersionCache.TryGetValue(worker.BaseUrl, out var cache))
+                {
+                    // Not yet probed — treat as unknown (not a mismatch).
+                    continue;
+                }
+
+                if (!cache.Online)
+                {
+                    offlineWorkers++;
+                    continue;
+                }
+
+                var cmp = SetupVersionHelper.CompareVersions(
+                    masterRecorder, masterUnity,
+                    cache.RecorderVersion, cache.UnityVersion);
+
+                if (cmp.Result != SetupVersionHelper.VersionMatchResult.Match)
+                {
+                    mismatchWorkers++;
+                    mismatchLines.AppendLine(
+                        $"  {worker.displayName}: " +
+                        SetupVersionHelper.FormatVersionLabel(
+                            masterRecorder, masterUnity,
+                            cache.RecorderVersion, cache.UnityVersion));
+                }
+            }
+
+            bool hasProbeResults = _workerVersionCache.Count > 0;
+
+            HealthStatus status;
+            string detail;
+
+            if (!hasProbeResults)
+            {
+                status = HealthStatus.Checking;
+                detail = $"Master — Recorder {masterRecorder} / Unity {masterUnity}" +
+                         $"\nWorker 版の確認中（「ヘルスチェックを今すぐ更新」を押してください）";
+            }
+            else if (mismatchWorkers > 0)
+            {
+                status = HealthStatus.Warning;
+                detail = $"Master — Recorder {masterRecorder} / Unity {masterUnity}" +
+                         $"\n版ズレあり ({mismatchWorkers}/{totalWorkers} Worker):\n" +
+                         mismatchLines.ToString().TrimEnd();
+            }
+            else if (offlineWorkers == totalWorkers && totalWorkers > 0)
+            {
+                status = HealthStatus.Warning;
+                detail = $"Master — Recorder {masterRecorder} / Unity {masterUnity}" +
+                         $"\n全 Worker オフライン（版確認不可）";
+            }
+            else
+            {
+                status = HealthStatus.Ok;
+                int checkedCount = totalWorkers - offlineWorkers;
+                detail = $"Master — Recorder {masterRecorder} / Unity {masterUnity}" +
+                         $"\n全 Worker 版一致 ({checkedCount}/{totalWorkers} オンライン確認済み)";
+            }
 
             return new HealthCheckItem
             {
-                Label  = "バージョン確認 (Master)",
-                Status = string.IsNullOrEmpty(localRecorder) ? HealthStatus.Warning : HealthStatus.Ok,
-                Detail = $"Unity {localUnity} / Recorder {(string.IsNullOrEmpty(localRecorder) ? "未インストール" : localRecorder)}",
-                FixLabel  = "プロジェクトを同期",
-                FixAction = null, // Sync UI is in SetupHubWindow
+                Label     = "バージョン確認",
+                Status    = status,
+                Detail    = detail,
+                FixLabel  = "再確認",
+                FixAction = () => { _ = RefreshWorkerHealthAsync(); },
             };
         }
 
@@ -321,17 +423,38 @@ namespace DistributedRecorder.Setup
         }
 
         private static async Task ProbeWorkerHealth(
-            string url, string key, Dictionary<string, bool> cache)
+            string url,
+            string key,
+            Dictionary<string, bool>               onlineCache,
+            Dictionary<string, WorkerVersionCache> versionCache)
         {
             try
             {
-                using var http  = new HttpClient { Timeout = HealthProbeTimeout };
-                var response    = await http.GetAsync(url);
-                cache[key]      = response.IsSuccessStatusCode;
+                using var http    = new HttpClient { Timeout = HealthProbeTimeout };
+                var response      = await http.GetAsync(url);
+                bool online       = response.IsSuccessStatusCode;
+                onlineCache[key]  = online;
+
+                if (online)
+                {
+                    string json   = await response.Content.ReadAsStringAsync();
+                    var health    = ProtocolSerializer.Deserialize<WorkerHealth>(json);
+                    versionCache[key] = new WorkerVersionCache
+                    {
+                        Online          = true,
+                        RecorderVersion = health?.recorderVersion ?? string.Empty,
+                        UnityVersion    = health?.unityVersion    ?? string.Empty,
+                    };
+                }
+                else
+                {
+                    versionCache[key] = new WorkerVersionCache { Online = false };
+                }
             }
             catch
             {
-                cache[key] = false;
+                onlineCache[key]  = false;
+                versionCache[key] = new WorkerVersionCache { Online = false };
             }
         }
     }
