@@ -39,10 +39,35 @@ namespace DistributedRecorder.Setup
         // ------------------------------------------------------------------
 
         /// <summary>
-        /// Starts an asynchronous <c>com.unity.recorder</c> install.
+        /// Starts an asynchronous <c>com.unity.recorder</c> install (latest version).
         /// Does nothing when another install is already in flight.
         /// </summary>
         public static void StartInstall()
+        {
+            StartInstallVersion(RecorderPackageName);
+        }
+
+        /// <summary>
+        /// Starts an asynchronous install of <c>com.unity.recorder</c> at a specific
+        /// semver version. Called by the Worker align endpoint after the incoming version
+        /// string has been validated by <c>InputValidator.IsValidRecorderVersion</c>.
+        ///
+        /// The <paramref name="packageId"/> must be either:
+        ///   - <c>"com.unity.recorder"</c> (latest)
+        ///   - <c>"com.unity.recorder@X.Y.Z"</c> (specific version)
+        ///
+        /// Callers MUST have validated the version portion with
+        /// <see cref="DistributedRecorder.Shared.InputValidator.IsValidRecorderVersion"/>
+        /// before constructing the packageId string.  This method does NOT re-validate;
+        /// it trusts that the caller's validation already ran.
+        ///
+        /// Does nothing when another install is already in flight.
+        /// </summary>
+        /// <param name="packageId">
+        /// Package identifier to pass to <see cref="Client.Add"/>.
+        /// Typically <c>"com.unity.recorder@5.1.2"</c>.
+        /// </param>
+        public static void StartInstallVersion(string packageId)
         {
             if (IsInstalling)
             {
@@ -52,11 +77,11 @@ namespace DistributedRecorder.Setup
 
             LastResult  = string.Empty;
             LastError   = string.Empty;
-            _addRequest = Client.Add(RecorderPackageName);
+            _addRequest = Client.Add(packageId);
 
             // Hook the update loop to poll for completion.
             EditorApplication.update += PollInstall;
-            Debug.Log($"[RecorderPackageInstaller] Installing {RecorderPackageName}...");
+            Debug.Log($"[RecorderPackageInstaller] Installing {packageId}...");
         }
 
         /// <summary>
