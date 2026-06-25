@@ -17,13 +17,45 @@ namespace DistributedRecorder.Master
     {
         private readonly ITransport    _transport;
         private readonly string        _projectRoot;
-        private static readonly TimeSpan HealthTimeout  = TimeSpan.FromSeconds(10);
-        private static readonly TimeSpan DispatchTimeout = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan HealthTimeout       = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan DispatchTimeout     = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan LivenessProbeTimeout = TimeSpan.FromSeconds(3);
 
         public JobDispatcher(ITransport transport, string projectRoot)
         {
             _transport   = transport ?? throw new ArgumentNullException(nameof(transport));
             _projectRoot = projectRoot;
+        }
+
+        /// <summary>
+        /// Probes <paramref name="worker"/> with a short-timeout GET /health to
+        /// determine whether it is reachable before the dispatch seed.
+        ///
+        /// Uses the same HMAC-authenticated transport as <see cref="DispatchAsync"/>
+        /// so the probe goes through the same security path.  The timeout is
+        /// deliberately shorter (3 s vs 10 s) to avoid stalling the batch seed when
+        /// multiple Workers are offline.
+        ///
+        /// Returns <c>true</c> if the Worker responds to /health within the timeout;
+        /// <c>false</c> on any <see cref="TransportException"/> (timeout, connection
+        /// refused, etc.).  Callers must not treat <c>false</c> as a permanent offline
+        /// verdict — it is only used to skip the Worker during the initial seed.
+        ///
+        /// Added in dispatch-worker-liveness (plan.md 案3, A-step).
+        /// </summary>
+        public async Task<bool> ProbeAsync(WorkerInfo worker)
+        {
+            if (worker == null) throw new ArgumentNullException(nameof(worker));
+            try
+            {
+                await _transport.GetAsync($"{worker.BaseUrl}/health", LivenessProbeTimeout)
+                                .ConfigureAwait(false);
+                return true;
+            }
+            catch (TransportException)
+            {
+                return false;
+            }
         }
 
         /// <summary>
