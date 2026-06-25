@@ -131,6 +131,19 @@ namespace Unity.MultiTimelineRecorder
         private HmacAuthenticator _batchAuth;
 
         /// <summary>
+        /// Workers that responded to the pre-flight liveness probe at batch start.
+        /// Used as the failover candidate pool so that pre-flight-offline Workers are
+        /// excluded from the initial failover list (Major fix: dispatch-worker-liveness §B2).
+        /// A Worker absent from this list can still be promoted to the failover pool once
+        /// all online candidates are exhausted, matching plan.md 不明点5 (one-chance policy).
+        ///
+        /// Set in <see cref="StartDistributedRecordingInternalAsync"/>; cleared when the
+        /// batch finalizes (<see cref="FinalizeBatchIfDone"/>).
+        /// Only accessed on the Editor main thread.
+        /// </summary>
+        private List<WorkerInfo> _batchOnlineWorkers;
+
+        /// <summary>
         /// Last progress-event time (EditorApplication.timeSinceStartup) keyed by JobId.
         /// Used by the failsafe polling to detect stalled jobs.
         /// Only accessed on the main thread.
@@ -964,14 +977,14 @@ namespace Unity.MultiTimelineRecorder
             // the reactive failover path handles any Worker that falls offline later.
             // We do NOT treat a failed probe as a permanent verdict — a Worker that was
             // temporarily unreachable (GC stall, restart) can still be selected by the
-            // failover path once it recovers.
-            var probeResults = new bool[workers.Count];
-            {
-                var probeTasks = new Task<bool>[workers.Count];
-                for (int pi = 0; pi < workers.Count; pi++)
-                    probeTasks[pi] = _batchDispatcher.ProbeAsync(workers[pi]);
-                probeResults = await Task.WhenAll(probeTasks).ConfigureAwait(false);
-            }
+            // failover path once it recovers (plan.md 不明点5: one-chance fallback).
+            //
+            // Minor fix (iter2): removed the redundant `new bool[workers.Count]` that
+            // was immediately overwritten by `await Task.WhenAll`.
+            var probeTasks = new Task<bool>[workers.Count];
+            for (int pi = 0; pi < workers.Count; pi++)
+                probeTasks[pi] = _batchDispatcher.ProbeAsync(workers[pi]);
+            bool[] probeResults = await Task.WhenAll(probeTasks).ConfigureAwait(false);
 
             var onlineWorkers = new List<WorkerInfo>();
             for (int pi = 0; pi < workers.Count; pi++)
@@ -985,6 +998,12 @@ namespace Unity.MultiTimelineRecorder
 
             Debug.Log(
                 $"[DistributedRecorder] 事前 health-check: {onlineWorkers.Count}/{workers.Count} Worker オンライン。");
+
+            // Retain the online list for the failover candidate pool (dispatch-worker-liveness
+            // §B2 – Major fix): the Unreachable failover path and TryDispatchNextQueuedJob
+            // use this list instead of EnabledWorkers so that pre-flight-offline Workers are
+            // not selected as failover targets during the batch.
+            _batchOnlineWorkers = onlineWorkers;
 
             // Generate a single dispatch timestamp for the whole batch so all Timeline results
             // land under the same parent folder (worker-recording-fix requirement C).
@@ -1139,25 +1158,38 @@ namespace Unity.MultiTimelineRecorder
             else
             {
                 // DispatchOneWithOverrideAsync sets:
-                //   vm.State = JobState.Queued  → WorkerBusy (transient), re-enqueue
+                //   vm.State = JobState.Queued  → WorkerBusy (transient) or Unreachable failover
                 //   vm.State = terminal          → permanent rejection / exception / retry-limit
                 //
                 // In both cases _workerInflightCount was NOT incremented (accepted==false),
-                // so we must NOT decrement it here.  We call AfterFailedDispatch which
-                // only triggers the next-job dispatch + FinalizeBatchIfDone without
-                // touching the in-flight counts.
+                // so we must NOT decrement it here.
                 if (vm.State == JobState.Queued)
                     _pendingQueue.Enqueue(vm);
 
-                // Terminal failure (permanent reject, exception, retry-limit exceeded):
-                // the Worker slot is free but OnJobTerminated must NOT be called because
-                // the in-flight count was never incremented.  Use the lightweight path that
-                // only advances the queue and checks for batch completion.
-                // (dispatch-retry-queue iteration 2 – Blocker fix: eliminates the stall where
-                // a permanently-rejected job leaves the queue frozen because no slot-release
-                // signal was ever sent.)
-                if (IsTerminalState(vm.State))
-                    AfterFailedDispatch(worker);
+                // dispatch-worker-liveness §B Blocker fix (iter2):
+                // Always call AfterFailedDispatch regardless of whether the job re-queued
+                // (Queued) or terminated (terminal).  This ensures the queue pump runs after
+                // BOTH WorkerBusy re-enqueue AND Unreachable failover re-enqueue.
+                //
+                // Without this, an Unreachable failover sets vm.State=Queued and re-enqueues
+                // but IsTerminalState(Queued)==false, so AfterFailedDispatch was not called.
+                // When the failed Worker had zero in-flight jobs (e.g. it was the only seeded
+                // Worker and fell offline before the job was accepted), no OnJobTerminated
+                // callback ever arrives, leaving the queue permanently stalled.
+                //
+                // WorkerBusy case: AfterFailedDispatch → TryDispatchNextQueuedJob(worker)
+                //   → SelectIdleWorker sees worker.inflightCount > 0 (another job is in-flight
+                //     on that Worker, that's why it was busy) and picks a different idle Worker
+                //     or returns null (all busy → queue left intact for next OnJobTerminated).
+                //   This is safe and actually improves throughput when another Worker is idle.
+                //
+                // Unreachable failover case: AfterFailedDispatch → TryDispatchNextQueuedJob
+                //   → SelectIdleWorker uses _batchOnlineWorkers with TriedWorkers exclusion,
+                //     so the same failed Worker is not re-selected.
+                //
+                // Double-pump guard: AfterFailedDispatch does NOT touch _workerInflightCount,
+                // so calling it once here (whether Queued or terminal) is safe in both cases.
+                AfterFailedDispatch(worker);
             }
 
             Repaint();
@@ -1235,8 +1267,15 @@ namespace Unity.MultiTimelineRecorder
             if (_pendingQueue.Count == 0) return;
 
             // Peek the next job to get its per-job exclusion set before selecting a Worker.
-            var nextVm  = _pendingQueue.Peek();
-            var workers = _distWorkerRegistry?.EnabledWorkers;
+            var nextVm = _pendingQueue.Peek();
+
+            // dispatch-worker-liveness §B2 (Major fix): use the pre-flight online list as
+            // the failover candidate pool so that pre-flight-offline Workers are not
+            // selected here.  Fall back to EnabledWorkers only when the batch has already
+            // been finalized (null guard; should not happen in practice).
+            var workers = (_batchOnlineWorkers != null && _batchOnlineWorkers.Count > 0)
+                ? (IReadOnlyList<WorkerInfo>)_batchOnlineWorkers
+                : _distWorkerRegistry?.EnabledWorkers;
 
             // Find an idle non-excluded Worker (prefer the freed one, fall back to any idle)
             WorkerInfo target = SelectIdleWorker(
@@ -1280,8 +1319,11 @@ namespace Unity.MultiTimelineRecorder
         /// <paramref name="triedWorkers"/> (i.e., there is still an untried candidate).
         /// Used by <see cref="TryDispatchNextQueuedJob"/> to distinguish "all busy"
         /// from "all tried + busy" so the failover terminates cleanly.
+        ///
+        /// Made <c>public static</c> for hermetic EditMode tests (same pattern as
+        /// <see cref="SelectIdleWorker"/>).
         /// </summary>
-        private static bool HasUntried(
+        public static bool HasUntried(
             IReadOnlyList<WorkerInfo> workers,
             IReadOnlyCollection<string> triedWorkers)
         {
@@ -1304,9 +1346,10 @@ namespace Unity.MultiTimelineRecorder
             if (!AreAllJobsTerminal(_dispatchedJobs)) return;
 
             _batchTransport?.Dispose();
-            _batchTransport  = null;
-            _batchDispatcher = null;
-            _batchAuth       = null;
+            _batchTransport     = null;
+            _batchDispatcher    = null;
+            _batchAuth          = null;
+            _batchOnlineWorkers = null;
 
             Debug.Log("[DistributedRecorder] 全ジョブが完了しました。バッチを終了します。");
             Repaint();
@@ -1483,8 +1526,13 @@ namespace Unity.MultiTimelineRecorder
                         $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
                         $"Worker に到達できません (tried: {string.Join(", ", vm.TriedWorkers)}).\n{result.ErrorMessage}");
 
-                    // Check whether any untried Worker still exists in the registry.
-                    var allWorkers = _distWorkerRegistry?.EnabledWorkers;
+                    // dispatch-worker-liveness §B2 (Major fix): use the pre-flight online
+                    // list as the failover candidate pool to avoid trying pre-flight-offline
+                    // Workers (which would each cost 10 s DispatchAsync /health timeout).
+                    // Fall back to EnabledWorkers only if the batch is already finalized.
+                    var allWorkers = (_batchOnlineWorkers != null && _batchOnlineWorkers.Count > 0)
+                        ? (IReadOnlyList<WorkerInfo>)_batchOnlineWorkers
+                        : _distWorkerRegistry?.EnabledWorkers;
                     bool hasMore   = HasUntried(allWorkers, vm.TriedWorkers);
                     if (hasMore)
                     {
