@@ -6,6 +6,8 @@ using System.Text;
 using System.Threading;
 using DistributedRecorder.Shared;
 using UnityEditor;
+using UnityEditor.PackageManager;
+using UnityEditor.PackageManager.Requests;
 using UnityEngine;
 
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("DistributedRecorder.Tests.EditMode")]
@@ -21,7 +23,8 @@ namespace DistributedRecorder.Worker
     ///
     /// Routes:
     ///   POST /jobs                        – submit a new job
-    ///   GET  /health                      – liveness probe
+    ///   GET  /health                      – liveness probe (unauthenticated)
+    ///   POST /align-recorder              – align com.unity.recorder version (HMAC required)
     ///   GET  /jobs/{id}                   – status
     ///   GET  /jobs/{id}/files             – output file list
     ///   GET  /jobs/{id}/files/{name}      – download a specific output file
@@ -214,6 +217,10 @@ namespace DistributedRecorder.Worker
                 else if (method == "POST" && rawUrl.Equals("/jobs", StringComparison.OrdinalIgnoreCase))
                 {
                     HandlePostJob(ctx, remoteIp);
+                }
+                else if (method == "POST" && rawUrl.Equals("/align-recorder", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleAlignRecorder(ctx, remoteIp);
                 }
                 else if (method == "GET" && TryParseJobRoute(rawUrl, out string jobId, out string subPath))
                 {
@@ -414,6 +421,143 @@ namespace DistributedRecorder.Worker
 
             var acceptedAck = new JobAck { jobId = request.jobId, accepted = true };
             RespondJson(ctx, 202, ProtocolSerializer.Serialize(acceptedAck));
+        }
+
+        // --- POST /align-recorder -----------------------------------------------
+
+        /// <summary>
+        /// Aligns <c>com.unity.recorder</c> on this Worker to the version specified
+        /// by the Master.
+        ///
+        /// Security requirements enforced here:
+        ///  1. HMAC authentication (same pattern as HandlePostJob).
+        ///  2. IP allowlist (enforced in HandleRequest before this is called).
+        ///  3. Incoming version string validated by InputValidator.IsValidRecorderVersion
+        ///     (semver whitelist only — git URLs / file: / .. / arbitrary text → 400).
+        ///  4. Target package name is NOT taken from the request; it is fixed to
+        ///     com.unity.recorder in code (manifest injection prevention).
+        ///  5. Busy check: rejected with 409 when a job is actively running.
+        ///  6. Returns 202 immediately; actual package update runs asynchronously on
+        ///     the main thread. Master re-polls /health to verify completion.
+        /// </summary>
+        private void HandleAlignRecorder(HttpListenerContext ctx, string remoteIp)
+        {
+            string body      = ReadBody(ctx);
+            byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
+
+            // 1. HMAC authentication — /align-recorder is NOT in the /health skip list.
+            string ts  = ctx.Request.Headers["X-Timestamp"] ?? string.Empty;
+            string nc  = ctx.Request.Headers["X-Nonce"]     ?? string.Empty;
+            string sig = ctx.Request.Headers["X-Signature"] ?? string.Empty;
+
+            if (!_auth.Validate("POST", "/align-recorder", bodyBytes, ts, nc, sig, out string authReason))
+            {
+                RecordAuthFailure(remoteIp);
+                Debug.LogWarning($"[WorkerHttpListener] /align-recorder auth failure from {remoteIp}: {authReason}");
+                RespondJson(ctx, 401, $"{{\"error\":\"Authentication failed: {EscapeJson(authReason)}\"}}");
+                return;
+            }
+
+            // 2. Deserialize
+            AlignRecorderRequest req;
+            try
+            {
+                req = ProtocolSerializer.Deserialize<AlignRecorderRequest>(body);
+            }
+            catch (Exception ex)
+            {
+                RespondJson(ctx, 400, $"{{\"error\":\"Invalid JSON: {EscapeJson(ex.Message)}\"}}");
+                return;
+            }
+
+            // 3. Semver whitelist — reject git URLs, file:, .., arbitrary strings
+            if (!InputValidator.IsValidRecorderVersion(req?.targetRecorderVersion ?? string.Empty))
+            {
+                Debug.LogWarning(
+                    $"[WorkerHttpListener] /align-recorder rejected invalid version string from {remoteIp}: " +
+                    $"'{EscapeJson(req?.targetRecorderVersion ?? "(null)")}'");
+                RespondJson(ctx, 400,
+                    "{\"error\":\"targetRecorderVersion must be a semver string (e.g. '5.1.2'). " +
+                    "git URLs, file: references, and path traversal are not accepted.\"}");
+                return;
+            }
+
+            // 4. Busy check — align is only safe in the prepare phase
+            if (_store.HasActiveJob)
+            {
+                string activeId = _store.ActiveJobId ?? string.Empty;
+                Debug.LogWarning(
+                    $"[WorkerHttpListener] /align-recorder rejected from {remoteIp}: " +
+                    $"Worker is busy executing job '{activeId}'.");
+                var busyAck = new AlignRecorderAck
+                {
+                    accepted = false,
+                    reason   = $"Worker is busy executing job '{EscapeJson(activeId)}'. " +
+                               "Align is only allowed in the prepare phase."
+                };
+                RespondJson(ctx, 409, ProtocolSerializer.Serialize(busyAck));
+                return;
+            }
+
+            // 5. Accept: enqueue the version-align on the main thread.
+            //    Package Manager API requires main-thread execution.
+            //    Respond 202 immediately; Master re-polls /health to confirm.
+            string targetVersion = req.targetRecorderVersion;
+            string requestorIp   = remoteIp;
+
+            // --- Perform package update on the main thread ---
+            // PackageManager.Client.Add is main-thread-only.
+            // We use EditorApplication.update polling (same pattern as
+            // RecorderPackageInstaller.StartInstall) but inline here to avoid
+            // a cross-asmdef dependency on DistributedRecorder.Editor.Setup.
+            MainThreadDispatcher.Enqueue(() =>
+            {
+                // Audit log — no secrets, no tokens
+                Debug.Log(
+                    $"[WorkerHttpListener] /align-recorder: request from {requestorIp} " +
+                    $"at {DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ} " +
+                    $"→ target com.unity.recorder@{targetVersion}");
+
+                // Package name is hard-coded here; never taken from the request (manifest-injection prevention).
+                const string recorderPackage = "com.unity.recorder";
+                string packageId = $"{recorderPackage}@{targetVersion}";
+
+                AddRequest addRequest = Client.Add(packageId);
+                Debug.Log($"[WorkerHttpListener] /align-recorder: Client.Add({packageId}) started.");
+
+                // Poll in EditorApplication.update to avoid blocking the main thread.
+                EditorApplication.update += PollAdd;
+
+                void PollAdd()
+                {
+                    if (addRequest == null || !addRequest.IsCompleted) return;
+
+                    EditorApplication.update -= PollAdd;
+
+                    if (addRequest.Status == StatusCode.Success)
+                    {
+                        // Invalidate VersionChecker cache so next /health reflects the new version.
+                        VersionChecker.InvalidateCache();
+                        Debug.Log(
+                            $"[WorkerHttpListener] /align-recorder: com.unity.recorder aligned to " +
+                            $"{targetVersion} successfully. Domain reload may follow.");
+                    }
+                    else
+                    {
+                        string err = addRequest.Error?.message ?? "Unknown error";
+                        // Invalidate cache anyway in case partial success changed the version.
+                        VersionChecker.InvalidateCache();
+                        Debug.LogError(
+                            $"[WorkerHttpListener] /align-recorder: failed to align " +
+                            $"com.unity.recorder to {targetVersion}. " +
+                            $"Verify the version exists in the Unity registry. " +
+                            $"Error: {err}");
+                    }
+                }
+            });
+
+            var ack = new AlignRecorderAck { accepted = true };
+            RespondJson(ctx, 202, ProtocolSerializer.Serialize(ack));
         }
 
         private void HandleGetJob(HttpListenerContext ctx, string remoteIp,
