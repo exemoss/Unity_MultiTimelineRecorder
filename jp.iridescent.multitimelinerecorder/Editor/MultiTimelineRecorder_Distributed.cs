@@ -76,6 +76,27 @@ namespace Unity.MultiTimelineRecorder
         private readonly Dictionary<string, string> _alignStatusMessages =
             new Dictionary<string, string>();
 
+        // --- worker-registry-management: self-detection cache -------------------
+
+        /// <summary>
+        /// Local addresses of this machine, collected once and cached for the session.
+        /// Refreshed when the user presses "バージョン確認" (same cadence as version badges)
+        /// and on first draw of the distributed section.
+        /// Never null after first access; read via <see cref="LocalAddressCache"/>.
+        /// </summary>
+        private IReadOnlyList<string> _localAddressCache;
+
+        /// <summary>Lazy-initialised local address cache.</summary>
+        private IReadOnlyList<string> LocalAddressCache
+        {
+            get
+            {
+                if (_localAddressCache == null)
+                    _localAddressCache = SelfHostDetector.CollectLocalAddresses();
+                return _localAddressCache;
+            }
+        }
+
         // EditorPrefs keys (MTR window scope)
         private const string PrefKeyDistMode     = "MTR.DistributedMode";
         private const string PrefKeyDistRegistry = "MTR.DistributedRegistryGuid";
@@ -231,20 +252,31 @@ namespace Unity.MultiTimelineRecorder
                         "Assets > Create > DistributedRecorder > WorkerRegistry で作成できます。",
                         MessageType.Info);
                 }
-                else if (enabledWorkerCount == 0)
+                else if (_distWorkerRegistry.workers == null || _distWorkerRegistry.workers.Count == 0)
                 {
                     EditorGUILayout.HelpBox(
-                        "有効な Worker がレジストリに登録されていません。",
+                        "Worker がレジストリに登録されていません。",
                         MessageType.Warning);
                 }
                 else
                 {
-                    EditorGUILayout.LabelField(
-                        $"有効 Worker: {enabledWorkerCount} 台",
-                        EditorStyles.miniLabel);
+                    if (enabledWorkerCount == 0)
+                    {
+                        EditorGUILayout.HelpBox(
+                            "有効な Worker がレジストリに登録されていません。",
+                            MessageType.Warning);
+                    }
+                    else
+                    {
+                        EditorGUILayout.LabelField(
+                            $"有効 Worker: {enabledWorkerCount} 台",
+                            EditorStyles.miniLabel);
+                    }
 
-                    // ── Worker version badges (worker-recorder-version-align) ──
-                    DrawWorkerVersionBadges(_distWorkerRegistry.EnabledWorkers);
+                    // ── Worker version badges + self badge + delete button ────
+                    // Pass all workers (enabled and disabled) so delete buttons
+                    // are accessible for disabled entries too.
+                    DrawWorkerVersionBadges(_distWorkerRegistry.workers);
                 }
 
                 // ── Lightweight target count (no CollectRenderTargets / AssetDatabase) ──
@@ -413,8 +445,18 @@ namespace Unity.MultiTimelineRecorder
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField("Worker バージョン", EditorStyles.boldLabel, GUILayout.Width(140));
             if (GUILayout.Button("バージョン確認", GUILayout.Width(90)))
+            {
+                // Refresh local address cache at the same time as version probing
+                // (DHCP address may have changed since last probe).
+                _localAddressCache = SelfHostDetector.CollectLocalAddresses();
                 _ = RefreshAllWorkerVersionsAsync(workers);
+            }
             EditorGUILayout.EndHorizontal();
+
+            // Iterate over a snapshot to allow safe removal during the loop.
+            // DrawWorkerVersionBadges receives EnabledWorkers (read-only projection),
+            // so we use _distWorkerRegistry.workers directly for the delete operation.
+            WorkerInfo workerToDelete = null;
 
             foreach (var worker in workers)
             {
@@ -422,6 +464,19 @@ namespace Unity.MultiTimelineRecorder
 
                 // Worker name
                 EditorGUILayout.LabelField(worker.displayName, GUILayout.Width(120));
+
+                // ── Self badge (worker-registry-management) ─────────────────
+                bool isSelf = SelfHostDetector.IsSelf(worker.host, LocalAddressCache);
+                if (isSelf)
+                {
+                    var prevColor = GUI.color;
+                    GUI.color = new Color(1f, 0.85f, 0.2f); // yellow-amber
+                    var selfBadgeContent = new GUIContent(
+                        "自分自身(self)",
+                        "Master 自身を指しています。Worker 用途には別マシンの listener が必要です");
+                    EditorGUILayout.LabelField(selfBadgeContent, EditorStyles.miniLabel, GUILayout.Width(90));
+                    GUI.color = prevColor;
+                }
 
                 bool isAligning = _aligningWorkers.Contains(worker.displayName);
 
@@ -512,7 +567,73 @@ namespace Unity.MultiTimelineRecorder
                     EditorGUILayout.LabelField("未確認 → 「バージョン確認」を押してください", EditorStyles.miniLabel);
                 }
 
+                // ── Delete button (worker-registry-management) ───────────────
+                // Note: the `enabled` toggle already exists on WorkerInfo (see WorkerRegistryAsset.cs).
+                // Use "無効化 (enabled=false)" to temporarily exclude a Worker from dispatch
+                // without losing its registration. Use "外す" to permanently remove it.
+                GUILayout.FlexibleSpace();
+                var prevCol = GUI.color;
+                GUI.color = new Color(1f, 0.45f, 0.45f); // light-red
+                if (GUILayout.Button("外す", GUILayout.Width(40)))
+                    workerToDelete = worker;
+                GUI.color = prevCol;
+
                 EditorGUILayout.EndHorizontal();
+            }
+
+            // Perform deferred deletion outside the foreach to avoid collection-modified errors.
+            if (workerToDelete != null && _distWorkerRegistry != null)
+                DeleteWorkerFromRegistry(_distWorkerRegistry, workerToDelete);
+        }
+
+        /// <summary>
+        /// Shows a confirmation dialog and, if confirmed, removes <paramref name="worker"/>
+        /// from the registry and persists the change.
+        ///
+        /// In-flight check: if the Worker currently has jobs in-flight, the user is warned
+        /// but deletion is still allowed (Q3 decision: warn and permit).  Removing an
+        /// in-flight Worker means its results will still arrive (the HTTP connection is
+        /// already open), but the registry entry is gone so it will not receive new jobs
+        /// after the current batch completes.
+        /// </summary>
+        private void DeleteWorkerFromRegistry(WorkerRegistryAsset registry, WorkerInfo worker)
+        {
+            // Check in-flight status
+            _workerInflightCount.TryGetValue(worker.displayName, out int inflightCount);
+            bool hasInflightJobs = inflightCount > 0;
+
+            string message = hasInflightJobs
+                ? $"Worker '{worker.displayName}' ({worker.host}:{worker.port}) を登録から外しますか?\n\n" +
+                  $"⚠ この Worker には現在 {inflightCount} 件の実行中ジョブがあります。\n" +
+                  "削除しても実行中のジョブは継続しますが、結果回収後に再登録が必要です。"
+                : $"Worker '{worker.displayName}' ({worker.host}:{worker.port}) を登録から外しますか?\n\n" +
+                  "この操作は元に戻せません。再登録するには SetupHub から再度追加してください。";
+
+            bool confirmed = EditorUtility.DisplayDialog(
+                "Worker を登録から外す",
+                message,
+                "外す",
+                "キャンセル");
+
+            if (!confirmed)
+                return;
+
+            // Remove from registry using pure helper (reference equality)
+            int removed = WorkerRegistryOperations.RemoveWorker(registry.workers, worker);
+            if (removed > 0)
+            {
+                // Clear version status cache for the removed Worker
+                _workerVersionStatus.Remove(worker.displayName);
+                _alignStatusMessages.Remove(worker.displayName);
+                _aligningWorkers.Remove(worker.displayName);
+
+                // Persist to disk
+                EditorUtility.SetDirty(registry);
+                AssetDatabase.SaveAssets();
+
+                Debug.Log($"[DistributedRecorder] Worker を登録から外しました: " +
+                          $"{worker.displayName} ({worker.host}:{worker.port})");
+                Repaint();
             }
         }
 
