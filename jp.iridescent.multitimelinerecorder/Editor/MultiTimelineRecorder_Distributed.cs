@@ -827,20 +827,55 @@ namespace Unity.MultiTimelineRecorder
             IReadOnlyList<WorkerInfo> workers,
             WorkerInfo preferredWorker,
             IReadOnlyDictionary<string, int> inflightCounts)
+            => SelectIdleWorker(workers, preferredWorker, inflightCounts, excludedDisplayNames: null);
+
+        /// <summary>
+        /// Selects the first idle Worker from <paramref name="workers"/> that is not
+        /// in <paramref name="excludedDisplayNames"/>.  Tries <paramref name="preferredWorker"/>
+        /// first (if not excluded), then falls back to the first non-excluded Worker with
+        /// 0 in-flight jobs.
+        ///
+        /// Used by the dispatch-worker-liveness failover path to prevent re-selecting a
+        /// Worker that already failed for this job (per-job <c>TriedWorkers</c> set).
+        ///
+        /// Made <c>public static</c> for hermetic EditMode tests.
+        /// </summary>
+        /// <param name="workers">Ordered list of available Workers.</param>
+        /// <param name="preferredWorker">
+        /// The Worker that was freed most recently.  Tried first unless excluded.
+        /// May be <c>null</c> (treated as no preference).
+        /// </param>
+        /// <param name="inflightCounts">
+        /// Map of workerDisplayName → number of currently in-flight jobs.
+        /// Workers absent from the map are treated as having 0 in-flight jobs.
+        /// </param>
+        /// <param name="excludedDisplayNames">
+        /// Set of worker display names to skip entirely.  Pass <c>null</c> or empty to
+        /// apply no exclusions (identical to the 3-argument overload).
+        /// </param>
+        public static WorkerInfo SelectIdleWorker(
+            IReadOnlyList<WorkerInfo> workers,
+            WorkerInfo preferredWorker,
+            IReadOnlyDictionary<string, int> inflightCounts,
+            IReadOnlyCollection<string> excludedDisplayNames)
         {
             if (workers == null || workers.Count == 0) return null;
 
-            // Check preferred Worker first
-            if (preferredWorker != null)
+            bool IsExcluded(string name) =>
+                excludedDisplayNames != null && excludedDisplayNames.Contains(name);
+
+            // Check preferred Worker first (only if not excluded and idle)
+            if (preferredWorker != null && !IsExcluded(preferredWorker.displayName))
             {
                 int pc = 0;
                 inflightCounts?.TryGetValue(preferredWorker.displayName, out pc);
                 if (pc == 0) return preferredWorker;
             }
 
-            // Fall back: first idle Worker in registry order
+            // Fall back: first non-excluded idle Worker in registry order
             foreach (var w in workers)
             {
+                if (IsExcluded(w.displayName)) continue;
                 int count = 0;
                 inflightCounts?.TryGetValue(w.displayName, out count);
                 if (count == 0)
@@ -877,6 +912,13 @@ namespace Unity.MultiTimelineRecorder
         /// in-flight job at a time; when a job completes/fails the next queued job is
         /// dispatched to the newly-freed Worker.  This eliminates 503-busy failures when
         /// Worker count is less than Timeline count.
+        ///
+        /// dispatch-worker-liveness change: performs a parallel pre-flight health probe
+        /// (HMAC, 3 s timeout) before seeding; offline Workers are excluded from the
+        /// initial seed.  If all Workers are offline every job is immediately marked
+        /// Unreachable and the batch is finalized without entering the event loop.
+        /// The reactive failover path (DispatchOneWithOverrideAsync) covers the case
+        /// where a Worker that passed the probe becomes unreachable later.
         /// </summary>
         private async Task StartDistributedRecordingInternalAsync(List<DistributedTimelineJob> targets)
         {
@@ -915,6 +957,34 @@ namespace Unity.MultiTimelineRecorder
             _batchTransport  = new HttpTransport(_batchAuth);
             _batchDispatcher = new JobDispatcher(_batchTransport, ProjectPaths.ProjectRoot);
 
+            // ── Pre-flight liveness probe (dispatch-worker-liveness §A) ─────────
+            // Probe all registered Workers in parallel (HMAC transport, 3 s timeout).
+            // Workers that do not respond are excluded from the initial seed;
+            // the reactive failover path handles any Worker that falls offline later.
+            // We do NOT treat a failed probe as a permanent verdict — a Worker that was
+            // temporarily unreachable (GC stall, restart) can still be selected by the
+            // failover path once it recovers.
+            var probeResults = new bool[workers.Count];
+            {
+                var probeTasks = new Task<bool>[workers.Count];
+                for (int pi = 0; pi < workers.Count; pi++)
+                    probeTasks[pi] = _batchDispatcher.ProbeAsync(workers[pi]);
+                probeResults = await Task.WhenAll(probeTasks).ConfigureAwait(false);
+            }
+
+            var onlineWorkers = new List<WorkerInfo>();
+            for (int pi = 0; pi < workers.Count; pi++)
+            {
+                if (probeResults[pi])
+                    onlineWorkers.Add(workers[pi]);
+                else
+                    Debug.LogWarning(
+                        $"[DistributedRecorder] 事前 health-check: '{workers[pi].displayName}' はオフラインです。初期 seed から除外します。");
+            }
+
+            Debug.Log(
+                $"[DistributedRecorder] 事前 health-check: {onlineWorkers.Count}/{workers.Count} Worker オンライン。");
+
             // Generate a single dispatch timestamp for the whole batch so all Timeline results
             // land under the same parent folder (worker-recording-fix requirement C).
             // Format: yyyyMMddHHmmss (14 digits).
@@ -924,6 +994,7 @@ namespace Unity.MultiTimelineRecorder
             // All jobs start as Queued (visible in UI immediately).
             // We build one VM per target (no pre-assignment); Worker assignment happens
             // at dispatch time (first available Worker).
+            _dispatchedJobs.Clear();
             _pendingQueue.Clear();
             _jobWorkerMap.Clear();
             _workerInflightCount.Clear();
@@ -983,7 +1054,8 @@ namespace Unity.MultiTimelineRecorder
                     LocalOutputDir = outDir,
                     Worker         = null,   // assigned at dispatch time
                     PendingRequest = request,
-                    RetryCount     = 0
+                    RetryCount     = 0,
+                    TriedWorkers   = new HashSet<string>()
                 };
 
                 _dispatchedJobs.Add(vm);
@@ -992,10 +1064,32 @@ namespace Unity.MultiTimelineRecorder
 
             Repaint();
 
-            // ── Initial dispatch: one job per Worker (parallel seed) ─────────────
+            // ── All Workers offline: fail every job immediately ──────────────────
+            // Do this after building VMs so the UI shows the jobs (with Unreachable
+            // state) before the batch is finalized.  FinalizeBatchIfDone will then
+            // clean up services immediately since the queue is empty and all VMs are
+            // terminal.
+            if (onlineWorkers.Count == 0)
+            {
+                Debug.LogError(
+                    "[DistributedRecorder] オンラインの Worker が 0 台です。全ジョブを Unreachable に設定します。");
+                _pendingQueue.Clear();
+                foreach (var vm in _dispatchedJobs)
+                {
+                    if (!IsTerminalState(vm.State))
+                        vm.State = JobState.Unreachable;
+                }
+                FinalizeBatchIfDone();
+                Repaint();
+                return;
+            }
+
+            // ── Initial dispatch: one job per online Worker (parallel seed) ──────
             // Use sequential await so override dialogs (hash/version) are shown on
             // the main thread one at a time and _sessionSkip flags propagate correctly.
-            foreach (var worker in workers)
+            // Only online Workers are seeded; the event-driven scheduler handles the
+            // remaining queue via OnJobTerminated/AfterFailedDispatch.
+            foreach (var worker in onlineWorkers)
             {
                 if (_pendingQueue.Count == 0) break;
                 var vm = _pendingQueue.Dequeue();
@@ -1128,24 +1222,76 @@ namespace Unity.MultiTimelineRecorder
         /// dispatch-retry-queue iteration 2: uses <see cref="SelectIdleWorker"/> so the
         /// scheduler is not locked to a single freed Worker; fixes the multi-Worker
         /// "preferredWorker fixed" weakness noted in the review (Major-2).
+        ///
+        /// dispatch-worker-liveness change: peeks the next job's <c>TriedWorkers</c> set
+        /// and passes it to <see cref="SelectIdleWorker"/> as the exclusion set, so the
+        /// failover path never re-selects a Worker that already failed for this job.
+        /// If no non-excluded idle Worker exists (all online Workers for this job tried),
+        /// the job is terminally failed here without re-queuing it (prevents infinite loop).
         /// </summary>
         private void TryDispatchNextQueuedJob(WorkerInfo preferredWorker)
         {
             if (_pendingQueue.Count == 0) return;
 
-            // Find an idle Worker (prefer the freed one, fall back to any idle)
+            // Peek the next job to get its per-job exclusion set before selecting a Worker.
+            var nextVm  = _pendingQueue.Peek();
             var workers = _distWorkerRegistry?.EnabledWorkers;
-            WorkerInfo target = SelectIdleWorker(workers, preferredWorker, _workerInflightCount);
+
+            // Find an idle non-excluded Worker (prefer the freed one, fall back to any idle)
+            WorkerInfo target = SelectIdleWorker(
+                workers, preferredWorker, _workerInflightCount, nextVm.TriedWorkers);
+
             if (target == null)
             {
-                // All Workers are busy – leave the item in the queue; it will be retried
-                // when the next Worker slot is freed via OnJobTerminated/AfterFailedDispatch.
+                // Two sub-cases:
+                // (a) All Workers busy but some are not yet excluded → leave in queue; retry
+                //     on next OnJobTerminated/AfterFailedDispatch.
+                // (b) All non-excluded Workers tried → no further candidates; fail this job
+                //     immediately to avoid the job stalling in the queue forever.
+                bool hasUntried = HasUntried(workers, nextVm.TriedWorkers);
+                if (hasUntried)
+                {
+                    // (a) At least one Worker is not yet excluded, but currently busy.
+                    // Leave the item in the queue; it will be retried when the next slot frees.
+                    return;
+                }
+
+                // (b) Every Worker has already been tried for this job.
+                _pendingQueue.Dequeue(); // remove from queue
+                if (!IsTerminalState(nextVm.State))
+                {
+                    nextVm.State = JobState.Unreachable;
+                    Debug.LogError(
+                        $"[DistributedRecorder] ジョブ {(nextVm.JobId.Length >= 8 ? nextVm.JobId.Substring(0, 8) : nextVm.JobId)}… :" +
+                        " すべての Worker を試みましたが到達できませんでした。Unreachable に設定します。");
+                }
+                FinalizeBatchIfDone();
                 return;
             }
 
-            var nextVm = _pendingQueue.Dequeue();
+            _pendingQueue.Dequeue(); // now safe to dequeue — target is confirmed
             // Fire-and-forget; exceptions are caught inside DispatchQueuedJobAsync
             _ = DispatchQueuedJobAsync(target, nextVm);
+        }
+
+        /// <summary>
+        /// Returns <c>true</c> if any Worker in <paramref name="workers"/> is NOT in
+        /// <paramref name="triedWorkers"/> (i.e., there is still an untried candidate).
+        /// Used by <see cref="TryDispatchNextQueuedJob"/> to distinguish "all busy"
+        /// from "all tried + busy" so the failover terminates cleanly.
+        /// </summary>
+        private static bool HasUntried(
+            IReadOnlyList<WorkerInfo> workers,
+            IReadOnlyCollection<string> triedWorkers)
+        {
+            if (workers == null) return false;
+            if (triedWorkers == null || triedWorkers.Count == 0) return workers.Count > 0;
+            foreach (var w in workers)
+            {
+                if (!triedWorkers.Contains(w.displayName))
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -1317,11 +1463,45 @@ namespace Unity.MultiTimelineRecorder
                 }
 
                 case DispatchFailReason.Unreachable:
-                    vm.State = JobState.Unreachable;
+                {
+                    // dispatch-worker-liveness §B – Unreachable failover:
+                    // Add the failed Worker to the per-job exclusion set so it is not
+                    // selected again for this job.  If an untried online Worker remains,
+                    // set vm.State = Queued and return false — the caller
+                    // (DispatchQueuedJobAsync) will re-enqueue, and AfterFailedDispatch
+                    // → TryDispatchNextQueuedJob will select a different Worker.
+                    // If all Workers have now been tried, set the terminal Unreachable
+                    // state here.
+                    //
+                    // vm.TriedWorkers is initialized in StartDistributedRecordingInternalAsync;
+                    // defensive null-guard in case this method is called from another path.
+                    if (vm.TriedWorkers == null)
+                        vm.TriedWorkers = new HashSet<string>();
+                    vm.TriedWorkers.Add(worker.displayName);
                     Debug.LogWarning(
                         $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
-                        $"Worker に到達できません。\n{result.ErrorMessage}");
+                        $"Worker に到達できません (tried: {string.Join(", ", vm.TriedWorkers)}).\n{result.ErrorMessage}");
+
+                    // Check whether any untried Worker still exists in the registry.
+                    var allWorkers = _distWorkerRegistry?.EnabledWorkers;
+                    bool hasMore   = HasUntried(allWorkers, vm.TriedWorkers);
+                    if (hasMore)
+                    {
+                        // Failover: requeue for dispatch to a different Worker.
+                        vm.State = JobState.Queued;
+                        Debug.Log(
+                            $"[DistributedRecorder] ジョブ {jobIdShort}…: 別 Worker へ failover します。");
+                        // Caller re-enqueues when State == Queued.
+                        return false;
+                    }
+
+                    // All Workers tried — terminal failure.
+                    vm.State = JobState.Unreachable;
+                    Debug.LogError(
+                        $"[DistributedRecorder] ジョブ {jobIdShort}…: " +
+                        "すべての Worker を試みましたが到達できませんでした。Unreachable に設定します。");
                     return false;
+                }
 
                 case DispatchFailReason.WorkerBusy:
                 {
@@ -1922,5 +2102,19 @@ namespace Unity.MultiTimelineRecorder
         /// <see cref="MultiTimelineRecorder.MaxJobRetries"/> the job is Failed.
         /// </summary>
         public int RetryCount;
+
+        // ── dispatch-worker-liveness fields ─────────────────────────────────────
+
+        /// <summary>
+        /// Set of Worker display names that have already been tried for this job and
+        /// should not be selected again (per-job blacklist for Unreachable failover).
+        ///
+        /// Populated by the failover path in
+        /// <see cref="MultiTimelineRecorder.DispatchOneWithOverrideAsync"/> when a
+        /// dispatch attempt returns <see cref="DispatchFailReason.Unreachable"/>.
+        ///
+        /// Master-local only; never sent over the wire.
+        /// </summary>
+        public HashSet<string> TriedWorkers;
     }
 }
