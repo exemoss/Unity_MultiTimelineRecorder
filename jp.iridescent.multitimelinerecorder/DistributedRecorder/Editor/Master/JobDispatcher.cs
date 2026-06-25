@@ -17,9 +17,12 @@ namespace DistributedRecorder.Master
     {
         private readonly ITransport    _transport;
         private readonly string        _projectRoot;
-        private static readonly TimeSpan HealthTimeout       = TimeSpan.FromSeconds(10);
-        private static readonly TimeSpan DispatchTimeout     = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan HealthTimeout        = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan DispatchTimeout      = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan LivenessProbeTimeout = TimeSpan.FromSeconds(3);
+        private static readonly TimeSpan AlignSendTimeout     = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan AlignHealthPollInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan AlignHealthPollTimeout  = TimeSpan.FromSeconds(120);
 
         public JobDispatcher(ITransport transport, string projectRoot)
         {
@@ -56,6 +59,198 @@ namespace DistributedRecorder.Master
             {
                 return false;
             }
+        }
+
+        // --- Recorder version align (worker-recorder-version-align) ---------------
+
+        /// <summary>
+        /// Result of an align operation.
+        /// </summary>
+        public enum AlignResult
+        {
+            /// <summary>Worker /health confirmed the target version.</summary>
+            Success,
+            /// <summary>Worker rejected the request (busy, invalid version, auth fail, etc.).</summary>
+            Rejected,
+            /// <summary>Worker accepted (202) but health re-poll timed out before confirming the version.</summary>
+            Timeout,
+            /// <summary>Network error reaching the Worker.</summary>
+            NetworkError
+        }
+
+        /// <summary>
+        /// Sends a <c>POST /align-recorder</c> command to <paramref name="worker"/> requesting
+        /// that it install <c>com.unity.recorder@<paramref name="targetVersion"/></c>, then
+        /// re-polls <c>GET /health</c> until the Worker reports the target version or a timeout
+        /// elapses.
+        ///
+        /// Design (worker-recorder-version-align B5):
+        ///  - Worker returns 202 immediately (domain reload may follow).
+        ///  - Master polls /health every <see cref="AlignHealthPollInterval"/> for up to
+        ///    <see cref="AlignHealthPollTimeout"/>.
+        ///  - /health is the source of truth for the installed version.
+        ///
+        /// Security: HMAC headers are injected by <see cref="ITransport.PostJsonAsync"/>.
+        /// The caller must have validated <paramref name="targetVersion"/> with
+        /// <see cref="InputValidator.IsValidRecorderVersion"/> before calling this method.
+        ///
+        /// NOTE: Do NOT use ConfigureAwait(false) here. This method is called from the
+        /// Unity Editor main thread (DrawDistributedSection → button click) and continuations
+        /// must remain on the main thread to allow Unity API calls (Repaint, etc.).
+        /// </summary>
+        /// <param name="worker">Target Worker.</param>
+        /// <param name="targetVersion">Semver version string validated by InputValidator.</param>
+        /// <param name="progressCallback">
+        /// Optional callback invoked on each poll attempt with a status message.
+        /// Called on the awaiting (main) thread. May be null.
+        /// </param>
+        /// <returns>
+        /// (<see cref="AlignResult"/>, errorMessage) — errorMessage is empty on Success.
+        /// </returns>
+        public async Task<(AlignResult result, string message)> AlignRecorderAsync(
+            WorkerInfo worker,
+            string targetVersion,
+            Action<string> progressCallback = null)
+        {
+            if (worker == null)       throw new ArgumentNullException(nameof(worker));
+            if (targetVersion == null) throw new ArgumentNullException(nameof(targetVersion));
+
+            // --- Send POST /align-recorder ---
+            var alignReq  = new AlignRecorderRequest { targetRecorderVersion = targetVersion };
+            string reqJson = ProtocolSerializer.Serialize(alignReq);
+
+            string ackJson;
+            try
+            {
+                ackJson = await _transport.PostJsonAsync(
+                    $"{worker.BaseUrl}/align-recorder", reqJson, AlignSendTimeout);
+            }
+            catch (TransportException ex)
+            {
+                // 409 = busy; surface reason from body when available
+                if (!string.IsNullOrEmpty(ex.Body))
+                {
+                    try
+                    {
+                        var errAck = ProtocolSerializer.Deserialize<AlignRecorderAck>(ex.Body);
+                        if (errAck != null && !errAck.accepted)
+                            return (AlignResult.Rejected, errAck.reason);
+                    }
+                    catch { }
+                }
+                return (AlignResult.NetworkError, ex.Message);
+            }
+
+            AlignRecorderAck ack;
+            try
+            {
+                ack = ProtocolSerializer.Deserialize<AlignRecorderAck>(ackJson);
+            }
+            catch
+            {
+                return (AlignResult.NetworkError, $"Failed to deserialize AlignRecorderAck: {ackJson}");
+            }
+
+            if (!ack.accepted)
+                return (AlignResult.Rejected, ack.reason);
+
+            // --- Poll /health until target version confirmed or timeout ---
+            var deadline = DateTime.UtcNow.Add(AlignHealthPollTimeout);
+            int attempt  = 0;
+            while (DateTime.UtcNow < deadline)
+            {
+                attempt++;
+                // Wait between polls (skip first wait to check immediately after 202)
+                if (attempt > 1)
+                    await Task.Delay(AlignHealthPollInterval);
+
+                progressCallback?.Invoke(
+                    $"Waiting for Worker '{worker.displayName}' to align " +
+                    $"com.unity.recorder → {targetVersion} (attempt {attempt})…");
+
+                string healthJson;
+                try
+                {
+                    healthJson = await _transport.GetAsync(
+                        $"{worker.BaseUrl}/health", HealthTimeout);
+                }
+                catch (TransportException)
+                {
+                    // Worker may be in the middle of a domain reload — keep polling
+                    continue;
+                }
+
+                WorkerHealth health;
+                try
+                {
+                    health = ProtocolSerializer.Deserialize<WorkerHealth>(healthJson);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (string.Equals(health.recorderVersion, targetVersion, StringComparison.Ordinal))
+                {
+                    return (AlignResult.Success,
+                        $"Worker '{worker.displayName}' aligned to com.unity.recorder@{targetVersion}.");
+                }
+            }
+
+            return (AlignResult.Timeout,
+                $"Timed out waiting for Worker '{worker.displayName}' to align " +
+                $"com.unity.recorder to {targetVersion} " +
+                $"(waited {AlignHealthPollTimeout.TotalSeconds}s). " +
+                "Check Worker Console for Package Manager errors.");
+        }
+
+        // --- Worker health comparison (worker-recorder-version-align A) -----------
+
+        /// <summary>
+        /// Fetches <c>/health</c> from <paramref name="worker"/> and returns a
+        /// <see cref="WorkerVersionStatus"/> indicating whether versions match the
+        /// local Master.
+        ///
+        /// Used by the UI to show version badges before dispatch.
+        /// Timeout matches the short liveness probe (3 s).
+        /// </summary>
+        public async Task<WorkerVersionStatus> GetWorkerVersionStatusAsync(WorkerInfo worker)
+        {
+            if (worker == null) throw new ArgumentNullException(nameof(worker));
+
+            WorkerHealth health;
+            try
+            {
+                string json = await _transport.GetAsync(
+                    $"{worker.BaseUrl}/health", LivenessProbeTimeout);
+                health = ProtocolSerializer.Deserialize<WorkerHealth>(json);
+            }
+            catch (TransportException ex)
+            {
+                return new WorkerVersionStatus
+                {
+                    Worker          = worker,
+                    Reachable       = false,
+                    ErrorMessage    = ex.Message
+                };
+            }
+
+            string masterRecorder = VersionChecker.RecorderVersion;
+            string masterUnity    = VersionChecker.UnityVersion;
+
+            return new WorkerVersionStatus
+            {
+                Worker                = worker,
+                Reachable             = true,
+                WorkerRecorderVersion = health.recorderVersion,
+                WorkerUnityVersion    = health.unityVersion,
+                MasterRecorderVersion = masterRecorder,
+                MasterUnityVersion    = masterUnity,
+                RecorderMismatch      = !string.Equals(
+                    health.recorderVersion, masterRecorder, StringComparison.Ordinal),
+                UnityMismatch         = !string.Equals(
+                    health.unityVersion, masterUnity, StringComparison.Ordinal)
+            };
         }
 
         /// <summary>
@@ -237,5 +432,47 @@ namespace DistributedRecorder.Master
 
         public static DispatchResult Fail(string jobId, DispatchFailReason reason, string message)
             => new DispatchResult { JobId = jobId, Success = false, FailReason = reason, ErrorMessage = message };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Worker version status (worker-recorder-version-align)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Version comparison result for a single Worker, returned by
+    /// <see cref="JobDispatcher.GetWorkerVersionStatusAsync"/>.
+    ///
+    /// Used by the UI to show version badges and the align button.
+    /// </summary>
+    public class WorkerVersionStatus
+    {
+        /// <summary>The Worker whose status this describes.</summary>
+        public WorkerInfo Worker;
+
+        /// <summary>True when /health responded within the probe timeout.</summary>
+        public bool Reachable;
+
+        /// <summary>Error message when <see cref="Reachable"/> is false.</summary>
+        public string ErrorMessage = string.Empty;
+
+        // --- Versions reported by the Worker ---
+        public string WorkerRecorderVersion = string.Empty;
+        public string WorkerUnityVersion    = string.Empty;
+
+        // --- Versions on the Master ---
+        public string MasterRecorderVersion = string.Empty;
+        public string MasterUnityVersion    = string.Empty;
+
+        /// <summary>True when Worker com.unity.recorder version differs from Master.</summary>
+        public bool RecorderMismatch;
+
+        /// <summary>
+        /// True when Worker Unity Editor version differs from Master.
+        /// Unity version cannot be aligned via PackageManager; UI shows warning only.
+        /// </summary>
+        public bool UnityMismatch;
+
+        /// <summary>True when Worker is reachable and all versions match.</summary>
+        public bool FullMatch => Reachable && !RecorderMismatch && !UnityMismatch;
     }
 }
