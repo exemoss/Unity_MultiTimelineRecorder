@@ -523,8 +523,11 @@ namespace DistributedRecorder.Shared
         /// arbitrary package names, and empty strings — preventing manifest injection
         /// if the string were ever passed to Client.Add.
         /// </summary>
+        // Use \A and \z (absolute string anchors), NOT ^ and $: in .NET, $ also matches
+        // the position BEFORE a trailing newline, so "5.1.2\n" would slip through ^...$ and
+        // could smuggle a newline into Client.Add / a manifest write. \z forbids that.
         private static readonly Regex SemverPattern =
-            new Regex(@"^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$", RegexOptions.Compiled);
+            new Regex(@"\A\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?\z", RegexOptions.Compiled);
 
         /// <summary>
         /// Returns true when <paramref name="version"/> is a valid registry semver string
