@@ -1,7 +1,3 @@
-// Allow DistributedRecorder test assembly to access internal helpers.
-// Refs: movie-recorder-support §F (ResolveOutputRelativePath test access)
-[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("DistributedRecorder.Tests.EditMode")]
-
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -21,6 +17,10 @@ using Unity.MultiTimelineRecorder.RecorderEditors;
 using Unity.MultiTimelineRecorder.Utilities;
 using UnityEditor.SceneManagement;
 using UnityEngine.SceneManagement;
+
+// Allow DistributedRecorder test assembly to access internal helpers.
+// Refs: movie-recorder-support §F (ResolveOutputRelativePath test access)
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("DistributedRecorder.Tests.EditMode")]
 
 namespace Unity.MultiTimelineRecorder
 {
