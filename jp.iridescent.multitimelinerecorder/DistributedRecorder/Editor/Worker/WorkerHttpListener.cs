@@ -317,11 +317,20 @@ namespace DistributedRecorder.Worker
 
             bool masterHasGitCommit = !string.IsNullOrEmpty(request.gitCommit)
                                       && InputValidator.IsValidGitCommitSha(request.gitCommit);
+            bool verifiedByCommit = false; // set true when commit comparison passes (hash check skipped)
 
-            if (masterHasGitCommit && !request.skipHashCheck)
+            if (masterHasGitCommit)
             {
-                // Attempt git commit comparison on this Worker.
-                if (GitInfo.TryGetHeadCommit(_projectRoot, out string workerCommit, out string gitErr))
+                if (request.skipHashCheck)
+                {
+                    // skipHashCheck is set (user approved Send anyway after commit mismatch).
+                    // Proceed without any comparison; emit a warning so the log records it.
+                    Debug.LogWarning(
+                        $"[Worker] commit check skipped (skipHashCheck=true). Master commit: {request.gitCommit}. " +
+                        "Worker のローカル版プロジェクトで録画します。");
+                    verifiedByCommit = true;
+                }
+                else if (GitInfo.TryGetHeadCommit(_projectRoot, out string workerCommit, out string gitErr))
                 {
                     // Both sides have commits: compare them.
                     if (!string.Equals(workerCommit, request.gitCommit, StringComparison.OrdinalIgnoreCase))
@@ -345,36 +354,19 @@ namespace DistributedRecorder.Worker
                     }
                     // Commits match – skip content-hash check entirely.
                     Debug.Log($"[Worker] git commit matched ({request.gitCommit.Substring(0, System.Math.Min(8, request.gitCommit.Length))}…). Hash check skipped.");
-                    // Jump directly to duplicate check below.
+                    verifiedByCommit = true;
                 }
                 else
                 {
                     // Worker cannot get its own commit (not a git repo, git missing, etc.).
-                    // Fall through to content-hash path so we don't reject valid non-git Workflows.
+                    // Fall through to content-hash path.
                     Debug.LogWarning(
                         $"[Worker] git rev-parse HEAD failed – falling back to content-hash: {gitErr}");
-                    goto contentHashFallback;
                 }
             }
-            else if (masterHasGitCommit && request.skipHashCheck)
-            {
-                // skipHashCheck is set (user approved Send anyway after commit mismatch).
-                // Proceed without any comparison; emit a warning so the log records it.
-                Debug.LogWarning(
-                    $"[Worker] commit check skipped (skipHashCheck=true). Master commit: {request.gitCommit}. " +
-                    "Worker のローカル版プロジェクトで録画します。");
-                // Jump directly to duplicate check below.
-            }
-            else
-            {
-                // No gitCommit from Master (old Master or non-git repo): content-hash path.
-                goto contentHashFallback;
-            }
+            // else: masterHasGitCommit == false → content-hash path below
 
-            // Successful commit check (or skipHashCheck): skip content-hash, go to dup check.
-            goto duplicateCheck;
-
-            contentHashFallback:
+            if (!verifiedByCommit)
             {
                 // Content-hash fallback (deprecated, kept for wire compat with older Masters/Workers).
                 bool isMtrJob = !string.IsNullOrEmpty(request.timelineAssetPath);
@@ -445,8 +437,6 @@ namespace DistributedRecorder.Worker
                         "Worker のローカル版プロジェクトで録画します。");
                 }
             }
-
-            duplicateCheck:
 
             // Duplicate check
             if (_store.TryGetEntry(request.jobId, out _))
