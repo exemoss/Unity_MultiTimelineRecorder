@@ -64,6 +64,14 @@ namespace DistributedRecorder.Master
 
         // --- private ------------------------------------------------------------
 
+        // dispatch-progress-feedback: explicit connect timeout for the progress-stream
+        // HTTP handshake.  The HttpClient itself uses Timeout.InfiniteTimeSpan (set in
+        // the constructor) so that the long-lived NDJSON body read is never cancelled by
+        // a client-level timeout.  We add a separate short CTS (3 s) that covers only
+        // the SendAsync / ResponseHeadersRead phase; once headers arrive the CTS is no
+        // longer in use and streaming continues indefinitely via the outer `ct`.
+        private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(3);
+
         private async Task StreamLoopAsync(string baseUrl, string jobId, CancellationToken ct)
         {
             string url     = $"{baseUrl}/jobs/{jobId}/progress";
@@ -77,10 +85,20 @@ namespace DistributedRecorder.Master
             HttpResponseMessage response;
             try
             {
+                // Link the connect-timeout CTS with the outer stop token so that Stop()
+                // cancels the connect phase too.
+                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                connectCts.CancelAfter(ConnectTimeout);
+
                 response = await _client.SendAsync(request,
-                    HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+                    HttpCompletionOption.ResponseHeadersRead, connectCts.Token).ConfigureAwait(false);
             }
-            catch (Exception ex) when (!ct.IsCancellationRequested)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Outer stop requested — exit silently.
+                return;
+            }
+            catch (Exception ex)
             {
                 OnError?.Invoke($"Progress stream connect failed for job '{jobId}': {ex.Message}");
                 return;

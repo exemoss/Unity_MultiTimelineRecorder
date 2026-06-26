@@ -2159,9 +2159,10 @@ namespace Unity.MultiTimelineRecorder
                 string healthJson;
                 try
                 {
+                    // dispatch-progress-feedback: shortened from 10s → 3s to match LivenessProbeTimeout.
                     healthJson = await healthTransport.GetAsync(
                         $"{worker.BaseUrl}/health",
-                        TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+                        TimeSpan.FromSeconds(3)).ConfigureAwait(false);
                 }
                 finally
                 {

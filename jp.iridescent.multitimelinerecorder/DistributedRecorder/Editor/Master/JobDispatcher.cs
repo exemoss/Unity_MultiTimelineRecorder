@@ -10,7 +10,7 @@ namespace DistributedRecorder.Master
 {
     /// <summary>
     /// Dispatches a <see cref="JobRequest"/> to a specific Worker after:
-    ///   1. Checking Worker liveness (GET /health, 10s timeout → MVP-A1).
+    ///   1. Checking Worker liveness (GET /health, 3s timeout → dispatch-progress-feedback).
     ///   2. Comparing Unity and Recorder versions (MVP-A3).
     ///   3. Computing and injecting the local project hash.
     ///
@@ -20,7 +20,12 @@ namespace DistributedRecorder.Master
     {
         private readonly ITransport    _transport;
         private readonly string        _projectRoot;
-        private static readonly TimeSpan HealthTimeout        = TimeSpan.FromSeconds(10);
+
+        // dispatch-progress-feedback: shortened from 10s → 3s so a dead/filtered Worker
+        // is detected quickly during DispatchAsync liveness check and failsafe health.
+        // The pre-flight LivenessProbeTimeout was already 3s; this makes DispatchAsync
+        // consistent with it and prevents the event-loop from stalling on each dead Worker.
+        private static readonly TimeSpan HealthTimeout        = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan DispatchTimeout      = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan LivenessProbeTimeout = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan AlignSendTimeout     = TimeSpan.FromSeconds(15);
@@ -277,7 +282,7 @@ namespace DistributedRecorder.Master
             if (worker == null)  throw new ArgumentNullException(nameof(worker));
             if (request == null) throw new ArgumentNullException(nameof(request));
 
-            // 1. Liveness check (MVP-A1: 10s timeout → unreachable)
+            // 1. Liveness check (dispatch-progress-feedback: 3s timeout – shortened from 10s)
             WorkerHealth health;
             try
             {
