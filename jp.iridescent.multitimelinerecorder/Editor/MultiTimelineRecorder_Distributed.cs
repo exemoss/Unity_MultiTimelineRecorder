@@ -1316,6 +1316,21 @@ namespace Unity.MultiTimelineRecorder
                 return;
             }
 
+            // ── dispatch-progress-feedback A: progress bar for pre-flight phase ──
+            // The bar is shown from OpenScene through the initial job seed.
+            // try-finally guarantees ClearProgressBar() even on early returns or exceptions.
+            // The bar is cleared before entering the async event loop (recording phase)
+            // so the per-job state UI (Repaint) takes over from that point on.
+            //
+            // D-constraint: DisplayCancelableProgressBar / OpenScene / Repaint are
+            // main-thread-only. This method is awaited on the Unity synchronization
+            // context (no ConfigureAwait(false) on any await in this method), so all
+            // Unity API calls here remain on the main thread.
+            const string k_BarTitle = "分散処理を準備中";
+            bool         cancelled  = false;
+
+            try
+            {
             // ── F10: open target scenes before dispatch ──────────────────────────
             // Ensure the scenes referenced by the targets are open so that CollectRenderTargets
             // ran against the correct (loaded) scene state.  If a scene is not loaded the job's
@@ -1330,9 +1345,28 @@ namespace Unity.MultiTimelineRecorder
                     scenePaths.Add(job.ScenePath);
             }
 
+            var scenePathList = new List<string>(scenePaths);
             string currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().path;
-            foreach (string scenePath in scenePaths)
+            for (int si = 0; si < scenePathList.Count; si++)
             {
+                string scenePath = scenePathList[si];
+                float  sceneProgress = scenePathList.Count > 0
+                    ? (float)si / scenePathList.Count * 0.2f  // 0–20 % range
+                    : 0f;
+
+                // Show the bar BEFORE the blocking OpenScene call so the user sees
+                // progress while the scene loads (the bar itself won't animate during
+                // the synchronous load, but it is visible and dismissable via cancel).
+                cancelled = EditorUtility.DisplayCancelableProgressBar(
+                    k_BarTitle,
+                    $"対象シーンを開いています… ({si + 1}/{scenePathList.Count})",
+                    sceneProgress);
+                if (cancelled)
+                {
+                    Debug.Log("[DistributedRecorder] プログレスバーでキャンセルされました（シーン読込前）。処理を中断します。");
+                    return;
+                }
+
                 if (!string.Equals(scenePath, currentScene, StringComparison.OrdinalIgnoreCase))
                 {
                     Debug.Log($"[DistributedRecorder] 対象 scene を開きます: {scenePath}");
@@ -1346,6 +1380,13 @@ namespace Unity.MultiTimelineRecorder
             // Warn when any recording-target scene (.unity) or timeline (.playable) asset
             // has uncommitted edits.  Recorder config assets (recorderConfigJson) are
             // transferred in-request, so their dirty state is irrelevant here.
+            cancelled = EditorUtility.DisplayCancelableProgressBar(
+                k_BarTitle, "未コミットの変更を確認しています…", 0.2f);
+            if (cancelled)
+            {
+                Debug.Log("[DistributedRecorder] プログレスバーでキャンセルされました（dirty チェック前）。処理を中断します。");
+                return;
+            }
             WarnIfTargetAssetsDirty(targets);
 
             if (_distWorkerRegistry == null)
@@ -1385,22 +1426,52 @@ namespace Unity.MultiTimelineRecorder
             // temporarily unreachable (GC stall, restart) can still be selected by the
             // failover path once it recovers (plan.md 不明点5: one-chance fallback).
             //
-            // Minor fix (iter2): removed the redundant `new bool[workers.Count]` that
-            // was immediately overwritten by `await Task.WhenAll`.
-            var probeTasks = new Task<bool>[workers.Count];
-            for (int pi = 0; pi < workers.Count; pi++)
-                probeTasks[pi] = _batchDispatcher.ProbeAsync(workers[pi]);
+            // dispatch-progress-feedback A+D: probe uses Task.WhenAny loop instead of
+            // Task.WhenAll so we can update the progress bar each time a Worker responds.
+            // All awaits in this method are WITHOUT ConfigureAwait(false) so continuations
+            // remain on the Unity main thread (same rule as before; comment preserved below).
+            //
             // NOTE: must NOT use ConfigureAwait(false) here. The continuation below calls
             // Unity main-thread-only APIs (Repaint, dispatch, AssetDatabase via DispatchQueuedJobAsync).
             // ConfigureAwait(false) resumed the continuation on a ThreadPool thread, causing
             // "Repaint can only be called from the main thread" and aborting the whole batch
             // (jobs stuck Queued). Resume on the captured Unity synchronization context instead.
-            bool[] probeResults = await Task.WhenAll(probeTasks);
+            var probeTasks = new List<Task<bool>>(workers.Count);
+            for (int pi = 0; pi < workers.Count; pi++)
+                probeTasks.Add(_batchDispatcher.ProbeAsync(workers[pi]));
+
+            // Wait for each probe to complete and update the bar.
+            // We maintain a mapping Task→WorkerInfo via index.
+            var pendingProbes   = new List<Task<bool>>(probeTasks);
+            var probeResultMap  = new bool[workers.Count];
+            int completedProbes = 0;
+            while (pendingProbes.Count > 0)
+            {
+                Task<bool> finished = await Task.WhenAny(pendingProbes);
+                pendingProbes.Remove(finished);
+                completedProbes++;
+
+                // Map back to worker index via reference equality.
+                int workerIdx = probeTasks.IndexOf(finished);
+                if (workerIdx >= 0)
+                    probeResultMap[workerIdx] = await finished;
+
+                float probeProgress = 0.25f + (float)completedProbes / workers.Count * 0.5f; // 25–75 %
+                cancelled = EditorUtility.DisplayCancelableProgressBar(
+                    k_BarTitle,
+                    $"Worker を確認しています… ({completedProbes}/{workers.Count})",
+                    probeProgress);
+                if (cancelled)
+                {
+                    Debug.Log("[DistributedRecorder] プログレスバーでキャンセルされました（probe 中）。処理を中断します。");
+                    return;
+                }
+            }
 
             var onlineWorkers = new List<WorkerInfo>();
             for (int pi = 0; pi < workers.Count; pi++)
             {
-                if (probeResults[pi])
+                if (probeResultMap[pi])
                     onlineWorkers.Add(workers[pi]);
                 else
                     Debug.LogWarning(
@@ -1529,17 +1600,47 @@ namespace Unity.MultiTimelineRecorder
             // the main thread one at a time and _sessionSkip flags propagate correctly.
             // Only online Workers are seeded; the event-driven scheduler handles the
             // remaining queue via OnJobTerminated/AfterFailedDispatch.
+            //
+            // dispatch-progress-feedback A: update the bar for each initial dispatch.
+            // The bar is cleared AFTER the seed loop exits so the recording phase (async
+            // event loop driven by EditorApplication.update + OnJobTerminated) uses
+            // the per-job state UI (Repaint) from that point on, not the progress bar.
+            int seedDispatched = 0;
             foreach (var worker in onlineWorkers)
             {
                 if (_pendingQueue.Count == 0) break;
                 var vm = _pendingQueue.Dequeue();
+
+                cancelled = EditorUtility.DisplayCancelableProgressBar(
+                    k_BarTitle,
+                    $"ジョブを送信しています… ({seedDispatched + 1}/{onlineWorkers.Count})",
+                    0.75f + (float)seedDispatched / onlineWorkers.Count * 0.25f); // 75–100 %
+                if (cancelled)
+                {
+                    // Re-enqueue the dequeued VM so it is not lost.
+                    _pendingQueue.Enqueue(vm);
+                    vm.State = JobState.Queued;
+                    Debug.Log("[DistributedRecorder] プログレスバーでキャンセルされました（ジョブ送信前）。処理を中断します。");
+                    return;
+                }
+
                 await DispatchQueuedJobAsync(worker, vm);
+                seedDispatched++;
                 Repaint();
             }
 
             // Remaining jobs stay in _pendingQueue; they are dispatched by
             // OnJobTerminated (via StartProgressMonitorWithScheduler completion callbacks).
             // No transport.Dispose() here — deferred to FinalizeBatchIfDone.
+
+            } // end try
+            finally
+            {
+                // dispatch-progress-feedback A: always clear the bar, whether we returned
+                // early (cancel, error, 0-worker) or completed the seed loop normally.
+                // The recording phase does NOT use the progress bar.
+                EditorUtility.ClearProgressBar();
+            }
         }
 
         // -----------------------------------------------------------------------
