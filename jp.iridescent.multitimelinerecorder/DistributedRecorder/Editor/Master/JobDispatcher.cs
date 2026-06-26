@@ -3,6 +3,9 @@ using System.Threading.Tasks;
 using DistributedRecorder.Shared;
 using UnityEngine;
 
+// GitInfo (commit-based-project-verification) lives in DistributedRecorder.Shared
+// (same namespace) – no extra using needed.
+
 namespace DistributedRecorder.Master
 {
     /// <summary>
@@ -297,10 +300,24 @@ namespace DistributedRecorder.Master
                 return DispatchResult.Fail(request.jobId, DispatchFailReason.VersionMismatch, versionReason);
             }
 
-            // 3. Inject local version, project hash, and override flags
+            // 3. Inject local version, project hash, override flags, and git commit
             request.masterUnityVersion    = VersionChecker.UnityVersion;
             request.masterRecorderVersion = VersionChecker.RecorderVersion;
             request.skipHashCheck         = skipHashCheck;
+
+            // Inject HEAD git commit (commit-based-project-verification).
+            // On failure (not a git repo, git not installed) we proceed with empty gitCommit
+            // so the Worker falls back to hash-based verification.
+            if (GitInfo.TryGetHeadCommit(_projectRoot, out string headCommit, out string gitError))
+            {
+                request.gitCommit = headCommit;
+            }
+            else
+            {
+                request.gitCommit = string.Empty;
+                Debug.LogWarning(
+                    $"[JobDispatcher] git rev-parse HEAD failed – falling back to content-hash: {gitError}");
+            }
 
             try
             {
@@ -379,8 +396,21 @@ namespace DistributedRecorder.Master
             if (httpStatusCode == 503 || reason.IndexOf("Worker is busy", StringComparison.OrdinalIgnoreCase) >= 0)
                 return DispatchResult.Fail(jobId, DispatchFailReason.WorkerBusy, reason);
 
-            // Hash mismatch: Worker reason contains "Project hash mismatch"
-            if (reason.IndexOf("Project hash mismatch", StringComparison.OrdinalIgnoreCase) >= 0)
+            // Commit mismatch (commit-based-project-verification):
+            // Worker reason contains "commit mismatch" (set by WorkerHttpListener when
+            // gitCommit comparison fails). Checked before hash-mismatch so the more
+            // specific reason wins when both keywords appear.
+            if (reason.IndexOf("commit mismatch", StringComparison.OrdinalIgnoreCase) >= 0)
+                return DispatchResult.Fail(jobId, DispatchFailReason.CommitMismatch, reason);
+
+            // Hash mismatch: Worker reason contains "hash mismatch" (content-hash fallback).
+            // Bug fix (commit-based-project-verification):
+            //   Previously matched "Project hash mismatch" which did NOT match the actual
+            //   Worker reason strings "job-scope hash mismatch (...)" and "project hash
+            //   mismatch (...)" (lower-case "project"/"job-scope" prefix).  Now we match
+            //   the common suffix "hash mismatch" (case-insensitive) which covers both
+            //   real Worker reason formats.
+            if (reason.IndexOf("hash mismatch", StringComparison.OrdinalIgnoreCase) >= 0)
                 return DispatchResult.Fail(jobId, DispatchFailReason.HashMismatch, reason);
 
             // Version mismatch: VersionChecker.MatchesLocal builds reasons that
@@ -389,6 +419,7 @@ namespace DistributedRecorder.Master
                 return DispatchResult.Fail(jobId, DispatchFailReason.VersionMismatch, reason);
 
             // Everything else (duplicate job-id, unknown errors, etc.) is a permanent rejection.
+            // ErrorMessage is preserved in the result so the UI can display it (no silent failure).
             return DispatchResult.Fail(jobId, DispatchFailReason.WorkerRejected, reason);
         }
     }
@@ -401,8 +432,8 @@ namespace DistributedRecorder.Master
         Unreachable,
         VersionMismatch,
         /// <summary>
-        /// Worker rejected the job because its local project hash differs from
-        /// the Master's.  The Master UI should prompt the user for a
+        /// Worker rejected the job because its local project hash (content-based SHA-256)
+        /// differs from the Master's.  The Master UI should prompt the user for a
         /// "Send anyway" override (hash-mismatch override flow).
         /// </summary>
         HashMismatch,
@@ -417,7 +448,14 @@ namespace DistributedRecorder.Master
         ///
         /// Added in dispatch-retry-queue to separate busy-503 from permanent-409.
         /// </summary>
-        WorkerBusy
+        WorkerBusy,
+        /// <summary>
+        /// Worker rejected the job because its HEAD git commit differs from the
+        /// Master's.  Added in commit-based-project-verification.
+        /// The Master UI should prompt the user for a "Send anyway" override,
+        /// showing master-commit vs worker-commit in the dialog body.
+        /// </summary>
+        CommitMismatch,
     }
 
     public class DispatchResult
