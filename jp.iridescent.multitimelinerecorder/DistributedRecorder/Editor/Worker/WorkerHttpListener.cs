@@ -330,7 +330,7 @@ namespace DistributedRecorder.Worker
                         "Worker のローカル版プロジェクトで録画します。");
                     verifiedByCommit = true;
                 }
-                else if (GitInfo.TryGetHeadCommit(_projectRoot, out string workerCommit, out string gitErr))
+                else if (DistributedRecorder.Shared.GitInfo.TryGetHeadCommit(_projectRoot, out string workerCommit, out string gitErr))
                 {
                     // Both sides have commits: compare them.
                     if (!string.Equals(workerCommit, request.gitCommit, StringComparison.OrdinalIgnoreCase))
