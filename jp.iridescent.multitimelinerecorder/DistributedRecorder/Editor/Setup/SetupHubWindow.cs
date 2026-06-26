@@ -452,6 +452,12 @@ namespace DistributedRecorder.Setup
                 "DistributedRecorder > Start/Stop Worker (Debug) と同等の操作です。",
                 MessageType.None);
 
+            // ------------------------------------------------------------------
+            // Firewall: open Worker listen port (Windows only)
+            // ------------------------------------------------------------------
+
+            DrawFirewallSection();
+
             if (GUILayout.Button("ジョブ投入 Window を開く", GUILayout.Height(22)))
                 EditorApplication.ExecuteMenuItem("Window/Distributed Recorder");
 
@@ -467,6 +473,39 @@ namespace DistributedRecorder.Setup
                 SampleSceneFactory.CreateSampleSceneFromMenu();
             if (GUILayout.Button("Step 2: サンプル Recorder ジョブを作成", GUILayout.Height(26)))
                 SampleRecorderJobFactory.CreateSampleRecorderJobFromMenu();
+        }
+
+        // ------------------------------------------------------------------
+        // Section: Firewall port opener
+        // ------------------------------------------------------------------
+
+        private void DrawFirewallSection()
+        {
+            EditorGUILayout.Space(4);
+            EditorGUILayout.LabelField("ファイアウォール設定", EditorStyles.boldLabel);
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+
+#if UNITY_EDITOR_WIN
+            // Read the configured port from the same default WorkerConfig uses.
+            int workerPort = new WorkerConfig().Port;
+
+            EditorGUILayout.HelpBox(
+                $"Worker のリッスンポート (TCP {workerPort}) が Windows Firewall でブロックされている場合に\n" +
+                $"受信許可ルールを追加します。管理者昇格 (UAC) が 1 回必要です。\n" +
+                $"プロファイル: private, domain のみ（Public は開きません）。",
+                MessageType.Info);
+
+            if (GUILayout.Button($"受信 TCP {workerPort} をファイアウォールで許可する", GUILayout.Height(26)))
+            {
+                FirewallPortOpener.OpenPortWithConfirmation(workerPort);
+            }
+#else
+            EditorGUILayout.HelpBox(
+                "ファイアウォール自動設定は Windows Editor のみ対応しています。",
+                MessageType.Info);
+#endif
+
+            EditorGUILayout.EndVertical();
         }
 
         // ------------------------------------------------------------------
