@@ -102,7 +102,14 @@ namespace DistributedRecorder.Shared
         /// </summary>
         public string scenePath = string.Empty;
 
-        /// <summary>SHA-256 hex digest of the project snapshot sent by Master.</summary>
+        /// <summary>
+        /// SHA-256 hex digest of the whole-Assets project snapshot sent by Master.
+        ///
+        /// <b>Deprecated (commit-based-project-verification):</b>
+        /// Retained for wire compatibility with older Workers.  When <see cref="gitCommit"/>
+        /// is non-empty on both sides the Worker uses commit comparison and does not
+        /// compute this hash.  Do not remove – removing it is a breaking protocol change.
+        /// </summary>
         public string projectHash = string.Empty;
 
         /// <summary>Master's Unity version string (e.g. "6000.2.10f1").</summary>
@@ -221,12 +228,32 @@ namespace DistributedRecorder.Shared
         /// <summary>
         /// Job-scoped SHA-256 hash covering only the Timeline asset + its dependencies
         /// + the scene file (not the whole Assets tree).
-        /// When non-empty and <see cref="timelineAssetPath"/> is non-empty,
-        /// Worker computes the same hash locally and compares it instead of
-        /// using the whole-Assets <see cref="projectHash"/>.
-        /// Validated: 64-char hex (SHA-256).
+        ///
+        /// <b>Deprecated (commit-based-project-verification):</b>
+        /// Retained for wire compatibility with older Masters/Workers that do not yet
+        /// send <see cref="gitCommit"/>. When <see cref="gitCommit"/> is non-empty on
+        /// both sides, the Worker uses commit comparison instead and ignores this field.
+        /// Validated: 64-char hex (SHA-256) when non-empty.
         /// </summary>
         public string jobScopeHash = string.Empty;
+
+        /// <summary>
+        /// HEAD commit SHA of the git repository containing the Unity project.
+        /// Populated by the Master at dispatch time via <c>git rev-parse HEAD</c>.
+        ///
+        /// When non-empty on both sides the Worker compares this value against its
+        /// own HEAD commit, replacing the content-hash fallback (<see cref="jobScopeHash"/>
+        /// / <see cref="projectHash"/>).  When empty (non-git repo or git unavailable),
+        /// the Worker falls back to hash-based comparison or skip+warn as appropriate.
+        ///
+        /// Wire compatibility: field is at the end of the DTO; JsonUtility ignores unknown
+        /// fields on older workers (empty = default string) so old workers will fall back
+        /// to the hash path automatically.
+        ///
+        /// Validated: 7–64 hex chars or empty string (empty = fallback path).
+        /// Added in commit-based-project-verification.
+        /// </summary>
+        public string gitCommit = string.Empty;
 
         /// <summary>
         /// Full <see cref="Unity.MultiTimelineRecorder.MultiRecorderConfig.RecorderConfigItem"/>

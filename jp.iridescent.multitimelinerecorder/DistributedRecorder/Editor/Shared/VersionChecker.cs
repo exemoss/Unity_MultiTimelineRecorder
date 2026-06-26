@@ -34,11 +34,19 @@ namespace DistributedRecorder.Shared
         {
             get
             {
-                if (_cachedRecorderVersion != null)
+                // Bug fix (commit-based-project-verification F9):
+                // The previous guard was `_cachedRecorderVersion != null`, which treated the
+                // empty string "" as a resolved value.  When PackageManager is not ready at
+                // startup, ResolveRecorderVersion() returns "" and the cache permanently stored
+                // it — subsequent queries always returned "" and caused VersionMismatch errors.
+                // Fix: only cache non-empty results; empty/null triggers re-resolution next call.
+                if (!string.IsNullOrEmpty(_cachedRecorderVersion))
                     return _cachedRecorderVersion;
 
-                _cachedRecorderVersion = ResolveRecorderVersion();
-                return _cachedRecorderVersion;
+                string resolved = ResolveRecorderVersion();
+                if (!string.IsNullOrEmpty(resolved))
+                    _cachedRecorderVersion = resolved;
+                return resolved;
             }
         }
 

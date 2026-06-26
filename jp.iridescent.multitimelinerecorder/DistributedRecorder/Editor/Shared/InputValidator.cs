@@ -106,13 +106,41 @@ namespace DistributedRecorder.Shared
                 return false;
             }
 
-            // projectHash – hex string, 64 chars (SHA-256)
-            if (!ValidateRequiredString(request.projectHash, "projectHash", 64, out reason))
-                return false;
-            if (request.projectHash.Length != 64 || !IsHexString(request.projectHash))
+            // gitCommit – optional 7–64 hex (git HEAD SHA); validated only when non-empty.
+            // Added in commit-based-project-verification; empty = use legacy hash fallback.
+            if (!string.IsNullOrEmpty(request.gitCommit))
             {
-                reason = "projectHash must be a 64-character hexadecimal SHA-256 digest.";
-                return false;
+                if (!IsValidGitCommitSha(request.gitCommit))
+                {
+                    reason = "gitCommit must be a 7–64 character hexadecimal git commit SHA, or empty.";
+                    return false;
+                }
+            }
+
+            // projectHash – SHA-256 hex digest (whole-Assets).
+            // Deprecated in commit-based-project-verification but retained for wire compat.
+            // Required when gitCommit is empty (legacy path); optional when gitCommit is set.
+            bool hasGitCommit = !string.IsNullOrEmpty(request.gitCommit);
+            if (!hasGitCommit)
+            {
+                // Legacy path: projectHash is still the primary verification token.
+                if (!ValidateRequiredString(request.projectHash, "projectHash", 64, out reason))
+                    return false;
+                if (request.projectHash.Length != 64 || !IsHexString(request.projectHash))
+                {
+                    reason = "projectHash must be a 64-character hexadecimal SHA-256 digest.";
+                    return false;
+                }
+            }
+            else if (!string.IsNullOrEmpty(request.projectHash))
+            {
+                // gitCommit is set but projectHash is also provided (fallback field).
+                // Validate it when present so it cannot be used as an injection vector.
+                if (request.projectHash.Length != 64 || !IsHexString(request.projectHash))
+                {
+                    reason = "projectHash, when provided, must be a 64-character hexadecimal SHA-256 digest.";
+                    return false;
+                }
             }
 
             // masterUnityVersion / masterRecorderVersion
@@ -528,6 +556,26 @@ namespace DistributedRecorder.Shared
         // could smuggle a newline into Client.Add / a manifest write. \z forbids that.
         private static readonly Regex SemverPattern =
             new Regex(@"\A\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?\z", RegexOptions.Compiled);
+
+        // Git commit SHA whitelist: 7–64 hex chars.
+        // \A...\z anchors prevent trailing-newline bypass (same defence as SemverPattern).
+        private static readonly Regex CommitShaPattern =
+            new Regex(@"\A[0-9a-fA-F]{7,64}\z", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Returns true when <paramref name="sha"/> is a valid git commit SHA
+        /// (7–64 hexadecimal characters). Empty string is NOT valid here (use the
+        /// non-empty guard at call site).
+        ///
+        /// Uses \A and \z anchors to prevent trailing-newline injection.
+        /// Added in commit-based-project-verification.
+        /// </summary>
+        public static bool IsValidGitCommitSha(string sha)
+        {
+            if (string.IsNullOrEmpty(sha))
+                return false;
+            return CommitShaPattern.IsMatch(sha);
+        }
 
         /// <summary>
         /// Returns true when <paramref name="version"/> is a valid registry semver string
