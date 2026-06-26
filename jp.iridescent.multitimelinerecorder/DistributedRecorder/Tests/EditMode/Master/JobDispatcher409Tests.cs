@@ -98,9 +98,15 @@ namespace DistributedRecorder.Tests.Master
         [Test]
         public async Task DispatchAsync_409HashMismatch_ReturnsHashMismatch()
         {
+            // Use the actual reason string format produced by WorkerHttpListener:
+            //   "job-scope hash mismatch (local=..., master=...)"
+            // Previously this test used "Project hash mismatch" which did NOT match the
+            // real Worker reason string, so ClassifyRejection returned WorkerRejected instead.
+            // Fixed in commit-based-project-verification by matching "hash mismatch" substring.
             string ackJson = MakeRejectedAckJson("job-hash-test",
-                "Project hash mismatch (local=aaaa, master=bbbb). " +
-                "両 PC を git pull で揃えるか Send anyway で続行してください。");
+                "job-scope hash mismatch (local=aaaa1111, master=bbbb2222). " +
+                "両 PC を `git pull` で同じコミットに揃えるか、" +
+                "Master 側で上書き許可（Send anyway）で続行してください。");
 
             var transport = new FakeTransport(
                 healthJson:  MakeHealthJson(),
@@ -113,7 +119,7 @@ namespace DistributedRecorder.Tests.Master
             Assert.IsFalse(result.Success);
             Assert.AreEqual(DispatchFailReason.HashMismatch, result.FailReason,
                 $"Expected HashMismatch but got {result.FailReason}. ErrorMessage: {result.ErrorMessage}");
-            StringAssert.Contains("Project hash mismatch", result.ErrorMessage);
+            StringAssert.Contains("hash mismatch", result.ErrorMessage);
         }
 
         // -----------------------------------------------------------------------
@@ -209,18 +215,78 @@ namespace DistributedRecorder.Tests.Master
         [Test]
         public void ClassifyRejection_409HashMismatch_NotMisrouted()
         {
-            // Confirm that HTTP 409 + hash-mismatch reason is still classified as HashMismatch,
-            // not WorkerBusy, after the 503 check was added.
+            // Use the actual Worker reason format ("job-scope hash mismatch ...") to
+            // verify ClassifyRejection correctly maps it to HashMismatch (not WorkerBusy).
+            // Previously "Project hash mismatch" was the test string but the real Worker
+            // sends "job-scope hash mismatch" which did NOT match the old keyword.
             var ack = new JobAck
             {
                 jobId    = "j",
                 accepted = false,
-                reason   = "Project hash mismatch (local=aaaa, master=bbbb)."
+                reason   = "job-scope hash mismatch (local=aaaa, master=bbbb)."
             };
             var result = JobDispatcher.ClassifyRejection("j", ack, httpStatusCode: 409);
 
             Assert.AreEqual(DispatchFailReason.HashMismatch, result.FailReason,
-                "409 + hash-mismatch reason must not be misrouted to WorkerBusy.");
+                "409 + 'job-scope hash mismatch' reason must map to HashMismatch (not WorkerBusy).");
+        }
+
+        [Test]
+        public void ClassifyRejection_409ProjectHashMismatch_NotMisrouted()
+        {
+            // The legacy "project hash mismatch" reason (whole-Assets hash path) must
+            // also map to HashMismatch.
+            var ack = new JobAck
+            {
+                jobId    = "j",
+                accepted = false,
+                reason   = "project hash mismatch (local=aaaa, master=bbbb)."
+            };
+            var result = JobDispatcher.ClassifyRejection("j", ack, httpStatusCode: 409);
+
+            Assert.AreEqual(DispatchFailReason.HashMismatch, result.FailReason,
+                "409 + 'project hash mismatch' reason must map to HashMismatch.");
+        }
+
+        // -----------------------------------------------------------------------
+        // Commit mismatch 409: DispatchFailReason.CommitMismatch
+        // -----------------------------------------------------------------------
+
+        [Test]
+        public async Task DispatchAsync_409CommitMismatch_ReturnsCommitMismatch()
+        {
+            // commit-based-project-verification: Worker returns "commit mismatch" reason.
+            string ackJson = MakeRejectedAckJson("job-commit-test",
+                "commit mismatch (worker=abc12345…, master=def67890…). " +
+                "Worker を同じコミットに `git pull` で揃えるか、Master 側で Send anyway で続行してください。");
+
+            var transport = new FakeTransport(
+                healthJson:  MakeHealthJson(),
+                postAction:  _ => throw MakeTransportException409(ackJson));
+
+            var dispatcher = new JobDispatcher(transport, _tempProjectRoot);
+            var result = await dispatcher.DispatchAsync(
+                MakeWorker(), MakeRequest("job-commit-test"), skipVersionCheck: true);
+
+            Assert.IsFalse(result.Success);
+            Assert.AreEqual(DispatchFailReason.CommitMismatch, result.FailReason,
+                $"Expected CommitMismatch but got {result.FailReason}. ErrorMessage: {result.ErrorMessage}");
+            StringAssert.Contains("commit mismatch", result.ErrorMessage);
+        }
+
+        [Test]
+        public void ClassifyRejection_CommitMismatch_MapsToCommitMismatch()
+        {
+            var ack = new JobAck
+            {
+                jobId    = "j",
+                accepted = false,
+                reason   = "commit mismatch (worker=abc12345…, master=def67890…)."
+            };
+            var result = JobDispatcher.ClassifyRejection("j", ack, httpStatusCode: 409);
+
+            Assert.AreEqual(DispatchFailReason.CommitMismatch, result.FailReason,
+                "'commit mismatch' reason must map to CommitMismatch, not HashMismatch or WorkerRejected.");
         }
 
         [Test]

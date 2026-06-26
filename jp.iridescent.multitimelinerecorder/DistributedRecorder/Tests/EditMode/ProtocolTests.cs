@@ -344,6 +344,104 @@ namespace DistributedRecorder.Tests
         }
 
         // -----------------------------------------------------------------------
+        // InputValidator – gitCommit (commit-based-project-verification)
+        // -----------------------------------------------------------------------
+
+        [Test]
+        public void Validate_GitCommit_Empty_WithProjectHash_Passes()
+        {
+            // Empty gitCommit = legacy path; projectHash is still required.
+            var req = MakeValidRequest();
+            req.gitCommit = string.Empty;
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsTrue(ok, reason);
+        }
+
+        [Test]
+        public void Validate_GitCommit_Valid40hex_ProjectHashOptional_Passes()
+        {
+            // gitCommit present + valid → projectHash is optional.
+            var req = MakeValidRequest();
+            req.gitCommit   = new string('a', 40);
+            req.projectHash = string.Empty; // no longer required
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsTrue(ok, reason);
+        }
+
+        [Test]
+        public void Validate_GitCommit_Valid64hex_Passes()
+        {
+            var req = MakeValidRequest();
+            req.gitCommit = new string('f', 64);
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsTrue(ok, reason);
+        }
+
+        [Test]
+        public void Validate_GitCommit_Invalid_NonHex_Fails()
+        {
+            var req = MakeValidRequest();
+            req.gitCommit = "g" + new string('0', 39); // 'g' is not hex
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsFalse(ok, "Non-hex gitCommit must be rejected.");
+            StringAssert.Contains("gitCommit", reason);
+        }
+
+        [Test]
+        public void Validate_GitCommit_TooShort_Fails()
+        {
+            var req = MakeValidRequest();
+            req.gitCommit = "abc123"; // 6 chars, below minimum 7
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsFalse(ok, "gitCommit shorter than 7 chars must be rejected.");
+        }
+
+        [Test]
+        public void Validate_GitCommit_TooLong_Fails()
+        {
+            var req = MakeValidRequest();
+            req.gitCommit = new string('a', 65); // 65 chars, above maximum 64
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsFalse(ok, "gitCommit longer than 64 chars must be rejected.");
+        }
+
+        [Test]
+        public void Validate_GitCommit_WithTrailingNewline_Fails()
+        {
+            // \z anchor must prevent trailing-newline injection.
+            var req = MakeValidRequest();
+            req.gitCommit = new string('a', 40) + "\n";
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsFalse(ok, "gitCommit with trailing newline must be rejected by \\z anchor.");
+        }
+
+        [Test]
+        public void IsValidGitCommitSha_Valid_ReturnsTrue()
+        {
+            Assert.IsTrue(InputValidator.IsValidGitCommitSha(new string('a', 40)));
+            Assert.IsTrue(InputValidator.IsValidGitCommitSha("abc1234")); // 7 chars min
+        }
+
+        [Test]
+        public void IsValidGitCommitSha_Empty_ReturnsFalse()
+        {
+            Assert.IsFalse(InputValidator.IsValidGitCommitSha(null));
+            Assert.IsFalse(InputValidator.IsValidGitCommitSha(""));
+        }
+
+        [Test]
+        public void Validate_GitCommit_WithValidHash_ProjectHashInvalid_Fails()
+        {
+            // When both gitCommit and projectHash are provided but projectHash is malformed,
+            // it must still be rejected.
+            var req = MakeValidRequest();
+            req.gitCommit   = new string('a', 40);
+            req.projectHash = "not-a-hex-string";
+            bool ok = InputValidator.Validate(req, out string reason);
+            Assert.IsFalse(ok, "Malformed projectHash must be rejected even when gitCommit is set.");
+        }
+
+        // -----------------------------------------------------------------------
         // Helpers
         // -----------------------------------------------------------------------
 

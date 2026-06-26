@@ -1,3 +1,4 @@
+using DistributedRecorder.Shared;
 using NUnit.Framework;
 using DistributedRecorder.Worker;
 
@@ -12,6 +13,11 @@ namespace DistributedRecorder.Tests.Worker
     ///   - Mismatched hashes without skipHashCheck → reject (409 path).
     ///   - Mismatched hashes with skipHashCheck → accept with warning.
     ///   - Hash comparison is case-insensitive (hex strings may vary in case).
+    ///
+    /// commit-based-project-verification: the commit-comparison path runs on the
+    /// background listener thread and requires a real git process and Worker project
+    /// (cannot be hermetic in EditMode). Those cases are covered by Tester / real-machine
+    /// validation. Pure SHA validation is tested in <see cref="GitInfoTests"/>.
     /// </summary>
     [TestFixture]
     public class HashCheckTests
