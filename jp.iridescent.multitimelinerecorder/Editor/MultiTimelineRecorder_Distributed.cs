@@ -1502,8 +1502,17 @@ namespace Unity.MultiTimelineRecorder
             // terminal.
             if (onlineWorkers.Count == 0)
             {
-                Debug.LogError(
-                    "[DistributedRecorder] オンラインの Worker が 0 台です。全ジョブを Unreachable に設定します。");
+                // dispatch-progress-feedback C: actionable message with firewall hint.
+                const string zeroWorkerMsg =
+                    "オンラインの Worker が 0 台です。全ジョブを中断します。\n\n" +
+                    "確認事項:\n" +
+                    "  (1) 各 Worker で Unity Editor とリスナーが起動し、ポート 11080 で待受しているか\n" +
+                    "  (2) Windows ファイアウォールが受信 TCP 11080 を許可しているか\n\n" +
+                    "Worker が起動中であれば「分散処理を開始」を再度押してください。";
+
+                Debug.LogError("[DistributedRecorder] " + zeroWorkerMsg);
+                EditorUtility.DisplayDialog("Worker 未検出", zeroWorkerMsg, "OK");
+
                 _pendingQueue.Clear();
                 foreach (var vm in _dispatchedJobs)
                 {
