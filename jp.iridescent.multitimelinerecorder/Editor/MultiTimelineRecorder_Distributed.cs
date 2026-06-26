@@ -1316,6 +1316,38 @@ namespace Unity.MultiTimelineRecorder
                 return;
             }
 
+            // ── F10: open target scenes before dispatch ──────────────────────────
+            // Ensure the scenes referenced by the targets are open so that CollectRenderTargets
+            // ran against the correct (loaded) scene state.  If a scene is not loaded the job's
+            // ScenePath was collected from SceneManager.GetActiveScene() (may be wrong scene).
+            // We open each unique scene once; if already open, OpenScene is a no-op.
+            // Main-thread call: this method is called from StartDistributedRecordingAsync (async void
+            // on the Unity synchronization context) so Unity API calls are safe here.
+            var scenePaths = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var job in targets)
+            {
+                if (!string.IsNullOrEmpty(job.ScenePath))
+                    scenePaths.Add(job.ScenePath);
+            }
+
+            string currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().path;
+            foreach (string scenePath in scenePaths)
+            {
+                if (!string.Equals(scenePath, currentScene, StringComparison.OrdinalIgnoreCase))
+                {
+                    Debug.Log($"[DistributedRecorder] 対象 scene を開きます: {scenePath}");
+                    UnityEditor.SceneManagement.EditorSceneManager.OpenScene(
+                        scenePath, UnityEditor.SceneManagement.OpenSceneMode.Single);
+                    currentScene = scenePath;
+                }
+            }
+
+            // ── F5: dirty warning for scene + timeline assets ────────────────────
+            // Warn when any recording-target scene (.unity) or timeline (.playable) asset
+            // has uncommitted edits.  Recorder config assets (recorderConfigJson) are
+            // transferred in-request, so their dirty state is irrelevant here.
+            WarnIfTargetAssetsDirty(targets);
+
             if (_distWorkerRegistry == null)
             {
                 Debug.LogWarning("[DistributedRecorder] WorkerRegistryAsset が未設定です。中断します。");
@@ -1885,6 +1917,64 @@ namespace Unity.MultiTimelineRecorder
                     return false;
                 }
 
+                case DispatchFailReason.CommitMismatch:
+                {
+                    // commit-based-project-verification: Worker's git HEAD differs from Master's.
+                    // Show a dialog analogous to HashMismatch, with commit SHAs in the body.
+                    string masterCommit = ExtractHashShort(result.ErrorMessage, "master=");
+                    string workerCommit = ExtractHashShort(result.ErrorMessage, "worker=");
+
+                    bool proceed = _sessionSkipHashCheck || EditorUtility.DisplayDialog(
+                        "コミット不一致",
+                        "Master と Worker の git コミットが異なります（commit mismatch）。\n" +
+                        "Worker は自分のローカル版プロジェクト（別コミット）で録画します。\n" +
+                        "続行しますか？\n\n" +
+                        $"Master commit: {masterCommit}\nWorker commit: {workerCommit}",
+                        "上書き送信（Send anyway）", "キャンセル");
+
+                    if (proceed)
+                    {
+                        _sessionSkipHashCheck = true;
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] コミット不一致のため上書き送信: ジョブ {jobIdShort}…");
+
+                        DispatchResult retryResult;
+                        try
+                        {
+                            retryResult = await dispatcher.DispatchAsync(worker, request,
+                                skipVersionCheck: _sessionSkipVersionCheck,
+                                skipHashCheck:    true);
+                        }
+                        catch (Exception ex)
+                        {
+                            vm.State = JobState.Failed;
+                            Debug.LogError(
+                                $"[DistributedRecorder] コミット上書き再送失敗 ジョブ {jobIdShort}…: {ex.Message}");
+                            return false;
+                        }
+
+                        if (!retryResult.Success)
+                        {
+                            vm.State = JobState.Failed;
+                            Debug.LogError(
+                                $"[DistributedRecorder] コミット上書き再送が拒否されました ジョブ {jobIdShort}…: " +
+                                retryResult.ErrorMessage);
+                            EditorUtility.DisplayDialog("送信失敗",
+                                retryResult.ErrorMessage, "OK");
+                            return false;
+                        }
+
+                        vm.State = JobState.Running;
+                        Debug.Log(
+                            $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
+                            "コミット上書き送信完了");
+                        return true;
+                    }
+
+                    vm.State = JobState.Failed;
+                    return false;
+                }
+
                 case DispatchFailReason.Unreachable:
                 {
                     // dispatch-worker-liveness §B – Unreachable failover:
@@ -1956,10 +2046,21 @@ namespace Unity.MultiTimelineRecorder
                 }
 
                 default:
+                    // Bug fix (commit-based-project-verification F8):
+                    // Previously this default case set State=Failed silently (no dialog).
+                    // Now we always show the reason in a dialog so the user knows why the
+                    // job was rejected (no silent / "無言 Failed" any more).
                     vm.State = JobState.Failed;
                     Debug.LogWarning(
                         $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
                         $"拒否されました ({result.FailReason})。\n{result.ErrorMessage}");
+                    if (!string.IsNullOrEmpty(result.ErrorMessage))
+                    {
+                        EditorUtility.DisplayDialog(
+                            $"ジョブ拒否 ({result.FailReason})",
+                            $"Worker '{worker.displayName}' からジョブが拒否されました。\n\n{result.ErrorMessage}",
+                            "OK");
+                    }
                     return false;
             }
         }
@@ -2289,6 +2390,66 @@ namespace Unity.MultiTimelineRecorder
 
             int len = Math.Min(8, reason.Length - start);
             return reason.Substring(start, len) + "…";
+        }
+
+        /// <summary>
+        /// Checks whether any recording-target scene or timeline asset has uncommitted
+        /// edits (dirty working tree) and logs a warning if so.
+        ///
+        /// Only scene (.unity) and timeline (.playable) assets are checked.
+        /// Recorder config assets (sent in-request as recorderConfigJson) are intentionally
+        /// excluded – their content is transferred regardless of git state.
+        ///
+        /// Uses <see cref="GitInfo.TryGetDirtyPaths"/> via the project root.
+        /// On non-git repos or when git is unavailable, the check is silently skipped
+        /// (warning in Debug.Log only).
+        ///
+        /// commit-based-project-verification F5.
+        /// </summary>
+        private static void WarnIfTargetAssetsDirty(List<DistributedTimelineJob> targets)
+        {
+            if (targets == null || targets.Count == 0)
+                return;
+
+            // Collect unique scene + timeline paths (project-relative, as passed to git).
+            var scopePaths = new System.Collections.Generic.List<string>();
+            var seen       = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var job in targets)
+            {
+                if (!string.IsNullOrEmpty(job.ScenePath) && seen.Add(job.ScenePath))
+                    scopePaths.Add(job.ScenePath);
+                if (!string.IsNullOrEmpty(job.TimelineAssetPath) && seen.Add(job.TimelineAssetPath))
+                    scopePaths.Add(job.TimelineAssetPath);
+            }
+
+            if (scopePaths.Count == 0)
+                return;
+
+            string projectRoot = DistributedRecorder.Shared.ProjectPaths.ProjectRoot;
+            if (!DistributedRecorder.Shared.GitInfo.TryGetDirtyPaths(
+                    projectRoot, scopePaths, out var dirtyPaths, out string gitError))
+            {
+                // Not a git repo or git not installed – skip silently.
+                Debug.Log(
+                    $"[DistributedRecorder] dirty 警告チェックをスキップ（git 取得失敗）: {gitError}");
+                return;
+            }
+
+            if (dirtyPaths.Count == 0)
+                return;
+
+            string fileList = string.Join("\n  ", dirtyPaths);
+            Debug.LogWarning(
+                "[DistributedRecorder] 録画対象 scene / timeline に未コミット編集があります。\n" +
+                "Worker には反映されません。先にコミットすることを推奨します。\n" +
+                $"ダーティなファイル:\n  {fileList}");
+
+            EditorUtility.DisplayDialog(
+                "未コミット編集の警告",
+                "録画対象の scene / timeline に未コミット編集があります。\n" +
+                "Worker には反映されません。このまま続行しますか？\n\n" +
+                $"未コミット:\n{fileList}",
+                "続行");
         }
 
         /// <summary>
