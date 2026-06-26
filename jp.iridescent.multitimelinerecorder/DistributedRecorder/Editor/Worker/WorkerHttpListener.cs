@@ -305,78 +305,148 @@ namespace DistributedRecorder.Worker
                 return;
             }
 
-            // Project / job-scope hash check.
-            // MTR jobs (timelineAssetPath non-empty) use the job-scope hash (timeline+deps+scene only).
-            // Legacy jobs (timelineAssetPath empty) use the whole-Assets projectHash as before.
-            // Delegate to CheckProjectHash so the logic is unit-testable.
-            bool isMtrJob = !string.IsNullOrEmpty(request.timelineAssetPath);
-            string localHash;
-            string masterHashToCheck;
-            if (isMtrJob && !string.IsNullOrEmpty(request.jobScopeHash))
+            // ── Project verification: git commit (primary) or content-hash (fallback) ──
+            //
+            // commit-based-project-verification:
+            //   When both Master and Worker can obtain their HEAD git commit, we compare
+            //   those commits instead of computing the expensive content-hash.
+            //   Fallback to content-hash when gitCommit is empty on either side
+            //   (non-git repo, git not installed, old Master without gitCommit field).
+            //
+            // skipHashCheck also covers commit mismatch (user approved "Send anyway").
+
+            bool masterHasGitCommit = !string.IsNullOrEmpty(request.gitCommit)
+                                      && InputValidator.IsValidGitCommitSha(request.gitCommit);
+
+            if (masterHasGitCommit && !request.skipHashCheck)
             {
-                // MTR path: compute job-scope hash on the main thread (AssetDatabase.GetDependencies
-                // is main-thread-only).  InvokeAndWait blocks this background listener thread until
-                // the main thread executes the computation.
-                // Implicit fallback to whole-Assets hash is intentionally removed: if the computation
-                // fails or times out we reject the job immediately so the mismatch is visible.
-                string capturedTimeline = request.timelineAssetPath;
-                string capturedScene    = request.scenePath;
-                try
+                // Attempt git commit comparison on this Worker.
+                if (GitInfo.TryGetHeadCommit(_projectRoot, out string workerCommit, out string gitErr))
                 {
-                    localHash = MainThreadDispatcher.InvokeAndWait(
-                        () => ProjectHasher.ComputeJobScope(capturedTimeline, capturedScene),
-                        TimeSpan.FromSeconds(15));
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError(
-                        $"[Worker] ジョブスコープハッシュ計算失敗 – ジョブを拒否します: {ex.Message}");
-                    var hashErrAck = new JobAck
+                    // Both sides have commits: compare them.
+                    if (!string.Equals(workerCommit, request.gitCommit, StringComparison.OrdinalIgnoreCase))
                     {
-                        jobId    = request.jobId,
-                        accepted = false,
-                        reason   = $"job-scope hash computation failed: {ex.Message}"
-                    };
-                    RespondJson(ctx, 409, ProtocolSerializer.Serialize(hashErrAck));
-                    return;
+                        string masterShort = request.gitCommit.Length >= 8
+                            ? request.gitCommit.Substring(0, 8) : request.gitCommit;
+                        string workerShort = workerCommit.Length >= 8
+                            ? workerCommit.Substring(0, 8) : workerCommit;
+                        var commitAck = new JobAck
+                        {
+                            jobId    = request.jobId,
+                            accepted = false,
+                            reason   = $"commit mismatch (worker={workerShort}…, master={masterShort}…). " +
+                                       "Worker を同じコミットに `git pull` で揃えるか、" +
+                                       "Master 側で Send anyway で続行してください。"
+                        };
+                        Debug.LogWarning(
+                            $"[Worker] commit mismatch: worker={workerCommit}, master={request.gitCommit}");
+                        RespondJson(ctx, 409, ProtocolSerializer.Serialize(commitAck));
+                        return;
+                    }
+                    // Commits match – skip content-hash check entirely.
+                    Debug.Log($"[Worker] git commit matched ({request.gitCommit.Substring(0, System.Math.Min(8, request.gitCommit.Length))}…). Hash check skipped.");
+                    // Jump directly to duplicate check below.
                 }
-                masterHashToCheck = request.jobScopeHash;
+                else
+                {
+                    // Worker cannot get its own commit (not a git repo, git missing, etc.).
+                    // Fall through to content-hash path so we don't reject valid non-git Workflows.
+                    Debug.LogWarning(
+                        $"[Worker] git rev-parse HEAD failed – falling back to content-hash: {gitErr}");
+                    goto contentHashFallback;
+                }
+            }
+            else if (masterHasGitCommit && request.skipHashCheck)
+            {
+                // skipHashCheck is set (user approved Send anyway after commit mismatch).
+                // Proceed without any comparison; emit a warning so the log records it.
+                Debug.LogWarning(
+                    $"[Worker] commit check skipped (skipHashCheck=true). Master commit: {request.gitCommit}. " +
+                    "Worker のローカル版プロジェクトで録画します。");
+                // Jump directly to duplicate check below.
             }
             else
             {
-                // Legacy path: whole-Assets hash.
-                localHash         = ProjectHasher.Compute(ProjectPaths.ProjectRoot);
-                masterHashToCheck = request.projectHash;
+                // No gitCommit from Master (old Master or non-git repo): content-hash path.
+                goto contentHashFallback;
             }
 
-            if (!CheckProjectHash(localHash, masterHashToCheck, request.skipHashCheck,
-                                  out bool shouldWarnHash))
+            // Successful commit check (or skipHashCheck): skip content-hash, go to dup check.
+            goto duplicateCheck;
+
+            contentHashFallback:
             {
-                string hashType = (isMtrJob && !string.IsNullOrEmpty(request.jobScopeHash))
-                    ? "job-scope hash" : "project hash";
-                var ack = new JobAck
+                // Content-hash fallback (deprecated, kept for wire compat with older Masters/Workers).
+                bool isMtrJob = !string.IsNullOrEmpty(request.timelineAssetPath);
+                string localHash;
+                string masterHashToCheck;
+                if (isMtrJob && !string.IsNullOrEmpty(request.jobScopeHash))
                 {
-                    jobId    = request.jobId,
-                    accepted = false,
-                    reason   = $"{hashType} mismatch (local={localHash}, master={masterHashToCheck}). " +
-                               "両 PC を `git pull` で同じコミットに揃えるか、" +
-                               "Master 側で上書き許可（Send anyway）で続行してください。"
-                };
-                RespondJson(ctx, 409, ProtocolSerializer.Serialize(ack));
-                return;
+                    // MTR path: compute job-scope hash on the main thread (AssetDatabase.GetDependencies
+                    // is main-thread-only).  InvokeAndWait blocks this background listener thread until
+                    // the main thread executes the computation.
+                    string capturedTimeline = request.timelineAssetPath;
+                    string capturedScene    = request.scenePath;
+                    try
+                    {
+                        localHash = MainThreadDispatcher.InvokeAndWait(
+                            () => ProjectHasher.ComputeJobScope(capturedTimeline, capturedScene),
+                            TimeSpan.FromSeconds(15));
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogError(
+                            $"[Worker] ジョブスコープハッシュ計算失敗 – ジョブを拒否します: {ex.Message}");
+                        var hashErrAck = new JobAck
+                        {
+                            jobId    = request.jobId,
+                            accepted = false,
+                            reason   = $"job-scope hash computation failed: {ex.Message}"
+                        };
+                        RespondJson(ctx, 409, ProtocolSerializer.Serialize(hashErrAck));
+                        return;
+                    }
+                    masterHashToCheck = request.jobScopeHash;
+                }
+                else
+                {
+                    // Legacy path: whole-Assets hash.
+                    localHash         = ProjectHasher.Compute(ProjectPaths.ProjectRoot);
+                    masterHashToCheck = request.projectHash;
+                }
+
+                if (!CheckProjectHash(localHash, masterHashToCheck, request.skipHashCheck,
+                                      out bool shouldWarnHash))
+                {
+                    string hashType = (isMtrJob && !string.IsNullOrEmpty(request.jobScopeHash))
+                        ? "job-scope hash" : "project hash";
+                    var ack = new JobAck
+                    {
+                        jobId    = request.jobId,
+                        accepted = false,
+                        // "hash mismatch" keyword must appear for ClassifyRejection to route correctly.
+                        reason   = $"{hashType} mismatch (local={localHash}, master={masterHashToCheck}). " +
+                                   "両 PC を `git pull` で同じコミットに揃えるか、" +
+                                   "Master 側で上書き許可（Send anyway）で続行してください。"
+                    };
+                    RespondJson(ctx, 409, ProtocolSerializer.Serialize(ack));
+                    return;
+                }
+                if (shouldWarnHash)
+                {
+                    // Override approved by user – proceed with local project copy.
+                    string masterShort = masterHashToCheck.Length >= 8
+                        ? masterHashToCheck.Substring(0, 8) : masterHashToCheck;
+                    string localShort  = localHash.Length >= 8
+                        ? localHash.Substring(0, 8) : localHash;
+                    Debug.LogWarning(
+                        "[Worker] ハッシュ不一致だが skipHashCheck により実行します" +
+                        $"（local={localShort}…, master={masterShort}…）。" +
+                        "Worker のローカル版プロジェクトで録画します。");
+                }
             }
-            if (shouldWarnHash)
-            {
-                // Override approved by user – proceed with local project copy.
-                string masterShort = masterHashToCheck.Length >= 8
-                    ? masterHashToCheck.Substring(0, 8) : masterHashToCheck;
-                string localShort  = localHash.Length >= 8
-                    ? localHash.Substring(0, 8) : localHash;
-                Debug.LogWarning(
-                    "[Worker] ハッシュ不一致だが skipHashCheck により実行します" +
-                    $"（local={localShort}…, master={masterShort}…）。" +
-                    "Worker のローカル版プロジェクトで録画します。");
-            }
+
+            duplicateCheck:
 
             // Duplicate check
             if (_store.TryGetEntry(request.jobId, out _))
