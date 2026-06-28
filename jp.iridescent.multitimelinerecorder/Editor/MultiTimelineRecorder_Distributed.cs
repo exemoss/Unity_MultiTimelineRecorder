@@ -128,6 +128,41 @@ namespace Unity.MultiTimelineRecorder
         /// </summary>
         private const double FailsafeStallSeconds = 30.0;
 
+        // worker-reload-survival 案D: timeout constants ─────────────────────────
+        //
+        // Two timeout tiers to survive the Worker's domain-reload gap:
+        //   • pre-flight (dispatch-time liveness probe): fast fail 3 s.
+        //     Worker must be reachable before we even try to send a job.
+        //   • in-flight (health poll during stall watchdog): patient 20 s.
+        //     During recording the Worker may be unresponsive for the duration of
+        //     the domain reload (HDRP shader warmup can add several seconds).
+        //     Real reload time is typically 5–15 s; 20 s gives a 1.5× safety margin.
+        //     Final tuning must be confirmed on the live machine (§F-4).
+        //
+        // ProgressMonitor reconnect: after a stream drop the monitor is restarted
+        // up to ReconnectMaxAttempts times with ReconnectDelaySeconds between tries
+        // before the job is marked Failed.
+
+        /// <summary>
+        /// Timeout for the /health poll issued by the stall watchdog while a job is
+        /// in-flight. Longer than the pre-flight probe to absorb domain-reload gaps.
+        /// Public for EditMode tests.
+        /// </summary>
+        public const double InFlightHealthTimeoutSeconds = 20.0;
+
+        /// <summary>
+        /// Maximum number of times the stall watchdog will restart the progress
+        /// monitor after a stream drop before giving up and marking the job Failed.
+        /// Public for EditMode tests.
+        /// </summary>
+        public const int ReconnectMaxAttempts = 6;
+
+        /// <summary>
+        /// Seconds to wait between consecutive ProgressMonitor reconnect attempts.
+        /// Public for EditMode tests.
+        /// </summary>
+        public const double ReconnectDelaySeconds = 5.0;
+
         /// <summary>
         /// Jobs waiting to be dispatched (not yet sent to any Worker).
         /// Populated at batch start; consumed by <see cref="TryDispatchNextQueuedJob"/>.
@@ -190,6 +225,29 @@ namespace Unity.MultiTimelineRecorder
         /// </summary>
         private readonly Dictionary<string, double> _jobLastProgressTime =
             new Dictionary<string, double>();
+
+        // worker-reload-survival 案D: stall watchdog ────────────────────────────
+
+        /// <summary>
+        /// Tracks how many ProgressMonitor reconnect attempts have been made for
+        /// each in-flight JobId.  Reset when the job terminates.
+        /// Only accessed on the main thread.
+        /// </summary>
+        private readonly Dictionary<string, int> _jobReconnectCount =
+            new Dictionary<string, int>();
+
+        /// <summary>
+        /// Set of JobIds currently being processed by the stall watchdog to prevent
+        /// concurrent re-entrant watchdog invocations for the same job.
+        /// Only accessed on the main thread.
+        /// </summary>
+        private readonly HashSet<string> _stallWatchdogActive =
+            new HashSet<string>();
+
+        /// <summary>
+        /// Whether the stall watchdog EditorApplication.update callback is registered.
+        /// </summary>
+        private bool _stallWatchdogRegistered;
 
         // -----------------------------------------------------------------------
         // UI hook (called from MultiTimelineRecorder.cs DrawRecordControls area)
@@ -1753,6 +1811,10 @@ namespace Unity.MultiTimelineRecorder
 
             _jobLastProgressTime.Remove(completedVm.JobId);
 
+            // worker-reload-survival 案D: clear watchdog state for this job
+            _jobReconnectCount.Remove(completedVm.JobId);
+            _stallWatchdogActive.Remove(completedVm.JobId);
+
             if (_workerInflightCount.TryGetValue(worker.displayName, out int count))
                 _workerInflightCount[worker.displayName] = Math.Max(0, count - 1);
 
@@ -1871,6 +1933,15 @@ namespace Unity.MultiTimelineRecorder
             _batchDispatcher    = null;
             _batchAuth          = null;
             _batchOnlineWorkers = null;
+
+            // worker-reload-survival 案D: unregister stall watchdog when batch finalizes
+            if (_stallWatchdogRegistered)
+            {
+                EditorApplication.update -= StallWatchdogTick;
+                _stallWatchdogRegistered  = false;
+            }
+            _jobReconnectCount.Clear();
+            _stallWatchdogActive.Clear();
 
             Debug.Log("[DistributedRecorder] 全ジョブが完了しました。バッチを終了します。");
             Repaint();
@@ -2236,26 +2307,269 @@ namespace Unity.MultiTimelineRecorder
             monitor.OnError += err =>
             {
                 var capturedErr = err;
-                // Failsafe: stream error may mean the Worker finished but the push
-                // stream dropped.  Check Worker health to decide if we should treat
-                // the job as done (free the slot) or just log the error.
+                // worker-reload-survival 案D: stream errors during in-flight recording
+                // may be caused by a transient domain-reload gap.  Instead of immediately
+                // failing, attempt to reconnect up to ReconnectMaxAttempts times.
+                // Only fall back to HandleProgressStreamErrorAsync when all retries are
+                // exhausted or the Worker is confirmed idle via /health.
                 EditorCallbackOnce(() =>
                 {
-                    Debug.LogError(
-                        $"[DistributedRecorder] 進捗ストリームエラー (jobId={vm.JobId.Substring(0, 8)}…): {capturedErr}");
-                    // Trigger async health check and free the slot if Worker is idle.
-                    _ = HandleProgressStreamErrorAsync(worker, vm);
+                    if (IsTerminalState(vm.State)) return; // job already done
+
+                    _jobReconnectCount.TryGetValue(vm.JobId, out int attempts);
+                    string jobIdShort = vm.JobId.Length >= 8 ? vm.JobId.Substring(0, 8) : vm.JobId;
+
+                    if (attempts < ReconnectMaxAttempts)
+                    {
+                        _jobReconnectCount[vm.JobId] = attempts + 1;
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] 進捗ストリーム切断 (jobId={jobIdShort}…, " +
+                            $"retry {attempts + 1}/{ReconnectMaxAttempts}): {capturedErr}\n" +
+                            "Worker のドメインリロード中の可能性があります。再接続を試みます。");
+
+                        // Re-arm the last-progress timestamp so stall watchdog does not
+                        // fire immediately during the reconnect delay.
+                        _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
+
+                        // Reconnect after a short delay using a fire-and-forget task.
+                        _ = ReconnectProgressMonitorAsync(worker, vm, attempts + 1);
+                    }
+                    else
+                    {
+                        Debug.LogError(
+                            $"[DistributedRecorder] 進捗ストリームエラー (jobId={jobIdShort}…): {capturedErr}\n" +
+                            $"再接続上限 ({ReconnectMaxAttempts}) 到達。Worker の health を確認します。");
+                        _ = HandleProgressStreamErrorAsync(worker, vm);
+                    }
+
                     Repaint();
                 });
             };
 
             monitor.Start(worker.BaseUrl, vm.JobId);
+
+            // worker-reload-survival 案D: register stall watchdog when first job starts
+            EnsureStallWatchdogRegistered();
         }
 
         /// <summary>
-        /// Failsafe: called when the progress stream emits an error.
-        /// Polls <c>GET /health</c> to determine if the Worker is idle, then either
-        /// frees the slot (if idle) or logs a warning and keeps waiting.
+        /// worker-reload-survival 案D: reconnects the ProgressMonitor for an in-flight
+        /// job after a delay to absorb the Worker domain-reload gap.
+        ///
+        /// Called from the OnError handler when <c>attempts &lt; ReconnectMaxAttempts</c>.
+        /// </summary>
+        private async Task ReconnectProgressMonitorAsync(WorkerInfo worker, MtrJobViewModel vm, int attempt)
+        {
+            // Delay to give the Worker time to complete the domain reload.
+            await Task.Delay(TimeSpan.FromSeconds(ReconnectDelaySeconds)).ConfigureAwait(false);
+
+            EditorCallbackOnce(() =>
+            {
+                if (IsTerminalState(vm.State)) return; // already resolved while we waited
+                if (_batchAuth == null)             return; // batch finalized
+
+                string jobIdShort = vm.JobId.Length >= 8 ? vm.JobId.Substring(0, 8) : vm.JobId;
+                Debug.Log($"[DistributedRecorder] 進捗ストリーム再接続 (jobId={jobIdShort}…, attempt={attempt})");
+
+                // Restart the monitor — this wires up the same OnProgress/OnError closures
+                // (but creates a fresh ProgressMonitor instance).
+                StartProgressMonitorWithScheduler(worker, vm);
+            });
+        }
+
+        /// <summary>
+        /// worker-reload-survival 案D: registers the stall watchdog on
+        /// <c>EditorApplication.update</c> if not already registered.
+        /// The watchdog auto-unregisters when no jobs are in flight.
+        /// </summary>
+        private void EnsureStallWatchdogRegistered()
+        {
+            if (_stallWatchdogRegistered) return;
+            _stallWatchdogRegistered = true;
+            EditorApplication.update += StallWatchdogTick;
+        }
+
+        /// <summary>
+        /// worker-reload-survival 案D: periodic stall watchdog.
+        ///
+        /// Called every Editor frame via <c>EditorApplication.update</c>.
+        /// For each in-flight job where no progress has been received for
+        /// <see cref="FailsafeStallSeconds"/>, issues a patient /health probe
+        /// (timeout <see cref="InFlightHealthTimeoutSeconds"/>).
+        ///
+        /// Outcomes:
+        ///   - Worker idle (job completed/failed there): free slot → OnJobTerminated.
+        ///   - Worker still running this job: reset last-progress time (progress is
+        ///     expected again soon) and let reconnect handle the stream.
+        ///   - Health poll fails (Worker unreachable): increment reconnect counter.
+        ///     If exhausted → OnJobTerminated with Failed.
+        ///
+        /// Exposed <c>internal</c> for pure-logic EditMode tests via
+        /// <see cref="IsJobStalled"/>.
+        /// </summary>
+        private void StallWatchdogTick()
+        {
+            if (_jobLastProgressTime.Count == 0)
+            {
+                // No in-flight jobs — unregister to avoid unnecessary ticks
+                EditorApplication.update -= StallWatchdogTick;
+                _stallWatchdogRegistered  = false;
+                return;
+            }
+
+            double now = EditorApplication.timeSinceStartup;
+
+            // Snapshot keys to avoid modifying the dict while iterating
+            var jobIds = new List<string>(_jobLastProgressTime.Keys);
+            foreach (string jobId in jobIds)
+            {
+                if (_stallWatchdogActive.Contains(jobId)) continue; // already processing
+
+                if (!_jobLastProgressTime.TryGetValue(jobId, out double lastTime)) continue;
+
+                if (!IsJobStalled(now, lastTime, FailsafeStallSeconds)) continue;
+
+                // Find the view model and worker
+                MtrJobViewModel vm = null;
+                foreach (var j in _dispatchedJobs)
+                {
+                    if (j.JobId == jobId) { vm = j; break; }
+                }
+
+                if (vm == null || IsTerminalState(vm.State)) continue;
+
+                if (!_jobWorkerMap.TryGetValue(jobId, out WorkerInfo stalledWorker)) continue;
+
+                string jobIdShort = jobId.Length >= 8 ? jobId.Substring(0, 8) : jobId;
+                Debug.LogWarning(
+                    $"[DistributedRecorder] Stall watchdog: ジョブ {jobIdShort}… の進捗が " +
+                    $"{FailsafeStallSeconds}s 途絶えています。Worker health を確認します。");
+
+                _stallWatchdogActive.Add(jobId);
+
+                // Fire async health probe with patient timeout (absorbed domain-reload gap)
+                _ = HandleStalledJobAsync(stalledWorker, vm);
+            }
+        }
+
+        /// <summary>
+        /// worker-reload-survival 案D: pure-logic stall predicate.
+        ///
+        /// Returns <c>true</c> when <c>now - lastProgressTime &gt;= stallThreshold</c>.
+        /// Public static for hermetic EditMode tests.
+        /// </summary>
+        public static bool IsJobStalled(double nowTime, double lastProgressTime, double stallThreshold)
+            => (nowTime - lastProgressTime) >= stallThreshold;
+
+        /// <summary>
+        /// Public accessor for <see cref="FailsafeStallSeconds"/> used by EditMode tests.
+        /// </summary>
+        public static double FailsafeStallSecondsPublic => FailsafeStallSeconds;
+
+        /// <summary>
+        /// worker-reload-survival 案D: async health probe for a stalled in-flight job.
+        ///
+        /// Uses <see cref="InFlightHealthTimeoutSeconds"/> (patient) instead of the
+        /// pre-flight 3 s so that a Worker recovering from domain-reload can respond.
+        ///
+        /// Outcomes:
+        ///   (a) Worker idle (job done there): if Completed, trigger download + OnJobTerminated.
+        ///       If Worker is idle but we never saw Completed, mark Failed.
+        ///   (b) Worker still running this job: reset last-progress time; let monitor reconnect.
+        ///   (c) Health poll fails: count as a reconnect attempt; when exhausted → Failed.
+        /// </summary>
+        private async Task HandleStalledJobAsync(WorkerInfo worker, MtrJobViewModel vm)
+        {
+            if (_batchAuth == null)
+            {
+                _stallWatchdogActive.Remove(vm.JobId);
+                return;
+            }
+
+            string jobIdShort = vm.JobId.Length >= 8 ? vm.JobId.Substring(0, 8) : vm.JobId;
+
+            try
+            {
+                var healthTransport = new HttpTransport(_batchAuth);
+                string healthJson;
+                try
+                {
+                    // patient timeout to absorb domain-reload gap (§F-4 tuning target)
+                    healthJson = await healthTransport.GetAsync(
+                        $"{worker.BaseUrl}/health",
+                        TimeSpan.FromSeconds(InFlightHealthTimeoutSeconds)).ConfigureAwait(false);
+                }
+                finally
+                {
+                    healthTransport.Dispose();
+                }
+
+                var health = ProtocolSerializer.Deserialize<WorkerHealth>(healthJson);
+                bool workerIsIdle = string.IsNullOrEmpty(health.currentJobId)
+                    || health.currentJobId != vm.JobId;
+
+                EditorCallbackOnce(() =>
+                {
+                    _stallWatchdogActive.Remove(vm.JobId);
+                    if (IsTerminalState(vm.State)) return;
+
+                    if (workerIsIdle)
+                    {
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] Stall watchdog: Worker がアイドル確認 → " +
+                            $"ジョブ {jobIdShort}… の slot を解放します (Failed)。");
+                        vm.State = JobState.Failed;
+                        OnJobTerminated(worker, vm);
+                    }
+                    else
+                    {
+                        // Worker is still running — reset last-progress time so we don't
+                        // immediately fire again next tick.
+                        Debug.Log(
+                            $"[DistributedRecorder] Stall watchdog: Worker はジョブ {jobIdShort}… を実行中。" +
+                            "進捗タイムスタンプをリセットします。");
+                        _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
+                    }
+
+                    Repaint();
+                });
+            }
+            catch (Exception ex)
+            {
+                EditorCallbackOnce(() =>
+                {
+                    _stallWatchdogActive.Remove(vm.JobId);
+                    if (IsTerminalState(vm.State)) return;
+
+                    _jobReconnectCount.TryGetValue(vm.JobId, out int attempts);
+                    if (attempts < ReconnectMaxAttempts)
+                    {
+                        _jobReconnectCount[vm.JobId] = attempts + 1;
+                        // Reset timestamp so we wait another FailsafeStallSeconds before probing again
+                        _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] Stall watchdog health チェック失敗 " +
+                            $"(job={jobIdShort}…, attempt {attempts + 1}/{ReconnectMaxAttempts}): {ex.Message}");
+                    }
+                    else
+                    {
+                        Debug.LogError(
+                            $"[DistributedRecorder] Stall watchdog health チェック上限到達 " +
+                            $"(job={jobIdShort}…): {ex.Message} → Failed");
+                        vm.State = JobState.Failed;
+                        OnJobTerminated(worker, vm);
+                    }
+
+                    Repaint();
+                });
+            }
+        }
+
+        /// <summary>
+        /// Failsafe: called when the progress stream emits an error AND reconnect
+        /// attempts are exhausted.
+        /// Polls <c>GET /health</c> with the pre-flight 3 s fast timeout to determine
+        /// if the Worker is idle, then either frees the slot or marks the job Failed.
         /// </summary>
         private async Task HandleProgressStreamErrorAsync(WorkerInfo worker, MtrJobViewModel vm)
         {
@@ -2269,7 +2583,7 @@ namespace Unity.MultiTimelineRecorder
                 string healthJson;
                 try
                 {
-                    // dispatch-progress-feedback: shortened from 10s → 3s to match LivenessProbeTimeout.
+                    // pre-flight fast-fail timeout (3 s) — reconnect retries already exhausted
                     healthJson = await healthTransport.GetAsync(
                         $"{worker.BaseUrl}/health",
                         TimeSpan.FromSeconds(3)).ConfigureAwait(false);
