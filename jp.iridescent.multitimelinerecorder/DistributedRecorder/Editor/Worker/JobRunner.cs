@@ -547,6 +547,16 @@ namespace DistributedRecorder.Worker
             // and the recording fails. Reset to 0 so each job starts from a clean state.
             UnityEngine.Time.captureFramerate = 0;
 
+            // worker-reload-survival 案A: disable domain reload for this recording session.
+            // PlayModeReloadGuard saves the original EditorSettings values to EditorPrefs and
+            // OR-assigns DisableDomainReload so that the next EnterPlaymode() does NOT trigger
+            // a domain reload, keeping Bootstrap._httpListener and JobRunner state alive.
+            // The guard is restored in ResetState() (called by both FinalizeCompletedJob and
+            // FailJob) and also at Bootstrap startup (sanity-restore for crash remnants).
+            // DisableSceneReload is intentionally not added so scene objects are recreated
+            // for each job, preventing sticky state leaking into job N+1.
+            PlayModeReloadGuard.Enable();
+
             // For the headless path, EditorApplication.isPlaying is set inside OnStartHeadlessRender.
             // For the legacy path, we call EnterPlaymode here.
             // Either way, playModeStateChanged fires for EnteredPlayMode.
@@ -1127,6 +1137,12 @@ namespace DistributedRecorder.Worker
             // worker-recording-fix: clear preflight suppression state
             _savedPlayOnAwakeValues  = null;
             _savedRecorderTrackMutes = null;
+
+            // worker-reload-survival 案A: restore EditorSettings.enterPlayModeOptions
+            // to the value saved before the recording session started.
+            // Restore() is idempotent — safe to call even when Enable() was never called
+            // (guard flag check inside prevents any-op when inactive).
+            PlayModeReloadGuard.Restore();
         }
 
         private void UnsubscribeAll()

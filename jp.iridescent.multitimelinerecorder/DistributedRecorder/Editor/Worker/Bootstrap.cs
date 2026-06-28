@@ -117,6 +117,18 @@ namespace DistributedRecorder.Worker
         {
             Debug.Log("[Bootstrap] Starting Distributed Recorder Worker...");
 
+            // worker-reload-survival 案A: sanity-restore for crash remnants.
+            // If the Editor crashed while DisableDomainReload was active, the EditorPrefs
+            // guard flag is still set.  Restore the saved EditorSettings now so the
+            // Worker does not start with a stale DisableDomainReload permanently on.
+            if (PlayModeReloadGuard.IsActive)
+            {
+                Debug.LogWarning(
+                    "[Bootstrap] PlayModeReloadGuard was left active (possible crash remnant). " +
+                    "Restoring EditorSettings.enterPlayModeOptions to saved value.");
+                PlayModeReloadGuard.Restore();
+            }
+
             // Warm the VersionChecker cache on the main thread before the HTTP
             // listener starts, so that HandlePostJob (which runs on a ThreadPool
             // thread) never triggers PackageManager.Client.List() from a non-main
@@ -257,6 +269,12 @@ namespace DistributedRecorder.Worker
                 _httpListener = null;
                 _udpCts?.Cancel();
                 _udpCts = null;
+
+                // worker-reload-survival 案A: restore EditorSettings on graceful shutdown.
+                // This covers the EditorApplication.quitting path (e.g. user closes Editor
+                // while a recording is in progress). FailJob/ResetState also calls Restore(),
+                // so this is an additional safety net only for the mid-recording quit case.
+                PlayModeReloadGuard.Restore();
             };
         }
     }
