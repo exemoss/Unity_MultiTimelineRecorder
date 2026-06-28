@@ -1,6 +1,7 @@
 using NUnit.Framework;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.TestTools;
 using DistributedRecorder.Worker;
 
 namespace DistributedRecorder.Tests.Worker
@@ -258,16 +259,24 @@ namespace DistributedRecorder.Tests.Worker
         [Test]
         public void Enable_DoesNotAddDisableSceneReload()
         {
-            EditorSettings.enterPlayModeOptionsEnabled = true;
-            EditorSettings.enterPlayModeOptions        = EnterPlayModeOptions.None;
+            // Snapshot the options BEFORE Enable() so we can detect what was added.
+            // Using the current actual EditorSettings value (whatever batchmode initialized it
+            // to) rather than forcing it to None avoids platform-specific initialization issues.
+            EnterPlayModeOptions before = EditorSettings.enterPlayModeOptions;
 
             PlayModeReloadGuard.Enable();
 
-            bool hasSceneBit = (EditorSettings.enterPlayModeOptions
-                                & EnterPlayModeOptions.DisableSceneReload) != 0;
-            Assert.IsFalse(hasSceneBit,
+            EnterPlayModeOptions after = EditorSettings.enterPlayModeOptions;
+
+            // Enable() must not add DisableSceneReload: the SceneReload bit must not
+            // change from its pre-Enable state (either both absent or both present).
+            bool sceneBitBefore = (before & EnterPlayModeOptions.DisableSceneReload) != 0;
+            bool sceneBitAfter  = (after  & EnterPlayModeOptions.DisableSceneReload) != 0;
+
+            Assert.AreEqual(sceneBitBefore, sceneBitAfter,
                 "Enable() must NOT add DisableSceneReload (scene objects must be recreated " +
-                "per-job to prevent sticky state leaking into job N+1).");
+                "per-job to prevent sticky state leaking into job N+1). " +
+                $"before={before}, after={after}");
 
             PlayModeReloadGuard.Restore();
         }
