@@ -280,5 +280,36 @@ namespace DistributedRecorder.Tests.Worker
 
             PlayModeReloadGuard.Restore();
         }
+
+        /// <summary>
+        /// Deterministic regression guard for d029e4c. Forces the Unity 6 auto-init
+        /// path: when enterPlayModeOptionsEnabled is toggled false→true, Unity sets
+        /// enterPlayModeOptions to DisableDomainReload | DisableSceneReload. Enable()
+        /// must derive the patched value from the options SAVED before enabling (None
+        /// here), NOT a re-read after enabling — otherwise scene reload is left disabled
+        /// and scene state leaks into job N+1. Unlike Enable_DoesNotAddDisableSceneReload
+        /// this does not depend on ambient EditorSettings state, so it pins the regression.
+        /// </summary>
+        [Test]
+        public void Enable_FromDisabledState_LeavesSceneReloadEnabled()
+        {
+            EditorSettings.enterPlayModeOptionsEnabled = false;
+            EditorSettings.enterPlayModeOptions        = EnterPlayModeOptions.None;
+
+            PlayModeReloadGuard.Enable();
+
+            bool sceneDisabled = (EditorSettings.enterPlayModeOptions
+                                  & EnterPlayModeOptions.DisableSceneReload) != 0;
+            Assert.IsFalse(sceneDisabled,
+                "Enable() from a disabled state must NOT leave DisableSceneReload set " +
+                "(regression guard for d029e4c — derive from saved original, not a re-read).");
+
+            bool domainDisabled = (EditorSettings.enterPlayModeOptions
+                                   & EnterPlayModeOptions.DisableDomainReload) != 0;
+            Assert.IsTrue(domainDisabled,
+                "Enable() must disable domain reload so the listener survives Play Mode.");
+
+            PlayModeReloadGuard.Restore();
+        }
     }
 }
