@@ -47,15 +47,23 @@ namespace DistributedRecorder.Worker
                 return;
             }
 
-            // Save current state
+            // Save current state. Capture the options value BEFORE toggling the
+            // enabled flag: on Unity 6, setting enterPlayModeOptionsEnabled = true
+            // (from false) makes Unity initialize enterPlayModeOptions to
+            // DisableDomainReload | DisableSceneReload. Re-reading the options after
+            // enabling would therefore also disable SCENE reload, leaking scene state
+            // into job N+1. Compute the patched value from the saved original instead
+            // so that only domain reload is disabled and scene reload stays ON.
+            EnterPlayModeOptions savedOptions = EditorSettings.enterPlayModeOptions;
             EditorPrefs.SetBool(KeyOptionsEnabled, EditorSettings.enterPlayModeOptionsEnabled);
-            EditorPrefs.SetInt (KeyOptions,        (int)EditorSettings.enterPlayModeOptions);
+            EditorPrefs.SetInt (KeyOptions,        (int)savedOptions);
             EditorPrefs.SetBool(KeyGuardActive,    true);
 
-            // Apply: enable options + add DisableDomainReload
+            // Apply: enable options + add DisableDomainReload only (derived from the
+            // saved original, NOT a re-read after enabling — see note above).
             EditorSettings.enterPlayModeOptionsEnabled = true;
             EditorSettings.enterPlayModeOptions =
-                EditorSettings.enterPlayModeOptions | EnterPlayModeOptions.DisableDomainReload;
+                savedOptions | EnterPlayModeOptions.DisableDomainReload;
 
             Debug.Log("[PlayModeReloadGuard] DisableDomainReload enabled for this recording session.");
         }
