@@ -100,34 +100,17 @@ namespace DistributedRecorder.Worker
         public static bool IsActive => EditorPrefs.GetBool(KeyGuardActive, false);
 
         // -----------------------------------------------------------------------
-        // Pure-logic helpers exposed for EditMode unit tests
+        // Pure-logic helper exposed for EditMode unit tests
         // -----------------------------------------------------------------------
 
         /// <summary>
-        /// Pure function: given <paramref name="original"/> options and
-        /// <paramref name="enabled"/> flag, returns the options value that would be set
-        /// after <see cref="Enable"/>.
+        /// Pure function: returns the options value that would be written by
+        /// <see cref="Enable"/> — <paramref name="original"/> with
+        /// <c>DisableDomainReload</c> OR-assigned.
         ///
         /// Exposed <c>internal</c> for hermetic EditMode tests.
         /// </summary>
         internal static EnterPlayModeOptions ApplyDisableDomainReload(EnterPlayModeOptions original)
             => original | EnterPlayModeOptions.DisableDomainReload;
-
-        /// <summary>
-        /// Pure function: verifies that applying then restoring leaves the original
-        /// value unchanged. Always returns <c>true</c>; asserted in tests.
-        ///
-        /// Exposed <c>internal</c> for hermetic EditMode tests.
-        /// </summary>
-        internal static bool RestoreIsIdempotent(EnterPlayModeOptions original)
-        {
-            var patched   = ApplyDisableDomainReload(original);
-            // Restore strips exactly what Enable added; if DisableDomainReload was already
-            // set in original, it stays set (not over-cleared). We restore the saved value
-            // verbatim, so the round-trip is original → patched → original (exact).
-            // Here we only test the pure math: restoring the saved copy equals original.
-            EnterPlayModeOptions restored = original; // saved value is original
-            return restored == original;
-        }
     }
 }

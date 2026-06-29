@@ -16,7 +16,7 @@ namespace DistributedRecorder.Tests.Worker
     ///   - Enable when already active is a no-op (guard flag check).
     ///   - Restore when not active is a no-op.
     ///   - Sanity-restore path (IsActive true before RunWithConfig).
-    ///   - Pure-function helpers ApplyDisableDomainReload and RestoreIsIdempotent.
+    ///   - Pure-function helper ApplyDisableDomainReload: idempotency and no mutation.
     ///
     /// All tests restore EditorSettings in [TearDown] to ensure they are hermetic.
     /// </summary>
@@ -225,7 +225,7 @@ namespace DistributedRecorder.Tests.Worker
         }
 
         // ------------------------------------------------------------------
-        // Tests: pure-function helpers
+        // Tests: pure-function helper (ApplyDisableDomainReload)
         // ------------------------------------------------------------------
 
         [Test]
@@ -245,11 +245,30 @@ namespace DistributedRecorder.Tests.Worker
         [TestCase(EnterPlayModeOptions.None)]
         [TestCase(EnterPlayModeOptions.DisableSceneReload)]
         [TestCase(EnterPlayModeOptions.DisableDomainReload | EnterPlayModeOptions.DisableSceneReload)]
-        public void RestoreIsIdempotent_AlwaysTrue(EnterPlayModeOptions original)
+        public void ApplyDisableDomainReload_IsIdempotentAndPure(EnterPlayModeOptions original)
         {
-            bool result = PlayModeReloadGuard.RestoreIsIdempotent(original);
-            Assert.IsTrue(result,
-                $"RestoreIsIdempotent must return true for any original value ({original}).");
+            // Verify that ApplyDisableDomainReload is a pure function.
+            // Two calls with the same input must yield the same result.
+            EnterPlayModeOptions firstCall  = PlayModeReloadGuard.ApplyDisableDomainReload(original);
+            EnterPlayModeOptions secondCall = PlayModeReloadGuard.ApplyDisableDomainReload(original);
+
+            Assert.AreEqual(firstCall, secondCall,
+                $"ApplyDisableDomainReload must be idempotent: " +
+                $"two calls with the same input ({original}) must return equal results.");
+
+            // The patched value must always have DisableDomainReload set.
+            bool hasDomainReloadBit = (firstCall & EnterPlayModeOptions.DisableDomainReload) != 0;
+            Assert.IsTrue(hasDomainReloadBit,
+                $"ApplyDisableDomainReload({original}) must always produce DisableDomainReload bit.");
+
+            // When DisableDomainReload was absent in original, patched must differ
+            // (proves the function actually modifies the value, not a no-op).
+            if ((original & EnterPlayModeOptions.DisableDomainReload) == 0)
+            {
+                Assert.AreNotEqual(original, firstCall,
+                    $"When DisableDomainReload is absent in original ({original}), " +
+                    $"the patched result must differ from original.");
+            }
         }
 
         // ------------------------------------------------------------------
