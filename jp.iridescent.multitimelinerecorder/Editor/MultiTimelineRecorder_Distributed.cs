@@ -1390,10 +1390,13 @@ namespace Unity.MultiTimelineRecorder
             try
             {
             // ── F10: open target scenes before dispatch ──────────────────────────
-            // Ensure the scenes referenced by the targets are open so that CollectRenderTargets
-            // ran against the correct (loaded) scene state.  If a scene is not loaded the job's
-            // ScenePath was collected from SceneManager.GetActiveScene() (may be wrong scene).
-            // We open each unique scene once; if already open, OpenScene is a no-op.
+            // Open (or ensure open) each unique scene referenced by the targets.
+            // CollectRenderTargets has already run at this point, so opening scenes here
+            // does NOT retroactively change the ScenePath values that were collected.
+            // In practice, targets all share the same active scene path (single-scene MTR),
+            // so this loop is usually a no-op.  It is retained as a defensive step for
+            // future multi-scene support; if already open, EditorSceneManager.OpenScene
+            // returns the existing scene without reloading.
             // Main-thread call: this method is called from StartDistributedRecordingAsync (async void
             // on the Unity synchronization context) so Unity API calls are safe here.
             var scenePaths = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
