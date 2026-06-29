@@ -851,6 +851,14 @@ namespace Unity.MultiTimelineRecorder
 
             string activeScenePath = SceneManager.GetActiveScene().path;
 
+            // Content-hash (jobScopeHash) is only a fallback for non-git projects. When a
+            // git commit is available the Worker verifies by commit, so we skip the
+            // expensive per-job AssetDatabase.GetDependencies hashing — that whole-deps
+            // scan was the main cause of the dispatch-time Editor freeze. Checked once
+            // here (git rev-parse is ~tens of ms).
+            bool gitAvailable = DistributedRecorder.Shared.GitInfo.TryGetHeadCommit(
+                ProjectPaths.ProjectRoot, out _, out _);
+
             foreach (int idx in selectedDirectorIndices)
             {
                 if (idx < 0 || idx >= recordingQueueDirectors.Count)
@@ -976,9 +984,11 @@ namespace Unity.MultiTimelineRecorder
                 string resolvedOutputRelativePath = ResolveOutputRelativePath(
                     supportedItem, activeScenePath, director);
 
-                // Compute job-scope hash (timeline + deps + scene only, no whole-Assets scan)
+                // Compute job-scope hash (timeline + deps + scene only, no whole-Assets scan).
+                // Skipped when git is available — the Worker verifies by commit, and this
+                // per-job dependency hashing is the heaviest synchronous dispatch-time work.
                 string jobScopeHash = string.Empty;
-                if (!string.IsNullOrEmpty(timelineAssetPath) && !string.IsNullOrEmpty(activeScenePath))
+                if (!gitAvailable && !string.IsNullOrEmpty(timelineAssetPath) && !string.IsNullOrEmpty(activeScenePath))
                 {
                     try
                     {

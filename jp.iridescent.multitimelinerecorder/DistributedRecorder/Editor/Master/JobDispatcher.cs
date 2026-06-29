@@ -324,14 +324,24 @@ namespace DistributedRecorder.Master
                     $"[JobDispatcher] git rev-parse HEAD failed – falling back to content-hash: {gitError}");
             }
 
-            try
+            // projectHash is only the fallback for non-git projects. When a git commit was
+            // obtained above, the Worker verifies by commit, so skip the expensive
+            // whole-Assets hash (a major contributor to the dispatch-time Editor freeze).
+            if (string.IsNullOrEmpty(request.gitCommit))
             {
-                request.projectHash = ProjectHasher.Compute(_projectRoot);
+                try
+                {
+                    request.projectHash = ProjectHasher.Compute(_projectRoot);
+                }
+                catch (Exception ex)
+                {
+                    return DispatchResult.Fail(request.jobId, DispatchFailReason.HashError,
+                        $"Failed to compute project hash: {ex.Message}");
+                }
             }
-            catch (Exception ex)
+            else
             {
-                return DispatchResult.Fail(request.jobId, DispatchFailReason.HashError,
-                    $"Failed to compute project hash: {ex.Message}");
+                request.projectHash = string.Empty;
             }
 
             // 4. POST the job
