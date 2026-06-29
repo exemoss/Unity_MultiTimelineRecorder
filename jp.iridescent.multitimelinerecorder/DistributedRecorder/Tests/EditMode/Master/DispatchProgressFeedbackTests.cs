@@ -158,8 +158,10 @@ namespace DistributedRecorder.Tests.Master
             Assert.IsFalse(result.Success);
             Assert.AreEqual(DispatchFailReason.Unreachable, result.FailReason,
                 "Dead Worker should return Unreachable, not NetworkError or other reason.");
-            // Error message should contain timeout value ≤ 3
-            StringAssert.Contains("3", result.ErrorMessage,
+            // Error message should reference the 3-second timeout value.
+            // We match "3s" (unit-suffixed) rather than bare "3" to avoid false-positive
+            // matches on other numeric substrings in the message.
+            StringAssert.Contains("3s", result.ErrorMessage,
                 "Error message should reference the 3s timeout.");
         }
 
