@@ -1,6 +1,6 @@
 {
   "name": "jp.iridescent.multitimelinerecorder",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "displayName": "Unity Multi Timeline Recorder",
   "description": "A comprehensive tool for batch recording multiple Unity Timelines with various output formats including Movie, Image Sequence, Animation, AOV, Alembic, and FBX. This fork adds LAN-distributed rendering: dispatch each Timeline as a job to Worker PCs on the local network and collect the results.",
   "unity": "2021.3",
