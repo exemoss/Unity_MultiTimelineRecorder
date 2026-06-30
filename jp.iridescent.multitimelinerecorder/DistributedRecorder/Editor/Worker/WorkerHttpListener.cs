@@ -227,6 +227,10 @@ namespace DistributedRecorder.Worker
                 {
                     HandleCancelJob(ctx, remoteIp);
                 }
+                else if (method == "POST" && rawUrl.Equals("/git-sync", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleGitSync(ctx, remoteIp);
+                }
                 else if (method == "GET" && TryParseJobRoute(rawUrl, out string jobId, out string subPath))
                 {
                     HandleGetJob(ctx, remoteIp, jobId, subPath);
@@ -247,6 +251,17 @@ namespace DistributedRecorder.Worker
 
         private void HandleHealth(HttpListenerContext ctx)
         {
+            // worker-git-sync (v1.4.11): populate gitBranch + gitCommitShort for master branch-match.
+            // Best-effort: empty string when git unavailable or detached HEAD.
+            string gitBranch = string.Empty;
+            string gitCommitShort = string.Empty;
+
+            if (DistributedRecorder.Shared.GitInfo.TryGetCurrentBranch(_projectRoot, out string branch, out _))
+                gitBranch = branch;
+
+            if (DistributedRecorder.Shared.GitInfo.TryGetHeadCommit(_projectRoot, out string headSha, out _))
+                gitCommitShort = headSha.Length >= 8 ? headSha.Substring(0, 8) : headSha;
+
             var health = new WorkerHealth
             {
                 alive           = true,
@@ -255,6 +270,8 @@ namespace DistributedRecorder.Worker
                 currentJobId    = _store.ActiveJobId ?? string.Empty,
                 currentJobState = _store.ActiveJobId != null ? JobState.Running : JobState.Pending,
                 jobsProcessed   = _store.CompletedJobCount,
+                gitBranch       = gitBranch,
+                gitCommitShort  = gitCommitShort,
             };
             RespondJson(ctx, 200, ProtocolSerializer.Serialize(health));
         }
@@ -720,6 +737,121 @@ namespace DistributedRecorder.Worker
                     Debug.Log(
                         $"[WorkerHttpListener] /cancel: TryCancelJob returned false: {cancelReason}");
                 }
+            });
+        }
+
+        // --- POST /git-sync (worker-git-sync, v1.4.11) --------------------------
+
+        /// <summary>
+        /// Handles POST /git-sync — performs <c>git fetch origin &lt;branch&gt;</c> followed by
+        /// <c>git reset --hard origin/&lt;branch&gt;</c> on this Worker's current branch.
+        ///
+        /// Security requirements:
+        ///  1. HMAC authentication (same pattern as /cancel, /align-recorder).
+        ///  2. IP allowlist + ban check enforced in HandleRequest before this is called.
+        ///  3. No branch name is accepted from the request. The Worker obtains its current
+        ///     branch via <see cref="GitInfo.TryGetCurrentBranch"/> (injection impossible).
+        ///  4. Branch name is validated by <see cref="GitInfo.IsValidRefName"/>.
+        ///  5. Only <c>git fetch</c> and <c>git reset --hard</c> are executed.
+        ///     No arbitrary git commands are possible.
+        ///  6. All git calls use <see cref="GitInfo"/> (ArgumentList, no shell).
+        ///  7. Returns 202 immediately; actual git operations run synchronously on the main
+        ///     thread via MainThreadDispatcher (same pattern as /cancel).
+        ///
+        /// Wire-compat: Workers older than v1.4.11 do not have this route and return 404
+        /// via the default "Not found" handler. The master handles 404 gracefully (skip + log).
+        /// </summary>
+        private void HandleGitSync(HttpListenerContext ctx, string remoteIp)
+        {
+            string body      = ReadBody(ctx);
+            byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
+
+            // 1. HMAC authentication — /git-sync is NOT in the /health skip list.
+            string ts  = ctx.Request.Headers["X-Timestamp"] ?? string.Empty;
+            string nc  = ctx.Request.Headers["X-Nonce"]     ?? string.Empty;
+            string sig = ctx.Request.Headers["X-Signature"] ?? string.Empty;
+
+            if (!_auth.Validate("POST", "/git-sync", bodyBytes, ts, nc, sig, out string authReason))
+            {
+                RecordAuthFailure(remoteIp);
+                Debug.LogWarning($"[WorkerHttpListener] /git-sync auth failure from {remoteIp}: {authReason}");
+                RespondJson(ctx, 401, $"{{\"error\":\"Authentication failed: {EscapeJson(authReason)}\"}}");
+                return;
+            }
+
+            // 2. Deserialize request (empty body is OK; requestId is a no-op placeholder).
+            // No branch name or git command is accepted from the request.
+            // (Deserialize failure is non-fatal: the request body carries no meaningful input.)
+
+            // 3. Busy check: reject when a job is actively running (same guard as /align-recorder).
+            if (_store.HasActiveJob)
+            {
+                string activeId = _store.ActiveJobId ?? string.Empty;
+                Debug.LogWarning(
+                    $"[WorkerHttpListener] /git-sync rejected from {remoteIp}: " +
+                    $"Worker is busy executing job '{activeId}'.");
+                var busyAck = new GitSyncAck
+                {
+                    accepted = false,
+                    reason   = $"Worker is busy executing job '{EscapeJson(activeId)}'. " +
+                               "git sync is only allowed when idle."
+                };
+                RespondJson(ctx, 409, ProtocolSerializer.Serialize(busyAck));
+                return;
+            }
+
+            // 4. Determine the current branch from the local repo (no network input used).
+            string capturedProjectRoot = _projectRoot;
+
+            // Respond 202 immediately; git operations run on the main thread.
+            var immediateAck = new GitSyncAck { accepted = true, reason = "Sync started." };
+            RespondJson(ctx, 202, ProtocolSerializer.Serialize(immediateAck));
+
+            // 5. Enqueue the actual git operations on the main thread.
+            //    All git calls use GitInfo (ArgumentList, no shell injection possible).
+            MainThreadDispatcher.Enqueue(() =>
+            {
+                Debug.Log(
+                    $"[WorkerHttpListener] /git-sync: main-thread dispatch requested by {remoteIp}");
+
+                // Step A: determine current branch (never from request).
+                if (!DistributedRecorder.Shared.GitInfo.TryGetCurrentBranch(
+                        capturedProjectRoot, out string branch, out string branchErr))
+                {
+                    Debug.LogError(
+                        $"[WorkerHttpListener] /git-sync: failed to determine current branch: {branchErr}");
+                    return;
+                }
+
+                Debug.Log(
+                    $"[WorkerHttpListener] /git-sync: branch = '{branch}'. " +
+                    "Running git fetch origin…");
+
+                // Step B: fetch.
+                if (!DistributedRecorder.Shared.GitInfo.TryFetch(
+                        capturedProjectRoot, branch, out string fetchErr))
+                {
+                    Debug.LogError(
+                        $"[WorkerHttpListener] /git-sync: git fetch origin {branch} failed: {fetchErr}");
+                    return;
+                }
+
+                Debug.Log(
+                    $"[WorkerHttpListener] /git-sync: fetch succeeded. Running git reset --hard origin/{branch}…");
+
+                // Step C: reset --hard.
+                if (!DistributedRecorder.Shared.GitInfo.TryResetHard(
+                        capturedProjectRoot, branch,
+                        out string newHead, out string syncSummary, out string resetErr))
+                {
+                    Debug.LogError(
+                        $"[WorkerHttpListener] /git-sync: git reset --hard origin/{branch} failed: {resetErr}");
+                    return;
+                }
+
+                Debug.Log(
+                    $"[WorkerHttpListener] /git-sync: completed. {syncSummary}. " +
+                    "Unity will domain-reload to reflect code changes.");
             });
         }
 
