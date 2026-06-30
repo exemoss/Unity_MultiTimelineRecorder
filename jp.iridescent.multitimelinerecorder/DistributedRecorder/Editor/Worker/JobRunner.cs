@@ -184,6 +184,89 @@ namespace DistributedRecorder.Worker
         }
 
         // ------------------------------------------------------------------
+        // stop-button: cancel API
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// Attempts to cancel the currently running job.
+        ///
+        /// If <paramref name="jobId"/> matches the active job, the recording is
+        /// interrupted by exiting Play Mode (if active) and the job is marked
+        /// <see cref="JobState.Cancelled"/> in the store.
+        ///
+        /// Returns <c>true</c> when the cancel was acted upon; <c>false</c> when
+        /// there is no active job matching <paramref name="jobId"/>.
+        ///
+        /// Must be called from the Unity main thread.
+        /// </summary>
+        public bool TryCancelJob(string jobId, out string reason)
+        {
+            reason = string.Empty;
+
+            if (_runningJobId == null || _phase == RecordingPhase.Idle)
+            {
+                reason = $"No active job to cancel.";
+                return false;
+            }
+
+            if (!string.Equals(_runningJobId, jobId, StringComparison.Ordinal))
+            {
+                reason = $"Active job is '{_runningJobId}', not '{jobId}'.";
+                return false;
+            }
+
+            Debug.Log($"[JobRunner] ジョブ '{jobId}' のキャンセルを開始します。");
+
+            // Unsubscribe update/state-change callbacks first to prevent
+            // the normal completion path from racing with cancel.
+            UnsubscribeAll();
+
+            // Exit Play Mode if currently in it.
+#if UNITY_RECORDER
+            if (EditorApplication.isPlaying)
+            {
+                Debug.Log($"[JobRunner] Play Mode を終了します（キャンセル）。jobId='{jobId}'");
+                EditorApplication.ExitPlaymode();
+            }
+#endif
+            // Clean up temp timeline (no-op if not created).
+            CleanupTempTimeline();
+
+            // Mark the job cancelled in the store and push a progress event.
+            _store.UpdateStatus(jobId, s =>
+            {
+                s.state   = JobState.Cancelled;
+                s.message = "Job cancelled by master request.";
+            });
+
+            var result = new JobResult
+            {
+                jobId     = jobId,
+                success   = false,
+                exitCode  = 2,
+                errorText = "Cancelled by master /cancel request."
+            };
+            _store.SetResult(jobId, result);
+
+            _progress.Push(new ProgressEvent
+            {
+                jobId        = jobId,
+                state        = JobState.Cancelled,
+                message      = "Job cancelled.",
+                timestampUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            });
+
+            // Restore PlayModeReloadGuard so the Worker can accept next jobs.
+            PlayModeReloadGuard.Restore();
+
+            // Reset runner state so TryStartJob can proceed.
+            ResetState();
+
+            Debug.Log($"[JobRunner] ジョブ '{jobId}' をキャンセルしました。次のジョブを受け付けられます。");
+            return true;
+        }
+
+        // ------------------------------------------------------------------
         // Internal: job execution
         // ------------------------------------------------------------------
 
