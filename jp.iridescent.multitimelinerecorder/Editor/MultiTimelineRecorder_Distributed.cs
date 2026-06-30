@@ -199,6 +199,23 @@ namespace Unity.MultiTimelineRecorder
         /// </summary>
         private bool _reprobing;
 
+        // worker-git-sync (v1.4.11): guard flag ──────────────────────────────────
+        //
+        // Set to true while SyncWorkersToLatestAsync is running to prevent concurrent
+        // button-clicks.  Only accessed on the Editor main thread.
+
+        /// <summary>
+        /// True while the "Worker を最新に同期" operation is in progress.
+        /// Prevents concurrent invocations from a rapid button double-click.
+        /// </summary>
+        private bool _syncingWorkers;
+
+        /// <summary>
+        /// Last result message from the most recent git sync operation, shown in the UI.
+        /// Cleared at the start of each new sync.
+        /// </summary>
+        private string _syncResultMessage;
+
         /// <summary>
         /// Last result message from the most recent reprobe operation, shown in the UI.
         /// Cleared at the start of each new reprobe.
@@ -494,6 +511,32 @@ namespace Unity.MultiTimelineRecorder
             }
             GUI.color = prevColor;
             GUI.enabled = true;
+            EditorGUILayout.EndHorizontal();
+            // ─────────────────────────────────────────────────────────────────
+
+            // ── worker-git-sync (v1.4.11): "Worker を最新に同期" button ─────────
+            // Destructive operation: discards Worker's local uncommitted changes.
+            // - Enabled when a registry is loaded (not batch-gated: useful before dispatch).
+            // - Master's own branch is fetched via GitInfo; Workers on a different branch
+            //   are skipped to prevent accidental cross-branch sync.
+            // - Confirmation dialog required before execution.
+            // - 404 from old Workers (< v1.4.11) is handled gracefully (skip + log).
+            EditorGUILayout.BeginHorizontal();
+            bool hasRegistry = _distWorkerRegistry != null
+                               && _distWorkerRegistry.workers != null
+                               && _distWorkerRegistry.workers.Count > 0;
+            GUI.enabled = hasRegistry && !_syncingWorkers;
+            if (GUILayout.Button(
+                    _syncingWorkers ? "同期中…" : "Worker を最新に同期",
+                    GUILayout.Height(22)))
+            {
+                _ = SyncWorkersToLatestAsync();
+            }
+            GUI.enabled = true;
+            if (!string.IsNullOrEmpty(_syncResultMessage))
+            {
+                EditorGUILayout.LabelField(_syncResultMessage, EditorStyles.miniLabel);
+            }
             EditorGUILayout.EndHorizontal();
             // ─────────────────────────────────────────────────────────────────
 
@@ -1094,6 +1137,195 @@ namespace Unity.MultiTimelineRecorder
                         $"Worker '{worker.displayName}' との通信に失敗しました:\n{message}",
                         "OK");
                     break;
+            }
+
+            Repaint();
+        }
+
+        // -----------------------------------------------------------------------
+        // Worker git sync (worker-git-sync, v1.4.11)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Sends POST /git-sync to each online Worker that is on the same git branch
+        /// as the master.  Workers on a different branch (or unreachable Workers) are
+        /// skipped to prevent accidental cross-branch sync.
+        ///
+        /// Security:
+        ///  - Branch name is never sent in the request body.  The Worker uses its own
+        ///    local git state, preventing injection.
+        ///  - A confirmation dialog is shown before any destructive operation.
+        ///  - Wire-compat: old Workers (< v1.4.11) return 404 and are skipped.
+        ///
+        /// Must NOT use ConfigureAwait(false) — continuations must stay on the main
+        /// thread for Unity API calls (Repaint, EditorUtility.DisplayDialog).
+        /// </summary>
+        private async Task SyncWorkersToLatestAsync()
+        {
+            if (_syncingWorkers)
+                return;
+
+            // 1. Determine master's current branch.
+            string masterBranch;
+            if (!DistributedRecorder.Shared.GitInfo.TryGetCurrentBranch(
+                    ProjectPaths.ProjectRoot, out masterBranch, out string branchErr))
+            {
+                EditorUtility.DisplayDialog(
+                    "ブランチ取得失敗",
+                    $"Master の現在のブランチを取得できませんでした:\n{branchErr}\n\n" +
+                    "git リポジトリ内でのみ使用できます。",
+                    "OK");
+                return;
+            }
+
+            // 2. Load shared key.
+            if (!SharedKeyLoader.TryLoad(out byte[] keyBytes, out string keyError))
+            {
+                EditorUtility.DisplayDialog(
+                    "共有キーエラー",
+                    $"共有キーのロードに失敗しました: {keyError}",
+                    "OK");
+                return;
+            }
+
+            using var transport  = new HttpTransport(new HmacAuthenticator(keyBytes));
+            var       dispatcher = new JobDispatcher(transport, ProjectPaths.ProjectRoot);
+
+            // 3. Probe each enabled Worker's gitBranch.
+            var workers = _distWorkerRegistry?.EnabledWorkers;
+            if (workers == null || workers.Count == 0)
+            {
+                EditorUtility.DisplayDialog(
+                    "Worker が見つかりません",
+                    "有効な Worker がレジストリに登録されていません。",
+                    "OK");
+                return;
+            }
+
+            _syncResultMessage = "ブランチ確認中…";
+            Repaint();
+
+            var samebranchWorkers = new List<WorkerInfo>();
+            var skipMessages      = new System.Text.StringBuilder();
+
+            foreach (var worker in workers)
+            {
+                if (worker == null) continue;
+                string workerBranch = await dispatcher.GetWorkerGitBranchAsync(worker);
+
+                if (string.IsNullOrEmpty(workerBranch))
+                {
+                    // Unreachable or no git info — skip.
+                    skipMessages.AppendLine(
+                        $"  {worker.displayName}: ブランチ取得不可（オフラインまたは旧バージョン）→ スキップ");
+                    Debug.Log(
+                        $"[DistributedRecorder] git sync: skipping '{worker.displayName}' " +
+                        "(unreachable or pre-v1.4.11 Worker).");
+                    continue;
+                }
+
+                if (!string.Equals(workerBranch, masterBranch, StringComparison.Ordinal))
+                {
+                    // Different branch — skip to prevent accidental sync.
+                    skipMessages.AppendLine(
+                        $"  {worker.displayName}: ブランチ違い (Worker={workerBranch}, Master={masterBranch}) → スキップ");
+                    Debug.Log(
+                        $"[DistributedRecorder] git sync: skipping '{worker.displayName}' " +
+                        $"(branch mismatch: worker='{workerBranch}', master='{masterBranch}').");
+                    continue;
+                }
+
+                samebranchWorkers.Add(worker);
+            }
+
+            if (samebranchWorkers.Count == 0)
+            {
+                string skipInfo = skipMessages.Length > 0
+                    ? $"\n\nスキップされた Worker:\n{skipMessages}"
+                    : string.Empty;
+                EditorUtility.DisplayDialog(
+                    "同期対象なし",
+                    $"Master と同じブランチ '{masterBranch}' の Worker がありませんでした。{skipInfo}",
+                    "OK");
+                _syncResultMessage = string.Empty;
+                Repaint();
+                return;
+            }
+
+            // 4. Confirmation dialog (destructive: discards local changes on Workers).
+            string skipInfo2 = skipMessages.Length > 0
+                ? $"\n\n以下はスキップされます:\n{skipMessages}"
+                : string.Empty;
+
+            string targetList = string.Join(
+                "\n", samebranchWorkers.Select(w => $"  • {w.displayName}"));
+
+            bool confirmed = EditorUtility.DisplayDialog(
+                "Worker を最新に同期",
+                $"以下の Worker を最新コミットに同期しますか？\n\n{targetList}\n\n" +
+                $"ブランチ: {masterBranch}\n" +
+                "実行内容: git fetch origin → git reset --hard origin/<branch>\n\n" +
+                "この操作は Worker のローカルの未コミット変更を破棄します。\n" +
+                "取り消せません。" + skipInfo2,
+                "同期する",
+                "キャンセル");
+
+            if (!confirmed)
+            {
+                _syncResultMessage = string.Empty;
+                Repaint();
+                return;
+            }
+
+            // 5. Send /git-sync to each same-branch Worker.
+            _syncingWorkers    = true;
+            _syncResultMessage = "同期中…";
+            Repaint();
+
+            var results      = new System.Text.StringBuilder();
+            int successCount = 0;
+            int failCount    = 0;
+
+            foreach (var worker in samebranchWorkers)
+            {
+                _syncResultMessage = $"{worker.displayName} に同期リクエスト送信中…";
+                Repaint();
+
+                var (accepted, message, summary) = await dispatcher.SendGitSyncAsync(worker);
+
+                if (accepted)
+                {
+                    successCount++;
+                    Debug.Log(
+                        $"[DistributedRecorder] git sync: '{worker.displayName}' accepted. {summary}");
+                    results.AppendLine($"  {worker.displayName}: 同期開始 (202 Accepted)");
+                }
+                else
+                {
+                    failCount++;
+                    Debug.LogWarning(
+                        $"[DistributedRecorder] git sync: '{worker.displayName}' failed: {message}");
+                    results.AppendLine($"  {worker.displayName}: 失敗 ({message})");
+                }
+            }
+
+            _syncingWorkers    = false;
+            _syncResultMessage = $"同期完了: {successCount} 件成功, {failCount} 件失敗";
+
+            if (failCount > 0)
+            {
+                EditorUtility.DisplayDialog(
+                    "同期結果",
+                    $"同期リクエストを送信しました。\n\n{results}\n" +
+                    "Worker の Console ログで結果を確認してください。\n" +
+                    "（git reset --hard はバックグラウンドで実行されます。ドメインリロードが発生する場合があります。）",
+                    "OK");
+            }
+            else
+            {
+                Debug.Log(
+                    $"[DistributedRecorder] git sync: all {successCount} Worker(s) accepted sync request.\n" +
+                    results);
             }
 
             Repaint();
