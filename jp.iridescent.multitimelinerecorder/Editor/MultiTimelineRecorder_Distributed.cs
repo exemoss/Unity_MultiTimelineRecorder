@@ -100,6 +100,23 @@ namespace Unity.MultiTimelineRecorder
         // EditorPrefs keys (MTR window scope)
         private const string PrefKeyDistMode     = "MTR.DistributedMode";
         private const string PrefKeyDistRegistry = "MTR.DistributedRegistryGuid";
+        private const string PrefKeyCollectDir   = "MultiTimelineRecorder.distributed.collectDir";
+
+        // ── collect-to-dir state (v1.4.10) ──────────────────────────────────────
+
+        /// <summary>
+        /// User-specified absolute path for bulk collection of render results.
+        /// Empty = feature disabled.  Snapshotted into <see cref="MtrJobViewModel.CollectDir"/>
+        /// at dispatch time so that UI edits do not affect in-flight jobs.
+        /// Persisted via <see cref="PrefKeyCollectDir"/> in <see cref="EditorPrefs"/>.
+        /// </summary>
+        private string _collectDir = string.Empty;
+
+        /// <summary>
+        /// Guard flag for the "まとめて DL" bulk-collect button.
+        /// Prevents concurrent invocations from rapid double-clicks.
+        /// </summary>
+        private bool _isBulkCollecting;
 
         // Default relative output root (relative to project root)
         private const string DistOutputRelRoot = "Recordings/Distributed";
@@ -480,6 +497,12 @@ namespace Unity.MultiTimelineRecorder
             EditorGUILayout.EndHorizontal();
             // ─────────────────────────────────────────────────────────────────
 
+            // ── collect-to-dir UI (v1.4.10) ──────────────────────────────────
+            // Placed directly below the stop button so both controls are visible
+            // in the same section of the MTR window.
+            DrawCollectDirUI();
+            // ─────────────────────────────────────────────────────────────────
+
             // Scrollable job list (max 150px)
             _distJobScrollPos = EditorGUILayout.BeginScrollView(
                 _distJobScrollPos, GUILayout.Height(Mathf.Min(150, _dispatchedJobs.Count * 36 + 4)));
@@ -597,6 +620,123 @@ namespace Unity.MultiTimelineRecorder
                     return LabelQueued;
             }
         }
+
+        // ── collect-to-dir UI (v1.4.10) ──────────────────────────────────────────
+        //
+        // "収集先ディレクトリ" text field + "..." folder picker + "まとめて DL" button.
+        // Rendered inside DrawDistributedJobList(), directly below the stop button,
+        // so it appears in the same MTR window section that users already interact with.
+        //
+        // _collectDir is persisted to EditorPrefs (PrefKeyCollectDir) by
+        // InitDistributedSection / PersistDistributedState.
+        // ─────────────────────────────────────────────────────────────────────────
+
+        private void DrawCollectDirUI()
+        {
+            EditorGUILayout.Space(2);
+            EditorGUILayout.LabelField("収集先ディレクトリ", EditorStyles.boldLabel);
+
+            // Path text field + folder picker on the same line.
+            EditorGUILayout.BeginHorizontal();
+            string newDir = EditorGUILayout.TextField(
+                new GUIContent("収集先",
+                    "完了したジョブの成果物をまとめてコピーするディレクトリ。\n" +
+                    "空の場合は従来の Output Directory のみに保存されます。"),
+                _collectDir);
+
+            if (newDir != _collectDir)
+            {
+                _collectDir = newDir;
+                PersistDistributedState();
+            }
+
+            if (GUILayout.Button("...", GUILayout.Width(30)))
+            {
+                string picked = EditorUtility.OpenFolderPanel(
+                    "収集先ディレクトリを選択",
+                    string.IsNullOrEmpty(_collectDir) ? string.Empty : _collectDir,
+                    string.Empty);
+
+                if (!string.IsNullOrEmpty(picked))
+                {
+                    if (CollectPathValidator.Validate(picked, out string pathErr))
+                    {
+                        _collectDir = picked;
+                        PersistDistributedState();
+                    }
+                    else
+                    {
+                        EditorUtility.DisplayDialog("無効なパス", pathErr, "OK");
+                    }
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+
+            // Inline validation feedback.
+            if (!string.IsNullOrEmpty(_collectDir))
+            {
+                if (!CollectPathValidator.Validate(_collectDir, out string valErr))
+                    EditorGUILayout.HelpBox($"パスが無効です: {valErr}", MessageType.Error);
+                else
+                    EditorGUILayout.LabelField("  " + _collectDir, EditorStyles.miniLabel);
+            }
+            else
+            {
+                EditorGUILayout.LabelField("(未設定 – 収集機能は無効)", EditorStyles.miniLabel);
+            }
+
+            EditorGUILayout.Space(2);
+
+            // "まとめて DL（収集先へ）" button.
+            bool hasValidCollectDir = !string.IsNullOrEmpty(_collectDir) &&
+                                      CollectPathValidator.Validate(_collectDir, out _);
+
+            // Count eligible jobs: Completed + Done + LocalOutputDir present.
+            int eligibleCount = 0;
+            foreach (var job in _dispatchedJobs)
+            {
+                if (job.State == JobState.Completed &&
+                    job.DownloadState == DownloadState.Done &&
+                    !string.IsNullOrEmpty(job.LocalOutputDir))
+                {
+                    eligibleCount++;
+                }
+            }
+
+            using (new EditorGUI.DisabledScope(!hasValidCollectDir || _isBulkCollecting))
+            {
+                string btnLabel = _isBulkCollecting
+                    ? "収集中..."
+                    : $"まとめて DL（収集先へ）[完了済み {eligibleCount} 件]";
+
+                if (GUILayout.Button(btnLabel, GUILayout.Height(24)))
+                {
+                    if (!hasValidCollectDir)
+                    {
+                        EditorUtility.DisplayDialog(
+                            "収集先を指定してください",
+                            "収集先ディレクトリが設定されていないか無効です。\n" +
+                            "「収集先」欄にディレクトリを指定してから実行してください。",
+                            "OK");
+                    }
+                    else
+                    {
+                        BulkCollectAsync();
+                    }
+                }
+            }
+
+            if (!hasValidCollectDir && string.IsNullOrEmpty(_collectDir))
+            {
+                EditorGUILayout.LabelField(
+                    "収集先を指定するとボタンが有効になります",
+                    EditorStyles.miniLabel);
+            }
+
+            EditorGUILayout.Space(2);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────
 
         private static void DrawMtrJobRow(MtrJobViewModel vm)
         {
@@ -977,6 +1117,9 @@ namespace Unity.MultiTimelineRecorder
                 if (!string.IsNullOrEmpty(path))
                     _distWorkerRegistry = AssetDatabase.LoadAssetAtPath<WorkerRegistryAsset>(path);
             }
+
+            // collect-to-dir (v1.4.10): restore persisted collect dir.
+            _collectDir = EditorPrefs.GetString(PrefKeyCollectDir, string.Empty);
         }
 
         private void PersistDistributedState()
@@ -988,6 +1131,9 @@ namespace Unity.MultiTimelineRecorder
                 string guid = AssetDatabase.AssetPathToGUID(path);
                 EditorPrefs.SetString(PrefKeyDistRegistry, guid);
             }
+
+            // collect-to-dir (v1.4.10): persist collect dir.
+            EditorPrefs.SetString(PrefKeyCollectDir, _collectDir ?? string.Empty);
         }
 
         // -----------------------------------------------------------------------
@@ -1793,6 +1939,10 @@ namespace Unity.MultiTimelineRecorder
                     RetryCount     = 0,
                     TriedWorkers   = new HashSet<string>(),
                     Phase          = JobPhase.Queued,  // dispatch-status-labels
+                    // collect-to-dir (v1.4.10): snapshot at dispatch time so later
+                    // UI edits to _collectDir do not affect already-queued jobs.
+                    CollectDir      = _collectDir,
+                    CollectDisambig = jobId.Substring(0, Math.Min(8, jobId.Length)),
                 };
 
                 _dispatchedJobs.Add(vm);
@@ -3429,6 +3579,14 @@ namespace Unity.MultiTimelineRecorder
                     vm.Phase = JobPhase.Terminal; // dispatch-status-labels
                     Debug.Log(
                         $"[DistributedRecorder] 回収完了: {result.Files.Count} ファイル → {vm.LocalOutputDir}");
+
+                    // collect-to-dir (v1.4.10): auto-copy to collect dir if set at dispatch time.
+                    if (!string.IsNullOrEmpty(vm.CollectDir) &&
+                        CollectPathValidator.Validate(vm.CollectDir, out _))
+                    {
+                        // Fire-and-forget; errors are logged inside CopyToCollectDirAsync.
+                        _ = CopyToCollectDirAsync(vm, result.Files);
+                    }
                 }
                 else
                 {
@@ -3442,6 +3600,164 @@ namespace Unity.MultiTimelineRecorder
             finally
             {
                 transport.Dispose();
+                Repaint();
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Collect-to-dir helpers (v1.4.10)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Copies <paramref name="localFiles"/> to a sub-directory under
+        /// <see cref="MtrJobViewModel.CollectDir"/>.
+        ///
+        /// Destination naming: <c>CollectDir / TimelineName_disambig /</c>
+        /// (collision avoidance via <see cref="CollectPathValidator.BuildDestinationPath"/>).
+        ///
+        /// I/O runs on a background thread (<see cref="Task.Run"/>); Unity API calls
+        /// are routed to the main thread via <see cref="MainThreadDispatcher.Enqueue"/>.
+        ///
+        /// Security: path validation is done by the caller before this method is
+        /// invoked; this method trusts that <paramref name="vm.CollectDir"/> has already
+        /// been validated.
+        /// </summary>
+        private async Task CopyToCollectDirAsync(MtrJobViewModel vm, IReadOnlyList<string> localFiles)
+        {
+            if (localFiles == null || localFiles.Count == 0) return;
+
+            string targetDir = vm.CollectDir;
+            if (string.IsNullOrEmpty(targetDir)) return;
+
+            // Use TimelineName as the sub-directory label, falling back to jobId prefix.
+            string label = !string.IsNullOrEmpty(vm.TimelineName) ? vm.TimelineName : vm.JobId;
+            string disambig = vm.CollectDisambig ?? vm.JobId.Substring(0, Math.Min(8, vm.JobId.Length));
+
+            string destDir = CollectPathValidator.BuildDestinationPath(
+                targetDir,
+                label,
+                disambig,
+                Directory.Exists);
+
+            try
+            {
+                await Task.Run(() =>
+                {
+                    CollectPathValidator.EnsureDirectory(destDir);
+                    foreach (string src in localFiles)
+                    {
+                        if (!File.Exists(src)) continue;
+                        string fileName = Path.GetFileName(src);
+                        string dest     = Path.Combine(destDir, fileName);
+
+                        // Avoid overwriting an identically-named file (simple name check).
+                        if (File.Exists(dest))
+                        {
+                            string stem = Path.GetFileNameWithoutExtension(fileName);
+                            string ext  = Path.GetExtension(fileName);
+                            dest = Path.Combine(destDir, $"{stem}_{disambig}{ext}");
+                        }
+
+                        File.Copy(src, dest, overwrite: false);
+                    }
+                }).ConfigureAwait(false);
+
+                // Back on a thread-pool thread after ConfigureAwait(false):
+                // route Unity API calls to the main thread.
+                MainThreadDispatcher.Enqueue(() =>
+                {
+                    Debug.Log($"[DistributedRecorder] 収集完了: {localFiles.Count} ファイル → {destDir}");
+                    Repaint();
+                });
+            }
+            catch (Exception ex)
+            {
+                MainThreadDispatcher.Enqueue(() =>
+                {
+                    Debug.LogError(
+                        $"[DistributedRecorder] 収集コピー失敗 ジョブ {vm.JobId.Substring(0, Math.Min(8, vm.JobId.Length))}: {ex.Message}");
+                    Repaint();
+                });
+            }
+        }
+
+        /// <summary>
+        /// Copies already-downloaded files for all Completed+Done jobs to
+        /// <see cref="_collectDir"/> (current UI value, not the per-job snapshot).
+        ///
+        /// Called by the "まとめて DL（収集先へ）" button.
+        /// Guard: <see cref="_isBulkCollecting"/>.
+        /// </summary>
+        private async void BulkCollectAsync()
+        {
+            if (_isBulkCollecting) return;
+            if (string.IsNullOrEmpty(_collectDir)) return;
+            if (!CollectPathValidator.Validate(_collectDir, out string valErr))
+            {
+                EditorUtility.DisplayDialog("収集先が無効", valErr, "OK");
+                return;
+            }
+
+            _isBulkCollecting = true;
+            Repaint();
+
+            try
+            {
+                // Snapshot the eligible job list synchronously on the main thread.
+                var eligible = new List<MtrJobViewModel>();
+                foreach (var job in _dispatchedJobs)
+                {
+                    if (job.State == JobState.Completed &&
+                        job.DownloadState == DownloadState.Done &&
+                        !string.IsNullOrEmpty(job.LocalOutputDir))
+                    {
+                        eligible.Add(job);
+                    }
+                }
+
+                if (eligible.Count == 0)
+                {
+                    Debug.Log("[DistributedRecorder] まとめて DL: 対象ジョブ（完了 & DL済み）がありません。");
+                    return;
+                }
+
+                Debug.Log($"[DistributedRecorder] まとめて DL 開始 – {eligible.Count} 件 → {_collectDir}");
+
+                int done = 0;
+                foreach (var job in eligible)
+                {
+                    Debug.Log(
+                        $"[DistributedRecorder]   [{++done}/{eligible.Count}] " +
+                        $"{job.JobId.Substring(0, Math.Min(8, job.JobId.Length))}...");
+
+                    if (!Directory.Exists(job.LocalOutputDir))
+                    {
+                        Debug.LogWarning(
+                            $"[DistributedRecorder]   [WARN] ローカルキャッシュが見つかりません: {job.LocalOutputDir}");
+                        continue;
+                    }
+
+                    var files = new List<string>(
+                        Directory.GetFiles(job.LocalOutputDir, "*", SearchOption.AllDirectories));
+
+                    // Override the per-job snapshot with current _collectDir for bulk op.
+                    var bulkVm = new MtrJobViewModel
+                    {
+                        JobId          = job.JobId,
+                        TimelineName   = job.TimelineName,
+                        CollectDir     = _collectDir,
+                        CollectDisambig = job.CollectDisambig,
+                        LocalOutputDir = job.LocalOutputDir,
+                    };
+
+                    await CopyToCollectDirAsync(bulkVm, files);
+                }
+
+                Debug.Log($"[DistributedRecorder] まとめて DL 完了 → {_collectDir}");
+            }
+            finally
+            {
+                _isBulkCollecting = false;
                 Repaint();
             }
         }
@@ -3926,5 +4242,24 @@ namespace Unity.MultiTimelineRecorder
         /// Added in dispatch-status-labels.
         /// </summary>
         public JobPhase Phase;
+
+        // ── collect-to-dir fields (v1.4.10) ─────────────────────────────────────
+
+        /// <summary>
+        /// Collection destination directory snapshotted at dispatch time so that
+        /// mid-session UI edits to <see cref="MultiTimelineRecorder._collectDir"/>
+        /// do not affect already-dispatched jobs.
+        ///
+        /// Empty string = collect feature disabled for this job.
+        /// Master-local only; never sent over the wire.
+        /// </summary>
+        public string CollectDir;
+
+        /// <summary>
+        /// Short unique string (first 8 chars of <see cref="JobId"/>) used by
+        /// <see cref="CollectPathValidator.BuildDestinationPath"/> to disambiguate
+        /// destination sub-directory names on collision.
+        /// </summary>
+        public string CollectDisambig;
     }
 }
