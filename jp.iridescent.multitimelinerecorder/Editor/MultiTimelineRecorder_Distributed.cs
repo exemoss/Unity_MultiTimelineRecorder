@@ -467,6 +467,109 @@ namespace Unity.MultiTimelineRecorder
             }
         }
 
+        // ── dispatch-status-labels: UI label constants ──────────────────────────
+        //
+        // All display strings are centralized here so they can be changed without
+        // touching test code (tests compare against these constants directly).
+        // Named with a k_ prefix to match Unity Editor coding convention.
+
+        internal const string LabelQueued      = "待機中";
+        internal const string LabelSending     = "データ送信中";
+        internal const string LabelPreparing   = "Editor 起動中…";
+        internal const string LabelCompleted   = "完了";
+        internal const string LabelFailed      = "失敗";
+        internal const string LabelUnreachable = "到達不能";
+        internal const string LabelCollecting  = "収集中";
+        // "録画中 N/M" is built at call-site from LabelRecordingFmt
+        internal const string LabelRecordingFmt = "録画中 {0}/{1}";
+
+        /// <summary>
+        /// Pure function: computes the human-readable status label for the job list UI.
+        ///
+        /// Decision tree:
+        /// <list type="bullet">
+        ///   <item>Terminal: Completed → "完了" (or "完了" even if DL still in progress;
+        ///     the Collecting label is shown while DownloadState == InProgress)</item>
+        ///   <item>Terminal: Failed     → "失敗"</item>
+        ///   <item>Terminal: Unreachable → "到達不能"</item>
+        ///   <item>DownloadState == InProgress → "収集中" (overrides state label)</item>
+        ///   <item>Queued (Phase == Queued / Sending) → label based on Phase</item>
+        ///   <item>Running + TotalFrames == 0 (Phase == Preparing) → "Editor 起動中…"</item>
+        ///   <item>Running + TotalFrames &gt; 0 → "録画中 N/M"</item>
+        ///   <item>Pending (just dispatched, ack not yet received) → "データ送信中"</item>
+        ///   <item>All others → Phase label as fallback</item>
+        /// </list>
+        ///
+        /// Made <c>public static</c> for hermetic EditMode tests.
+        /// Added in dispatch-status-labels.
+        /// </summary>
+        public static string ComputeJobStatusLabel(MtrJobViewModel vm)
+        {
+            if (vm == null) return LabelFailed;
+
+            // Terminal states (evaluated first; DownloadState may still be InProgress
+            // briefly after Completed — the Collecting label takes priority in that window).
+            switch (vm.State)
+            {
+                case JobState.Failed:
+                    return LabelFailed;
+                case JobState.Unreachable:
+                    return LabelUnreachable;
+                case JobState.Cancelled:
+                    return LabelFailed; // Cancelled treated as failed for UI purposes
+            }
+
+            // Download in-progress: show "収集中" even when State == Completed,
+            // because the result files are still being pulled from the Worker.
+            if (vm.DownloadState == DownloadState.InProgress)
+                return LabelCollecting;
+
+            // Completed (and download done or not started)
+            if (vm.State == JobState.Completed)
+                return LabelCompleted;
+
+            // Active / queued states — use Phase for finer granularity.
+            // Exception: Phase.Queued while State==Running and TotalFrames>0 is a stale-Phase
+            // scenario (the ProgressEvent arrived before Phase was updated); treat it as
+            // Recording so the user sees "録画中 N/M" instead of "待機中".
+            switch (vm.Phase)
+            {
+                case JobPhase.Queued:
+                    // Stale-Phase guard: if we are already Running with frames, show recording.
+                    if (vm.State == JobState.Running && vm.TotalFrames > 0)
+                        return string.Format(LabelRecordingFmt, vm.CurrentFrame, vm.TotalFrames);
+                    return LabelQueued;
+                case JobPhase.Sending:
+                    return LabelSending;
+                case JobPhase.Preparing:
+                    return LabelPreparing;
+                case JobPhase.Recording:
+                    return string.Format(LabelRecordingFmt, vm.CurrentFrame, vm.TotalFrames);
+                case JobPhase.Collecting:
+                    return LabelCollecting;
+                case JobPhase.Terminal:
+                    // Shouldn't normally reach here (terminal handled above), but guard.
+                    return LabelCompleted;
+            }
+
+            // Fallback: derive from State + TotalFrames for robustness
+            // (covers Pending = just-dispatched-not-yet-acked, or Phase not yet set)
+            switch (vm.State)
+            {
+                case JobState.Queued:
+                case JobState.Pending:
+                    return vm.TotalFrames > 0
+                        ? string.Format(LabelRecordingFmt, vm.CurrentFrame, vm.TotalFrames)
+                        : LabelPreparing;
+                case JobState.Running:
+                    return vm.TotalFrames > 0
+                        ? string.Format(LabelRecordingFmt, vm.CurrentFrame, vm.TotalFrames)
+                        : LabelPreparing;
+                default:
+                    return LabelQueued;
+            }
+        }
+
         private static void DrawMtrJobRow(MtrJobViewModel vm)
         {
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
@@ -488,24 +591,10 @@ namespace Unity.MultiTimelineRecorder
             else
                 progress = 1f;
 
-            string barLabel;
-            switch (vm.State)
-            {
-                case JobState.Completed:
-                    barLabel = vm.DownloadState == DownloadState.Done   ? "Done+DL"
-                             : vm.DownloadState == DownloadState.Failed ? "Done/DL失敗"
-                             : "Done";
-                    break;
-                case JobState.Failed:
-                    barLabel = "Failed";
-                    break;
-                case JobState.Queued:
-                    barLabel = vm.RetryCount > 0 ? $"待機中 (retry {vm.RetryCount})" : "待機中";
-                    break;
-                default:
-                    barLabel = $"{vm.CurrentFrame}/{vm.TotalFrames}";
-                    break;
-            }
+            // dispatch-status-labels: use ComputeJobStatusLabel instead of the
+            // previous ad-hoc barLabel switch.  This replaces "0/0" with a
+            // human-readable phase string ("Editor 起動中…", "データ送信中", etc.).
+            string barLabel = ComputeJobStatusLabel(vm);
 
             EditorGUI.ProgressBar(
                 EditorGUILayout.GetControlRect(GUILayout.Width(120), GUILayout.Height(16)),
@@ -1674,7 +1763,8 @@ namespace Unity.MultiTimelineRecorder
                     Worker         = null,   // assigned at dispatch time
                     PendingRequest = request,
                     RetryCount     = 0,
-                    TriedWorkers   = new HashSet<string>()
+                    TriedWorkers   = new HashSet<string>(),
+                    Phase          = JobPhase.Queued,  // dispatch-status-labels
                 };
 
                 _dispatchedJobs.Add(vm);
@@ -1779,6 +1869,8 @@ namespace Unity.MultiTimelineRecorder
             vm.Worker     = worker;
             vm.WorkerName = worker.displayName;
             // State remains Queued until accepted by Worker
+            // dispatch-status-labels: mark Sending phase so UI shows "データ送信中"
+            vm.Phase = JobPhase.Sending;
 
             bool accepted = await DispatchOneWithOverrideAsync(
                 _batchDispatcher, _batchAuth, worker, vm.PendingRequest, vm);
@@ -2277,6 +2369,9 @@ namespace Unity.MultiTimelineRecorder
             if (result.Success)
             {
                 vm.State = JobState.Running;
+                // dispatch-status-labels: ack received → Worker is launching Play Mode.
+                // No frames yet → show "Editor 起動中…" until first ProgressEvent.
+                vm.Phase = JobPhase.Preparing;
                 Debug.Log(
                     $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: 投入完了");
                 return true;
@@ -2325,6 +2420,7 @@ namespace Unity.MultiTimelineRecorder
                         }
 
                         vm.State = JobState.Running;
+                        vm.Phase = JobPhase.Preparing; // dispatch-status-labels
                         Debug.Log(
                             $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
                             "バージョン上書き送信完了");
@@ -2381,6 +2477,7 @@ namespace Unity.MultiTimelineRecorder
                         }
 
                         vm.State = JobState.Running;
+                        vm.Phase = JobPhase.Preparing; // dispatch-status-labels
                         Debug.Log(
                             $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
                             "ハッシュ上書き送信完了");
@@ -2439,6 +2536,7 @@ namespace Unity.MultiTimelineRecorder
                         }
 
                         vm.State = JobState.Running;
+                        vm.Phase = JobPhase.Preparing; // dispatch-status-labels
                         Debug.Log(
                             $"[DistributedRecorder] ジョブ {jobIdShort}… → {worker.displayName}: " +
                             "コミット上書き送信完了");
@@ -2573,6 +2671,17 @@ namespace Unity.MultiTimelineRecorder
                     vm.State        = capturedEvt.state;
                     vm.CurrentFrame = capturedEvt.currentFrame;
                     vm.TotalFrames  = capturedEvt.totalFrames;
+
+                    // dispatch-status-labels: advance Phase based on progress event.
+                    // Transition Preparing → Recording on first frame event with frames known.
+                    // Terminal phases are set by the state check below.
+                    if (!IsTerminalState(capturedEvt.state))
+                    {
+                        if (capturedEvt.totalFrames > 0)
+                            vm.Phase = JobPhase.Recording;
+                        else if (vm.Phase == JobPhase.Queued || vm.Phase == JobPhase.Sending)
+                            vm.Phase = JobPhase.Preparing;
+                    }
 
                     // Keep last-progress timestamp fresh for the failsafe
                     _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
@@ -3085,6 +3194,8 @@ namespace Unity.MultiTimelineRecorder
         private async void DownloadResultsAsync(WorkerInfo worker, MtrJobViewModel vm)
         {
             vm.DownloadState = DownloadState.InProgress;
+            // dispatch-status-labels: show "収集中" while pulling result files
+            vm.Phase = JobPhase.Collecting;
             Repaint();
 
             Debug.Log(
@@ -3116,12 +3227,14 @@ namespace Unity.MultiTimelineRecorder
                 if (result.Success)
                 {
                     vm.DownloadState = DownloadState.Done;
+                    vm.Phase = JobPhase.Terminal; // dispatch-status-labels
                     Debug.Log(
                         $"[DistributedRecorder] 回収完了: {result.Files.Count} ファイル → {vm.LocalOutputDir}");
                 }
                 else
                 {
                     vm.DownloadState = DownloadState.Failed;
+                    vm.Phase = JobPhase.Terminal; // dispatch-status-labels
                     Debug.LogError(
                         $"[DistributedRecorder] 回収失敗 ジョブ {vm.JobId.Substring(0, 8)}…: " +
                         result.ErrorMessage);
@@ -3500,6 +3613,46 @@ namespace Unity.MultiTimelineRecorder
         Failed
     }
 
+    // ── dispatch-status-labels: JobPhase enum ─────────────────────────────────
+    //
+    // Sub-phase within the Running lifecycle, used to provide finer-grained UI
+    // labels without changing the wire-protocol JobState values.
+    // Master-local only; never sent over the wire.
+    // Values are ordered chronologically so comparisons against ordinal are valid.
+
+    /// <summary>
+    /// Fine-grained dispatch sub-phase for a job that is in or approaching the
+    /// Running state.  Provides UI status labels without altering JobState wire values.
+    ///
+    /// Master-local only: never sent over the wire.
+    /// Added in dispatch-status-labels.
+    /// </summary>
+    public enum JobPhase
+    {
+        /// <summary>Job is waiting in the Master-side queue (State == Queued).</summary>
+        Queued,
+        /// <summary>
+        /// Master is sending the HTTP POST to the Worker; waiting for the ack.
+        /// Transitions to <see cref="Preparing"/> on successful ack (accepted == true).
+        /// </summary>
+        Sending,
+        /// <summary>
+        /// Ack received. Worker is starting Unity / Play Mode; no frames yet.
+        /// Transitions to <see cref="Recording"/> on first ProgressEvent with TotalFrames &gt; 0.
+        /// </summary>
+        Preparing,
+        /// <summary>
+        /// First frame event received; Worker is actively recording.
+        /// </summary>
+        Recording,
+        /// <summary>
+        /// Recording completed; Master is downloading result files from Worker.
+        /// </summary>
+        Collecting,
+        /// <summary>Job has reached a terminal state (Completed / Failed / Unreachable).</summary>
+        Terminal,
+    }
+
     /// <summary>
     /// View model for a dispatched distributed job.
     /// Replaces the M5 <c>DistributedJobRecord</c> with richer progress/download state.
@@ -3562,5 +3715,17 @@ namespace Unity.MultiTimelineRecorder
         /// Master-local only; never sent over the wire.
         /// </summary>
         public HashSet<string> TriedWorkers;
+
+        // ── dispatch-status-labels field ────────────────────────────────────────
+
+        /// <summary>
+        /// Fine-grained dispatch sub-phase used to display human-readable status labels
+        /// in the job list UI.  Updated by the Master as the job progresses through the
+        /// dispatch → ack → recording → download lifecycle.
+        ///
+        /// Master-local only; never sent over the wire.
+        /// Added in dispatch-status-labels.
+        /// </summary>
+        public JobPhase Phase;
     }
 }
