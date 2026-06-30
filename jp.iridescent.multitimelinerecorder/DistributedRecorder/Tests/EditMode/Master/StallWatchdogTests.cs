@@ -107,6 +107,21 @@ namespace DistributedRecorder.Tests.Master
         }
 
         [Test]
+        public void ProgressStreamConnectTimeout_IsGreaterThanPreFlightTimeout()
+        {
+            // progress-monitor-resilience: the progress-stream connect timeout was raised
+            // from 3 s to 60 s.  Assert it remains strictly greater than the pre-flight
+            // fast-fail probe (3 s) so the stall watchdog can re-arm without racing.
+            const double preFlightTimeoutSeconds = 3.0;
+
+            Assert.Greater(
+                MultiTimelineRecorder.ProgressStreamConnectTimeoutSecondsPublic,
+                preFlightTimeoutSeconds,
+                "ProgressMonitor.ConnectTimeout must be strictly greater than the pre-flight " +
+                $"probe ({preFlightTimeoutSeconds}s) so in-flight streams are patient.");
+        }
+
+        [Test]
         public void FailsafeStallSeconds_IsAtLeast30()
         {
             Assert.GreaterOrEqual(
