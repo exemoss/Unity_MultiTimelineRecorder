@@ -25,6 +25,7 @@ namespace DistributedRecorder.Worker
     ///   POST /jobs                        – submit a new job
     ///   GET  /health                      – liveness probe (unauthenticated)
     ///   POST /align-recorder              – align com.unity.recorder version (HMAC required)
+    ///   POST /cancel                      – cancel the active job (HMAC required, v1.4.9+)
     ///   GET  /jobs/{id}                   – status
     ///   GET  /jobs/{id}/files             – output file list
     ///   GET  /jobs/{id}/files/{name}      – download a specific output file
@@ -221,6 +222,10 @@ namespace DistributedRecorder.Worker
                 else if (method == "POST" && rawUrl.Equals("/align-recorder", StringComparison.OrdinalIgnoreCase))
                 {
                     HandleAlignRecorder(ctx, remoteIp);
+                }
+                else if (method == "POST" && rawUrl.Equals("/cancel", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleCancelJob(ctx, remoteIp);
                 }
                 else if (method == "GET" && TryParseJobRoute(rawUrl, out string jobId, out string subPath))
                 {
@@ -618,6 +623,104 @@ namespace DistributedRecorder.Worker
 
             var ack = new AlignRecorderAck { accepted = true };
             RespondJson(ctx, 202, ProtocolSerializer.Serialize(ack));
+        }
+
+        // --- POST /cancel (stop-button, v1.4.9+) --------------------------------
+
+        /// <summary>
+        /// Handles POST /cancel — cancels the active recording job on this Worker.
+        ///
+        /// Security requirements (identical to /align-recorder):
+        ///  1. HMAC authentication.
+        ///  2. IP allowlist (enforced in HandleRequest before this is called).
+        ///  3. jobId validated by InputValidator (alphanumeric/hyphen, max 64 chars,
+        ///     no path traversal).
+        ///  4. Unknown jobId (no matching active job) returns 404.
+        ///  5. The cancel itself runs synchronously on the main thread via
+        ///     MainThreadDispatcher.Enqueue; this handler responds 202 immediately
+        ///     so the master's cancel timeout is not gate-kept by Play Mode exit time.
+        ///
+        /// Wire-compat: Workers older than v1.4.9 do not have this route and will
+        /// return 404 via the default "Not found" handler.  The master handles this
+        /// gracefully (log + proceed).
+        /// </summary>
+        private void HandleCancelJob(HttpListenerContext ctx, string remoteIp)
+        {
+            string body      = ReadBody(ctx);
+            byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
+
+            // 1. HMAC authentication
+            string ts  = ctx.Request.Headers["X-Timestamp"] ?? string.Empty;
+            string nc  = ctx.Request.Headers["X-Nonce"]     ?? string.Empty;
+            string sig = ctx.Request.Headers["X-Signature"] ?? string.Empty;
+
+            if (!_auth.Validate("POST", "/cancel", bodyBytes, ts, nc, sig, out string authReason))
+            {
+                RecordAuthFailure(remoteIp);
+                Debug.LogWarning($"[WorkerHttpListener] /cancel auth failure from {remoteIp}: {authReason}");
+                RespondJson(ctx, 401, $"{{\"error\":\"Authentication failed: {EscapeJson(authReason)}\"}}");
+                return;
+            }
+
+            // 2. Deserialize
+            CancelJobRequest req;
+            try
+            {
+                req = ProtocolSerializer.Deserialize<CancelJobRequest>(body);
+            }
+            catch (Exception ex)
+            {
+                RespondJson(ctx, 400, $"{{\"error\":\"Invalid JSON: {EscapeJson(ex.Message)}\"}}");
+                return;
+            }
+
+            // 3. Validate jobId (length, alphanumeric, no path traversal)
+            string cancelJobId = req?.jobId ?? string.Empty;
+            if (string.IsNullOrEmpty(cancelJobId) ||
+                cancelJobId.Length > 64 ||
+                !InputValidator.IsAlphanumericOrHyphenStatic(cancelJobId))
+            {
+                Debug.LogWarning(
+                    $"[WorkerHttpListener] /cancel: invalid jobId from {remoteIp}: " +
+                    $"'{EscapeJson(cancelJobId)}'");
+                RespondJson(ctx, 400,
+                    "{\"error\":\"jobId must be non-empty alphanumeric (max 64 chars).\"}");
+                return;
+            }
+
+            // 4. Check if we have an active job matching this jobId.
+            //    Use store.ActiveJobId for the check (Running state only — not Pending).
+            string activeId = _store.ActiveJobId;
+            if (activeId == null ||
+                !string.Equals(activeId, cancelJobId, StringComparison.Ordinal))
+            {
+                // No matching active job — 404 so master knows this is a "miss" (not an error).
+                Debug.Log(
+                    $"[WorkerHttpListener] /cancel: no active job matching jobId='{cancelJobId}'. " +
+                    $"activeJobId='{activeId ?? "(none)"}'. Returning 404.");
+                RespondJson(ctx, 404,
+                    $"{{\"error\":\"No active job matching jobId '{EscapeJson(cancelJobId)}'.\"}}");
+                return;
+            }
+
+            // 5. Accept: respond 202 immediately, then enqueue the cancel on the main thread.
+            //    Play Mode exit is async; the master does not wait for completion.
+            var ack = new CancelJobAck { accepted = true };
+            RespondJson(ctx, 202, ProtocolSerializer.Serialize(ack));
+
+            string capturedJobId = cancelJobId;
+            MainThreadDispatcher.Enqueue(() =>
+            {
+                Debug.Log(
+                    $"[WorkerHttpListener] /cancel: main-thread dispatch for jobId='{capturedJobId}'");
+                if (!_runner.TryCancelJob(capturedJobId, out string cancelReason))
+                {
+                    // Race: job may have already completed between the store-check above
+                    // and this main-thread execution.  Log and continue.
+                    Debug.Log(
+                        $"[WorkerHttpListener] /cancel: TryCancelJob returned false: {cancelReason}");
+                }
+            });
         }
 
         private void HandleGetJob(HttpListenerContext ctx, string remoteIp,
