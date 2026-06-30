@@ -164,6 +164,13 @@ namespace Unity.MultiTimelineRecorder
         public const double ReconnectDelaySeconds = 5.0;
 
         /// <summary>
+        /// Public accessor for <see cref="ProgressMonitor.ConnectTimeout"/> (seconds)
+        /// used by EditMode tests to assert separation from the pre-flight 3 s probe.
+        /// </summary>
+        public static double ProgressStreamConnectTimeoutSecondsPublic
+            => ProgressMonitor.ConnectTimeout.TotalSeconds;
+
+        /// <summary>
         /// Jobs waiting to be dispatched (not yet sent to any Worker).
         /// Populated at batch start; consumed by <see cref="TryDispatchNextQueuedJob"/>.
         /// Only accessed on the main thread.
@@ -2517,31 +2524,51 @@ namespace Unity.MultiTimelineRecorder
                     healthTransport.Dispose();
                 }
 
-                var health = ProtocolSerializer.Deserialize<WorkerHealth>(healthJson);
-                bool workerIsIdle = string.IsNullOrEmpty(health.currentJobId)
-                    || health.currentJobId != vm.JobId;
+                var health  = ProtocolSerializer.Deserialize<WorkerHealth>(healthJson);
+                var outcome = ClassifyWorkerJobOutcome(health, vm.JobId);
 
                 EditorCallbackOnce(() =>
                 {
                     _stallWatchdogActive.Remove(vm.JobId);
                     if (IsTerminalState(vm.State)) return;
 
-                    if (workerIsIdle)
+                    switch (outcome)
                     {
-                        Debug.LogWarning(
-                            $"[DistributedRecorder] Stall watchdog: Worker がアイドル確認 → " +
-                            $"ジョブ {jobIdShort}… の slot を解放します (Failed)。");
-                        vm.State = JobState.Failed;
-                        OnJobTerminated(worker, vm);
-                    }
-                    else
-                    {
-                        // Worker is still running — reset last-progress time so we don't
-                        // immediately fire again next tick.
-                        Debug.Log(
-                            $"[DistributedRecorder] Stall watchdog: Worker はジョブ {jobIdShort}… を実行中。" +
-                            "進捗タイムスタンプをリセットします。");
-                        _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
+                        case WorkerJobOutcome.StillRunning:
+                            // Worker is actively recording — reset progress time and wait.
+                            Debug.Log(
+                                $"[DistributedRecorder] Stall watchdog: Worker はジョブ {jobIdShort}… を実行中。" +
+                                "進捗タイムスタンプをリセットします。");
+                            _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
+                            break;
+
+                        case WorkerJobOutcome.CompletedElsewhere:
+                            // Worker finished the job; stream missed the terminal event.
+                            Debug.Log(
+                                $"[DistributedRecorder] Stall watchdog: Worker がジョブ {jobIdShort}… " +
+                                "を完了済みと判定。結果を回収します。");
+                            vm.State = JobState.Completed;
+                            DownloadResultsAsync(worker, vm);
+                            OnJobTerminated(worker, vm);
+                            break;
+
+                        case WorkerJobOutcome.FailedOnWorker:
+                            Debug.LogError(
+                                $"[DistributedRecorder] Stall watchdog: Worker がジョブ {jobIdShort}… " +
+                                "を Failed と報告しました。");
+                            vm.State = JobState.Failed;
+                            OnJobTerminated(worker, vm);
+                            break;
+
+                        default: // WorkerJobOutcome.Unknown
+                            // Idle, state indeterminate — treat as Completed (false-negative avoidance).
+                            Debug.LogWarning(
+                                $"[DistributedRecorder] Stall watchdog: Worker アイドル、ジョブ " +
+                                $"{jobIdShort}… の状態不明 → Completed 扱いで回収を試みます。");
+                            vm.State = JobState.Completed;
+                            DownloadResultsAsync(worker, vm);
+                            OnJobTerminated(worker, vm);
+                            break;
                     }
 
                     Repaint();
@@ -2581,8 +2608,23 @@ namespace Unity.MultiTimelineRecorder
         /// <summary>
         /// Failsafe: called when the progress stream emits an error AND reconnect
         /// attempts are exhausted.
-        /// Polls <c>GET /health</c> with the pre-flight 3 s fast timeout to determine
-        /// if the Worker is idle, then either frees the slot or marks the job Failed.
+        ///
+        /// Polls <c>GET /health</c> with a patient timeout (same as the in-flight stall
+        /// watchdog) to determine the Worker's actual state, then routes:
+        ///
+        ///   • Worker still running this job → log warning only (stream will reconnect
+        ///     via the stall watchdog; do NOT mark Failed).
+        ///   • Worker is idle (currentJobId moved on or empty) → treat as Completed and
+        ///     trigger result download.  The Worker completed the job before the master
+        ///     could (re-)connect to the progress stream.  Only mark Failed when the
+        ///     Worker explicitly reports the job as Failed via currentJobState.
+        ///   • Worker unreachable (health GET throws) → mark Failed with reason in log
+        ///     (no silent / "無言 Failed").
+        ///
+        /// This replaces the previous "idle → unconditional Failed" behaviour that caused
+        /// short jobs (or jobs that finished while the master was reconnecting) to be
+        /// incorrectly classified as Failed even though jobsProcessed on the Worker
+        /// showed the recording had completed successfully.
         /// </summary>
         private async Task HandleProgressStreamErrorAsync(WorkerInfo worker, MtrJobViewModel vm)
         {
@@ -2596,10 +2638,12 @@ namespace Unity.MultiTimelineRecorder
                 string healthJson;
                 try
                 {
-                    // pre-flight fast-fail timeout (3 s) — reconnect retries already exhausted
+                    // Use the patient in-flight timeout rather than the pre-flight 3 s.
+                    // Even though reconnect retries are exhausted, the Worker may still be
+                    // alive and finishing the job — we must not fast-fail here.
                     healthJson = await healthTransport.GetAsync(
                         $"{worker.BaseUrl}/health",
-                        TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+                        TimeSpan.FromSeconds(InFlightHealthTimeoutSeconds)).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -2607,55 +2651,157 @@ namespace Unity.MultiTimelineRecorder
                 }
 
                 var health = ProtocolSerializer.Deserialize<WorkerHealth>(healthJson);
-                bool workerIsIdle = string.IsNullOrEmpty(health.currentJobId)
-                    || health.currentJobId != vm.JobId;
 
-                if (workerIsIdle)
+                // Determine the Worker's relationship to this job from health fields.
+                // ClassifyWorkerJobOutcome is a pure function so it can be unit-tested.
+                var outcome = ClassifyWorkerJobOutcome(health, vm.JobId);
+
+                EditorCallbackOnce(() =>
                 {
-                    EditorCallbackOnce(() =>
-                    {
-                        Debug.LogWarning(
-                            $"[DistributedRecorder] フェイルセーフ: Worker がアイドル状態を確認。" +
-                            $"ジョブ {jobIdShort}… の slot を解放します。");
+                    if (IsTerminalState(vm.State)) return;
 
-                        // Mark as failed if state is still non-terminal
-                        if (!IsTerminalState(vm.State))
-                        {
-                            vm.State = JobState.Failed;
+                    switch (outcome)
+                    {
+                        case WorkerJobOutcome.StillRunning:
+                            // Worker is actively recording — do not mark Failed.
+                            // The stall watchdog will probe again after FailsafeStallSeconds.
+                            Debug.LogWarning(
+                                $"[DistributedRecorder] フェイルセーフ health チェック: Worker はまだ " +
+                                $"ジョブ {jobIdShort}… を実行中。再接続は StallWatchdog に委ねます。");
+                            // Reset last-progress time so watchdog waits another full window.
+                            _jobLastProgressTime[vm.JobId] = EditorApplication.timeSinceStartup;
+                            break;
+
+                        case WorkerJobOutcome.CompletedElsewhere:
+                            // Worker finished this job (moved to next job or idle after success).
+                            // Treat as Completed and pull results — the stream just missed the
+                            // terminal event.
+                            Debug.Log(
+                                $"[DistributedRecorder] フェイルセーフ: Worker がジョブ {jobIdShort}… " +
+                                "を完了済みと判定。結果を回収します (ストリームは接続できませんでした)。");
+                            vm.State = JobState.Completed;
+                            DownloadResultsAsync(worker, vm);
+                            OnJobTerminated(worker, vm);
+                            break;
+
+                        case WorkerJobOutcome.FailedOnWorker:
+                            // Worker explicitly reported the job as Failed.
                             Debug.LogError(
-                                $"[DistributedRecorder] ジョブ {jobIdShort}… がストリームエラー後に " +
-                                "Worker アイドルを確認 → Failed。");
-                        }
+                                $"[DistributedRecorder] フェイルセーフ: Worker がジョブ {jobIdShort}… " +
+                                "を Failed と報告しました (currentJobState=Failed)。");
+                            vm.State = JobState.Failed;
+                            OnJobTerminated(worker, vm);
+                            break;
 
-                        OnJobTerminated(worker, vm);
-                        Repaint();
-                    });
-                }
-                else
-                {
-                    EditorCallbackOnce(() =>
-                    {
-                        Debug.LogWarning(
-                            $"[DistributedRecorder] フェイルセーフ health チェック: Worker はまだ " +
-                            $"ジョブ {jobIdShort}… を実行中。ストリームを再接続してください。");
-                        Repaint();
-                    });
-                }
+                        default: // WorkerJobOutcome.Unknown — idle but state unclear
+                            // Worker is idle and we cannot determine outcome from health alone.
+                            // Treat as Completed (false-negative avoidance): it is worse to
+                            // mark a successfully-recorded job as Failed than to attempt a
+                            // result download that may find no files.
+                            Debug.LogWarning(
+                                $"[DistributedRecorder] フェイルセーフ: Worker がアイドル、ジョブ " +
+                                $"{jobIdShort}… の結果状態不明 → Completed 扱いで回収を試みます。");
+                            vm.State = JobState.Completed;
+                            DownloadResultsAsync(worker, vm);
+                            OnJobTerminated(worker, vm);
+                            break;
+                    }
+
+                    Repaint();
+                });
             }
             catch (Exception ex)
             {
                 EditorCallbackOnce(() =>
                 {
+                    if (IsTerminalState(vm.State)) return;
+
+                    // Health check failed → Worker is unreachable.  This IS a genuine failure.
                     Debug.LogError(
                         $"[DistributedRecorder] フェイルセーフ health チェック失敗 " +
-                        $"(job={jobIdShort}…): {ex.Message}");
-                    // If health check itself fails, mark failed and free the slot
-                    if (!IsTerminalState(vm.State))
-                        vm.State = JobState.Failed;
-
+                        $"(job={jobIdShort}…): {ex.Message} → Failed");
+                    vm.State = JobState.Failed;
                     OnJobTerminated(worker, vm);
                     Repaint();
                 });
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Progress-loss classification helpers
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Describes the outcome of an in-flight job as seen from a fresh
+        /// <see cref="WorkerHealth"/> snapshot.
+        ///
+        /// Used by <see cref="HandleProgressStreamErrorAsync"/> and
+        /// <see cref="HandleStalledJobAsync"/> to decide whether to mark the job
+        /// Completed (and trigger download), Failed, or keep it Running.
+        /// </summary>
+        public enum WorkerJobOutcome
+        {
+            /// <summary>Worker is actively executing this job.</summary>
+            StillRunning,
+            /// <summary>
+            /// Worker is idle or running a different job, and the job state is not
+            /// explicitly Failed — treat as Completed and pull results.
+            /// </summary>
+            CompletedElsewhere,
+            /// <summary>Worker explicitly reports this job as Failed.</summary>
+            FailedOnWorker,
+            /// <summary>
+            /// Worker is idle but the last job state cannot be determined (e.g. the
+            /// currentJobId already moved on and we have no explicit state).
+            /// Caller should treat this as Completed (false-negative avoidance).
+            /// </summary>
+            Unknown,
+        }
+
+        /// <summary>
+        /// Pure function: classifies what happened to <paramref name="jobId"/> on a
+        /// Worker based on a fresh <see cref="WorkerHealth"/> snapshot.
+        ///
+        /// This is the single source of truth for the progress-loss decision tree and
+        /// is exposed <c>public static</c> so hermetic EditMode tests can exercise every
+        /// branch without instantiating the EditorWindow.
+        ///
+        /// Decision tree:
+        /// <list type="bullet">
+        ///   <item>alive=false → Unknown (caller treats as Completed to avoid false-fail)</item>
+        ///   <item>currentJobId == jobId &amp;&amp; state is non-terminal → StillRunning</item>
+        ///   <item>currentJobId == jobId &amp;&amp; state == Failed → FailedOnWorker</item>
+        ///   <item>currentJobId == jobId &amp;&amp; state == Completed → CompletedElsewhere</item>
+        ///   <item>currentJobId ≠ jobId (idle or next job) → CompletedElsewhere</item>
+        /// </list>
+        /// </summary>
+        public static WorkerJobOutcome ClassifyWorkerJobOutcome(WorkerHealth health, string jobId)
+        {
+            if (health == null) return WorkerJobOutcome.Unknown;
+
+            // Worker unresponsive / not healthy — cannot determine outcome.
+            if (!health.alive) return WorkerJobOutcome.Unknown;
+
+            bool isCurrentJob = !string.IsNullOrEmpty(health.currentJobId)
+                             && health.currentJobId == jobId;
+
+            if (!isCurrentJob)
+            {
+                // Worker has moved on (running a different job, or idle).
+                // This means it finished ours — classify as Completed.
+                return WorkerJobOutcome.CompletedElsewhere;
+            }
+
+            // currentJobId == jobId — check the reported state.
+            switch (health.currentJobState)
+            {
+                case JobState.Completed:
+                    return WorkerJobOutcome.CompletedElsewhere;
+                case JobState.Failed:
+                    return WorkerJobOutcome.FailedOnWorker;
+                default:
+                    // Pending / Running / Queued — still in progress.
+                    return WorkerJobOutcome.StillRunning;
             }
         }
 

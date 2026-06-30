@@ -64,13 +64,22 @@ namespace DistributedRecorder.Master
 
         // --- private ------------------------------------------------------------
 
-        // dispatch-progress-feedback: explicit connect timeout for the progress-stream
-        // HTTP handshake.  The HttpClient itself uses Timeout.InfiniteTimeSpan (set in
-        // the constructor) so that the long-lived NDJSON body read is never cancelled by
-        // a client-level timeout.  We add a separate short CTS (3 s) that covers only
-        // the SendAsync / ResponseHeadersRead phase; once headers arrive the CTS is no
-        // longer in use and streaming continues indefinitely via the outer `ct`.
-        private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(3);
+        // progress-monitor-resilience: the connect timeout covers only the
+        // SendAsync / ResponseHeadersRead phase.  The HttpClient itself uses
+        // Timeout.InfiniteTimeSpan so that the long-lived NDJSON body read is never
+        // cancelled by a client-level timeout; streaming continues indefinitely via the
+        // outer `ct` after headers arrive.
+        //
+        // We use a patient 60 s window here (up from the original dispatch-progress-feedback
+        // 3 s) because the Worker has already accepted the dispatch (job Running), so it is
+        // alive — but the progress endpoint may not start serving until the Play-Mode entry
+        // / shader warmup / HDRP init completes, which can take 5-30 s on a cold start.
+        // The pre-flight fast-fail probe (JobDispatcher.ProbeAsync, HealthTimeout = 3 s)
+        // is unchanged; that covers truly dead workers before the dispatch even happens.
+        //
+        // Public so that StallWatchdog EditMode tests can assert the separation from the
+        // pre-flight 3 s value.
+        public static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(60);
 
         private async Task StreamLoopAsync(string baseUrl, string jobId, CancellationToken ct)
         {
