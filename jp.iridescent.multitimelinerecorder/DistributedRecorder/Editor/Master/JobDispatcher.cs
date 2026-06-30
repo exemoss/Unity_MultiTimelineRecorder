@@ -261,6 +261,50 @@ namespace DistributedRecorder.Master
             };
         }
 
+        // --- stop-button: /cancel endpoint -----------------------------------
+
+        /// <summary>
+        /// Sends <c>POST /cancel</c> to <paramref name="worker"/> requesting cancellation
+        /// of <paramref name="jobId"/>.
+        ///
+        /// Wire-compat (stop-button):
+        ///   - v1.4.9+ Workers handle /cancel and stop recording.
+        ///   - Older Workers return 404 (unknown route). The method returns <c>false</c>
+        ///     in that case; the master-side stop proceeds without waiting for the Worker.
+        ///
+        /// Returns <c>true</c> if the Worker accepted the request (2xx response).
+        /// Returns <c>false</c> on 404 (old Worker) or any <see cref="TransportException"/>.
+        ///
+        /// Must NOT use ConfigureAwait(false) — this is called from the Unity main thread.
+        /// </summary>
+        private static readonly TimeSpan CancelTimeout = TimeSpan.FromSeconds(5);
+
+        public async Task<bool> SendCancelJobAsync(WorkerInfo worker, string jobId)
+        {
+            if (worker == null) throw new ArgumentNullException(nameof(worker));
+            if (string.IsNullOrEmpty(jobId)) throw new ArgumentNullException(nameof(jobId));
+
+            var req  = new CancelJobRequest { jobId = jobId };
+            string json = ProtocolSerializer.Serialize(req);
+
+            try
+            {
+                await _transport.PostJsonAsync(
+                    $"{worker.BaseUrl}/cancel", json, CancelTimeout)
+                    .ConfigureAwait(false);
+                return true;
+            }
+            catch (TransportException ex)
+            {
+                // 404 = old Worker without /cancel — not an error from master's perspective.
+                // Any other network error: still non-fatal (wire-compat requirement).
+                Debug.Log(
+                    $"[JobDispatcher] /cancel not acknowledged by '{worker.displayName}': " +
+                    $"{ex.Message} (statusCode={ex.HttpStatusCode}). Old Worker or network error.");
+                return false;
+            }
+        }
+
         /// <summary>
         /// Dispatches the job to <paramref name="worker"/> and returns the result.
         /// This method is async and must be awaited.
