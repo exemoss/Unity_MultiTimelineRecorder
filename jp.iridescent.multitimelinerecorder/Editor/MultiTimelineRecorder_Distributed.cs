@@ -453,6 +453,33 @@ namespace Unity.MultiTimelineRecorder
             EditorGUILayout.EndHorizontal();
             // ─────────────────────────────────────────────────────────────────
 
+            // ── stop-button: batch stop button ───────────────────────────────
+            // Enabled only while a batch is in flight. Shown in red to signal a
+            // destructive action. Confirmation dialog prevents accidental clicks.
+            EditorGUILayout.BeginHorizontal();
+            GUI.enabled = batchActive;
+            var prevColor = GUI.color;
+            GUI.color = batchActive ? new Color(1f, 0.4f, 0.4f) : GUI.color;
+            if (GUILayout.Button("停止", GUILayout.Height(22)))
+            {
+                bool confirmed = EditorUtility.DisplayDialog(
+                    "分散レンダリングを停止",
+                    "実行中のバッチを停止しますか？\n\n" +
+                    "・待機中ジョブはキャンセルされます。\n" +
+                    "・実行中ジョブは Worker に中断リクエストを送信します。\n" +
+                    "  古い Worker（v1.4.9 未満）は中断リクエストを無視して録画を継続しますが、\n" +
+                    "  master は新規ジョブを送信しません。\n\n" +
+                    "この操作は取り消せません。",
+                    "停止する",
+                    "キャンセル");
+                if (confirmed)
+                    _ = StopBatchAsync();
+            }
+            GUI.color = prevColor;
+            GUI.enabled = true;
+            EditorGUILayout.EndHorizontal();
+            // ─────────────────────────────────────────────────────────────────
+
             // Scrollable job list (max 150px)
             _distJobScrollPos = EditorGUILayout.BeginScrollView(
                 _distJobScrollPos, GUILayout.Height(Mathf.Min(150, _dispatchedJobs.Count * 36 + 4)));
@@ -480,6 +507,7 @@ namespace Unity.MultiTimelineRecorder
         internal const string LabelFailed      = "失敗";
         internal const string LabelUnreachable = "到達不能";
         internal const string LabelCollecting  = "収集中";
+        internal const string LabelCancelled   = "停止";
         // "録画中 N/M" is built at call-site from LabelRecordingFmt
         internal const string LabelRecordingFmt = "録画中 {0}/{1}";
 
@@ -516,7 +544,7 @@ namespace Unity.MultiTimelineRecorder
                 case JobState.Unreachable:
                     return LabelUnreachable;
                 case JobState.Cancelled:
-                    return LabelFailed; // Cancelled treated as failed for UI purposes
+                    return LabelCancelled; // stop-button: show "停止" for cancelled jobs
             }
 
             // Download in-progress: show "収集中" even when State == Completed,
@@ -2096,6 +2124,177 @@ namespace Unity.MultiTimelineRecorder
 
             Debug.Log("[DistributedRecorder] 全ジョブが完了しました。バッチを終了します。");
             Repaint();
+        }
+
+        // -----------------------------------------------------------------------
+        // stop-button: batch stop
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Whether a batch stop is in progress.  Prevents re-entrant calls.
+        /// Only accessed on the main thread.
+        /// </summary>
+        private bool _batchStopping;
+
+        /// <summary>
+        /// Stops the current batch:
+        ///  1. Drains the pending queue and marks un-dispatched jobs as Cancelled.
+        ///  2. Stops the stall watchdog and progress monitors.
+        ///  3. Sends POST /cancel to each in-flight Worker (HMAC authenticated).
+        ///     Workers that do not understand /cancel (older than v1.4.9) return 404;
+        ///     the master proceeds without waiting (wire-compat: they will finish recording
+        ///     but master will not dispatch new jobs to them).
+        ///  4. Marks all remaining non-terminal jobs as Cancelled.
+        ///  5. Calls <see cref="FinalizeBatchIfDone"/> to release batch-scoped services.
+        ///
+        /// Must be called from the Editor main thread (async void guard calls this via await).
+        /// </summary>
+        private async System.Threading.Tasks.Task StopBatchAsync()
+        {
+            if (_batchStopping)
+            {
+                Debug.Log("[DistributedRecorder] 停止処理がすでに進行中です。");
+                return;
+            }
+            _batchStopping = true;
+
+            try
+            {
+                Debug.Log("[DistributedRecorder] バッチ停止を開始します。");
+
+                // 1. Drain the pending queue: cancel all un-dispatched jobs immediately.
+                CancelQueuedJobs();
+
+                // 2. Stop the stall watchdog (no new stall callbacks should fire after this).
+                if (_stallWatchdogRegistered)
+                {
+                    EditorApplication.update -= StallWatchdogTick;
+                    _stallWatchdogRegistered  = false;
+                }
+
+                // 3. Collect in-flight jobs (Running or Pending, i.e., dispatched to a Worker).
+                //    Snapshot the map now; it may change on callbacks after we await.
+                var inflightSnapshot = new List<(string jobId, WorkerInfo worker, MtrJobViewModel vm)>();
+                foreach (var vm in _dispatchedJobs)
+                {
+                    if (!IsTerminalState(vm.State) && vm.Worker != null &&
+                        _jobWorkerMap.ContainsKey(vm.JobId))
+                    {
+                        inflightSnapshot.Add((vm.JobId, vm.Worker, vm));
+                    }
+                }
+
+                // 4. Send /cancel to each in-flight Worker.
+                //    Wire-compat: 404 from old Workers is logged and ignored — master stop
+                //    still completes. We do NOT await each individually to avoid long waits;
+                //    we fire all in parallel and await the aggregate.
+                if (inflightSnapshot.Count > 0 && _batchDispatcher != null && _batchAuth != null)
+                {
+                    var cancelTasks = new List<System.Threading.Tasks.Task>(inflightSnapshot.Count);
+                    foreach (var (jobId, worker, _) in inflightSnapshot)
+                    {
+                        cancelTasks.Add(SendCancelToWorkerAsync(worker, jobId));
+                    }
+                    // Wait for all cancel requests to finish (success or failure).
+                    await System.Threading.Tasks.Task.WhenAll(cancelTasks);
+                }
+
+                // 5. Mark all remaining non-terminal jobs as Cancelled.
+                foreach (var vm in _dispatchedJobs)
+                {
+                    if (!IsTerminalState(vm.State))
+                    {
+                        vm.State = JobState.Cancelled;
+                        vm.Phase = JobPhase.Terminal;
+                    }
+                }
+
+                // 6. Clean up watchdog state.
+                _jobReconnectCount.Clear();
+                _stallWatchdogActive.Clear();
+                _jobLastProgressTime.Clear();
+                _jobWorkerMap.Clear();
+
+                Debug.Log("[DistributedRecorder] バッチ停止完了。全ジョブを Cancelled に設定しました。");
+
+                // 7. Finalize the batch (releases transport/dispatcher/auth).
+                //    FinalizeBatchIfDone checks pendingQueue.Count==0 and all-terminal, both true now.
+                FinalizeBatchIfDone();
+                Repaint();
+            }
+            finally
+            {
+                _batchStopping = false;
+            }
+        }
+
+        /// <summary>
+        /// Drains <see cref="_pendingQueue"/> and marks every dequeued job as
+        /// <see cref="JobState.Cancelled"/>.  Called at the start of
+        /// <see cref="StopBatchAsync"/> to prevent new dispatches.
+        ///
+        /// Pure side-effect (no network calls).
+        /// Made internal for hermetic tests.
+        /// </summary>
+        internal void CancelQueuedJobs()
+        {
+            while (_pendingQueue.Count > 0)
+            {
+                var vm = _pendingQueue.Dequeue();
+                if (!IsTerminalState(vm.State))
+                {
+                    vm.State = JobState.Cancelled;
+                    vm.Phase = JobPhase.Terminal;
+                    Debug.Log(
+                        $"[DistributedRecorder] 待機中ジョブをキャンセル: " +
+                        $"{(vm.JobId.Length >= 8 ? vm.JobId.Substring(0, 8) : vm.JobId)}…");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sends POST /cancel to <paramref name="worker"/> for the given
+        /// <paramref name="jobId"/> using the batch HMAC authenticator.
+        ///
+        /// Wire-compat: if the Worker returns 404 (older than v1.4.9, no /cancel endpoint),
+        /// the failure is logged at Info level (not Error) and the promise resolves normally
+        /// so the master-side stop is not blocked.
+        ///
+        /// Must be awaited on the Unity main thread (no ConfigureAwait(false)).
+        ///
+        /// Made internal for hermetic tests.
+        /// </summary>
+        internal async System.Threading.Tasks.Task SendCancelToWorkerAsync(
+            WorkerInfo worker, string jobId)
+        {
+            if (_batchDispatcher == null || _batchAuth == null)
+                return;
+
+            try
+            {
+                bool sent = await _batchDispatcher.SendCancelJobAsync(worker, jobId);
+                if (sent)
+                {
+                    Debug.Log(
+                        $"[DistributedRecorder] /cancel 送信成功: Worker='{worker.displayName}' " +
+                        $"jobId={jobId.Substring(0, Math.Min(8, jobId.Length))}…");
+                }
+                else
+                {
+                    // 404 or other non-fatal response from older Worker.
+                    Debug.Log(
+                        $"[DistributedRecorder] /cancel: Worker '{worker.displayName}' が応答しませんでした " +
+                        $"(古い Worker の可能性)。master 停止は続行します。" +
+                        $"jobId={jobId.Substring(0, Math.Min(8, jobId.Length))}…");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Network error: log and continue. Master-side stop must always complete.
+                Debug.LogWarning(
+                    $"[DistributedRecorder] /cancel 送信中に例外が発生しました " +
+                    $"(Worker='{worker.displayName}'): {ex.Message}。master 停止は続行します。");
+            }
         }
 
         // -----------------------------------------------------------------------
