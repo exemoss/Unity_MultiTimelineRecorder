@@ -18,6 +18,7 @@ namespace DistributedRecorder.UI
     ///   - Dispatch button + pre-flight version/hash check
     ///   - Active job progress bars and log tail
     ///   - Completed jobs with "Open folder" button
+    ///   - Collect-to-directory section (v1.4.8)
     ///
     /// Open via: Window > Distributed Recorder
     /// </summary>
@@ -46,6 +47,17 @@ namespace DistributedRecorder.UI
         private string              _scenePath            = DefaultSampleScenePath;
         private string              _outputDirectory      = "Recordings/Results";
 
+        // --- collect-to-dir state (v1.4.8) -------------------------------------
+
+        /// <summary>
+        /// User-specified absolute (or relative) path for bulk collection.
+        /// Empty = feature disabled; per-job results stay in their individual LocalOutputDir.
+        /// </summary>
+        private string _collectDir = string.Empty;
+
+        /// <summary>Guard against concurrent bulk-collect button presses.</summary>
+        private bool _isBulkCollecting;
+
         // --- runtime state ------------------------------------------------------
 
         private readonly List<JobViewModel> _jobs     = new List<JobViewModel>();
@@ -66,6 +78,7 @@ namespace DistributedRecorder.UI
         private const string PrefKeyScenePath            = "DistributedRecorder.scenePath";
         private const string PrefKeyRecorderSettingsPath = "DistributedRecorder.recorderSettingsPath";
         private const string PrefKeyOutputDirectory      = "DistributedRecorder.outputDirectory";
+        private const string PrefKeyCollectDir           = "DistributedRecorder.collectDir";
 
         // -------------------------------------------------------------------------
 
@@ -74,6 +87,7 @@ namespace DistributedRecorder.UI
             // Restore persisted values from EditorPrefs, then migrate stale scene path.
             _recorderSettingsPath = EditorPrefs.GetString(PrefKeyRecorderSettingsPath, _recorderSettingsPath);
             _outputDirectory      = EditorPrefs.GetString(PrefKeyOutputDirectory,      _outputDirectory);
+            _collectDir           = EditorPrefs.GetString(PrefKeyCollectDir,           _collectDir);
 
             string savedScene = EditorPrefs.GetString(PrefKeyScenePath, _scenePath);
             _scenePath = MigrateScenePath(
@@ -88,6 +102,7 @@ namespace DistributedRecorder.UI
             EditorPrefs.SetString(PrefKeyScenePath,            _scenePath);
             EditorPrefs.SetString(PrefKeyRecorderSettingsPath, _recorderSettingsPath);
             EditorPrefs.SetString(PrefKeyOutputDirectory,      _outputDirectory);
+            EditorPrefs.SetString(PrefKeyCollectDir,           _collectDir);
 
             _transport?.Dispose();
         }
@@ -160,6 +175,8 @@ namespace DistributedRecorder.UI
             DrawWorkerSection();
             EditorGUILayout.Space(4);
             DrawJobConfigSection();
+            EditorGUILayout.Space(4);
+            DrawCollectSection();
             EditorGUILayout.Space(4);
             DrawActiveJobsSection();
             if (_showLog) DrawLogSection();
@@ -254,6 +271,101 @@ namespace DistributedRecorder.UI
             }
         }
 
+        // --- Collect section (v1.4.8) -------------------------------------------
+
+        private void DrawCollectSection()
+        {
+            EditorGUILayout.LabelField("収集先ディレクトリ (Collect to Directory)", EditorStyles.boldLabel);
+
+            // Path text field + folder picker button on the same line.
+            EditorGUILayout.BeginHorizontal();
+            _collectDir = EditorGUILayout.TextField(
+                new GUIContent("収集先",
+                    "完了したジョブの成果物をまとめてコピーするディレクトリ。\n" +
+                    "空の場合は従来の Output Directory のみに保存されます。"),
+                _collectDir);
+
+            if (GUILayout.Button("...", GUILayout.Width(30)))
+            {
+                string picked = EditorUtility.OpenFolderPanel(
+                    "収集先ディレクトリを選択",
+                    string.IsNullOrEmpty(_collectDir) ? string.Empty : _collectDir,
+                    string.Empty);
+
+                if (!string.IsNullOrEmpty(picked))
+                {
+                    // Validate immediately so the user gets instant feedback.
+                    if (CollectPathValidator.Validate(picked, out string pathErr))
+                    {
+                        _collectDir = picked;
+                    }
+                    else
+                    {
+                        EditorUtility.DisplayDialog("無効なパス", pathErr, "OK");
+                    }
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+
+            // Show current validation state.
+            if (!string.IsNullOrEmpty(_collectDir))
+            {
+                if (!CollectPathValidator.Validate(_collectDir, out string valErr))
+                    EditorGUILayout.HelpBox($"パスが無効です: {valErr}", MessageType.Error);
+                else
+                    EditorGUILayout.LabelField(
+                        new GUIContent("  " + _collectDir),
+                        EditorStyles.miniLabel);
+            }
+            else
+            {
+                EditorGUILayout.LabelField(
+                    "(未設定 – 収集機能は無効)",
+                    EditorStyles.miniLabel);
+            }
+
+            EditorGUILayout.Space(2);
+
+            // "まとめて DL（収集先へ）" button.
+            bool hasValidCollectDir = !string.IsNullOrEmpty(_collectDir) &&
+                                      CollectPathValidator.Validate(_collectDir, out _);
+            int completedCount = CountCompletedJobs();
+
+            using (new EditorGUI.DisabledScope(!hasValidCollectDir || _isBulkCollecting))
+            {
+                string btnLabel = _isBulkCollecting
+                    ? "収集中..."
+                    : $"まとめて DL（収集先へ）[完了済み {completedCount} 件]";
+
+                if (GUILayout.Button(btnLabel, GUILayout.Height(26)))
+                {
+                    if (!hasValidCollectDir)
+                    {
+                        EditorUtility.DisplayDialog(
+                            "収集先を指定してください",
+                            "収集先ディレクトリが設定されていないか無効です。\n" +
+                            "「収集先」欄にディレクトリを指定してから実行してください。",
+                            "OK");
+                    }
+                    else
+                    {
+                        BulkCollectAsync();
+                    }
+                }
+            }
+
+            if (!hasValidCollectDir && !string.IsNullOrEmpty(_collectDir))
+            {
+                // Path is set but invalid – additional hint.
+            }
+            else if (!hasValidCollectDir)
+            {
+                EditorGUILayout.LabelField(
+                    "収集先を指定するとボタンが有効になります",
+                    EditorStyles.miniLabel);
+            }
+        }
+
         // --- Active jobs section ------------------------------------------------
 
         private void DrawActiveJobsSection()
@@ -335,6 +447,16 @@ namespace DistributedRecorder.UI
                 return;
             }
 
+            // Validate collect dir if set.
+            if (!string.IsNullOrEmpty(_collectDir) &&
+                !CollectPathValidator.Validate(_collectDir, out string collectErr))
+            {
+                EditorUtility.DisplayDialog("収集先パスが無効",
+                    $"収集先ディレクトリが無効なため Dispatch を中止しました。\n\n{collectErr}",
+                    "OK");
+                return;
+            }
+
             var request = new JobRequest
             {
                 jobId                     = jobId,
@@ -349,7 +471,12 @@ namespace DistributedRecorder.UI
                 WorkerName     = worker.displayName,
                 State          = JobState.Pending,
                 LocalOutputDir = Path.Combine(
-                    ProjectPaths.ProjectRoot, _outputDirectory, jobId)
+                    ProjectPaths.ProjectRoot, _outputDirectory, jobId),
+                // Snapshot the collect dir at dispatch time so mid-session UI edits
+                // do not affect already-dispatched jobs.
+                CollectDir     = _collectDir,
+                // Use jobId as disambig for destination path collision avoidance.
+                CollectDisambig = jobId.Substring(0, Math.Min(8, jobId.Length)),
             };
             _jobs.Add(vm);
             Log($"Dispatching job {jobId} → {worker.displayName}...");
@@ -372,8 +499,6 @@ namespace DistributedRecorder.UI
                 vm.State = JobState.Failed;
 
                 // Version mismatch: show dialog asking for override (MVP-A3).
-                // If the user approves, re-dispatch with skipVersionCheck = true so
-                // the dispatcher bypasses the local version comparison.
                 if (result.FailReason == DispatchFailReason.VersionMismatch)
                 {
                     bool proceed = EditorUtility.DisplayDialog(
@@ -411,7 +536,6 @@ namespace DistributedRecorder.UI
                             return;
                         }
 
-                        // Override dispatch accepted – continue to monitor progress.
                         result = overrideResult;
                     }
                     else
@@ -420,13 +544,8 @@ namespace DistributedRecorder.UI
                         return;
                     }
                 }
-                // Hash mismatch: show dialog asking for override.
-                // If the user approves, re-dispatch with skipHashCheck = true so the
-                // Worker bypasses the project-hash equality check and uses its local copy.
                 else if (result.FailReason == DispatchFailReason.HashMismatch)
                 {
-                    // Extract short hashes from the reason string for the dialog body.
-                    // reason format: "Project hash mismatch (local=<64hex>, master=<64hex>). ..."
                     string masterShort = ExtractHashShort(result.ErrorMessage, "master=");
                     string localShort  = ExtractHashShort(result.ErrorMessage, "local=");
 
@@ -467,7 +586,6 @@ namespace DistributedRecorder.UI
                             return;
                         }
 
-                        // Override dispatch accepted – continue to monitor progress.
                         result = overrideResult;
                     }
                     else
@@ -511,6 +629,10 @@ namespace DistributedRecorder.UI
             Repaint();
         }
 
+        /// <summary>
+        /// Downloads results for a single completed job, then optionally copies
+        /// them to <see cref="JobViewModel.CollectDir"/> when it is set and valid.
+        /// </summary>
         private async void DownloadResultsAsync(WorkerInfo worker, JobViewModel vm)
         {
             Log($"Downloading results for job {vm.JobId}...");
@@ -520,14 +642,174 @@ namespace DistributedRecorder.UI
                 (name, cur, total) => Log($"  [{cur}/{total}] {name}"));
 
             if (result.Success)
+            {
                 Log($"Download complete: {result.Files.Count} file(s) → {vm.LocalOutputDir}");
+
+                // Auto-collect to CollectDir if it was set at dispatch time.
+                if (!string.IsNullOrEmpty(vm.CollectDir) &&
+                    CollectPathValidator.Validate(vm.CollectDir, out _))
+                {
+                    await CopyToCollectDirAsync(vm, result.Files);
+                }
+            }
             else
+            {
                 Log($"[ERROR] Download failed: {result.ErrorMessage}");
+            }
 
             Repaint();
         }
 
+        // --- bulk collect logic (v1.4.8) ----------------------------------------
+
+        /// <summary>
+        /// Copies already-downloaded files for all Completed jobs to
+        /// <see cref="_collectDir"/>.  Jobs without a local download yet skip.
+        ///
+        /// Called by the "まとめて DL" button.  Guard: <see cref="_isBulkCollecting"/>.
+        /// </summary>
+        private async void BulkCollectAsync()
+        {
+            if (_isBulkCollecting) return;
+            if (string.IsNullOrEmpty(_collectDir)) return;
+            if (!CollectPathValidator.Validate(_collectDir, out string valErr))
+            {
+                EditorUtility.DisplayDialog("収集先が無効", valErr, "OK");
+                return;
+            }
+
+            _isBulkCollecting = true;
+            Repaint();
+
+            try
+            {
+                // Snapshot the completed-job list synchronously on the main thread.
+                var completedJobs = new List<JobViewModel>();
+                foreach (var job in _jobs)
+                {
+                    if (job.State == JobState.Completed)
+                        completedJobs.Add(job);
+                }
+
+                if (completedJobs.Count == 0)
+                {
+                    Log("[INFO] まとめて DL: 完了済みジョブがありません。");
+                    return;
+                }
+
+                Log($"[INFO] まとめて DL 開始 – {completedJobs.Count} 件 → {_collectDir}");
+
+                int done = 0;
+                foreach (var job in completedJobs)
+                {
+                    Log($"  [{++done}/{completedJobs.Count}] {job.JobId.Substring(0, Math.Min(8, job.JobId.Length))}...");
+
+                    bool hasCachedFiles = !string.IsNullOrEmpty(job.LocalOutputDir) &&
+                                         Directory.Exists(job.LocalOutputDir);
+
+                    if (hasCachedFiles)
+                    {
+                        // Files already downloaded – copy from local cache.
+                        var cachedFiles = new List<string>();
+                        foreach (string f in Directory.GetFiles(job.LocalOutputDir, "*", SearchOption.AllDirectories))
+                            cachedFiles.Add(f);
+
+                        await CopyToCollectDirAsync(job, cachedFiles);
+                    }
+                    else
+                    {
+                        // No cached files – cannot re-download without a live worker reference.
+                        // This case arises when the window was closed between DL and collect.
+                        Log($"  [WARN] Job {job.JobId.Substring(0, Math.Min(8, job.JobId.Length))}: " +
+                            "ローカルキャッシュが見つかりません。先にジョブを再 DL してください。");
+                    }
+                }
+
+                Log($"[INFO] まとめて DL 完了 → {_collectDir}");
+            }
+            finally
+            {
+                _isBulkCollecting = false;
+                Repaint();
+            }
+        }
+
+        /// <summary>
+        /// Copies <paramref name="localFiles"/> to a sub-directory under
+        /// <see cref="JobViewModel.CollectDir"/> (or <see cref="_collectDir"/> if
+        /// the VM has no collect dir set).
+        ///
+        /// Destination naming:
+        ///   <see cref="_collectDir"/>/<c>WorkerName</c>_<c>jobId[0..7]</c>/
+        ///
+        /// Collision avoidance is handled by <see cref="CollectPathValidator.BuildDestinationPath"/>.
+        /// Large lists are copied on a background thread to avoid blocking the Editor.
+        /// </summary>
+        private async Task CopyToCollectDirAsync(JobViewModel vm, IReadOnlyList<string> localFiles)
+        {
+            if (localFiles == null || localFiles.Count == 0) return;
+
+            string targetDir = string.IsNullOrEmpty(vm.CollectDir) ? _collectDir : vm.CollectDir;
+            if (string.IsNullOrEmpty(targetDir)) return;
+
+            string destDir = CollectPathValidator.BuildDestinationPath(
+                targetDir,
+                vm.WorkerName ?? "Job",
+                vm.CollectDisambig ?? vm.JobId.Substring(0, Math.Min(8, vm.JobId.Length)),
+                Directory.Exists);
+
+            try
+            {
+                await Task.Run(() =>
+                {
+                    CollectPathValidator.EnsureDirectory(destDir);
+                    foreach (string src in localFiles)
+                    {
+                        if (!File.Exists(src)) continue;
+                        string fileName = Path.GetFileName(src);
+                        string dest     = Path.Combine(destDir, fileName);
+
+                        // Avoid overwriting identical file (simple name check).
+                        if (File.Exists(dest))
+                        {
+                            string stem = Path.GetFileNameWithoutExtension(fileName);
+                            string ext  = Path.GetExtension(fileName);
+                            dest = Path.Combine(destDir,
+                                $"{stem}_{vm.CollectDisambig ?? "dup"}{ext}");
+                        }
+
+                        File.Copy(src, dest, overwrite: false);
+                    }
+                }).ConfigureAwait(false);
+
+                // Back on main thread (ConfigureAwait(false) → continuation on thread pool,
+                // but Log / Repaint are called via MainThreadDispatcher.Enqueue).
+                MainThreadDispatcher.Enqueue(() =>
+                {
+                    Log($"  Collected {localFiles.Count} file(s) → {destDir}");
+                    Repaint();
+                });
+            }
+            catch (Exception ex)
+            {
+                MainThreadDispatcher.Enqueue(() =>
+                {
+                    Log($"[ERROR] Collect copy failed for job {vm.JobId}: {ex.Message}");
+                    Repaint();
+                });
+            }
+        }
+
         // --- helpers ------------------------------------------------------------
+
+        private int CountCompletedJobs()
+        {
+            int n = 0;
+            foreach (var job in _jobs)
+                if (job.State == JobState.Completed)
+                    n++;
+            return n;
+        }
 
         private const int MaxLogLines = 200;
 
@@ -569,5 +851,18 @@ namespace DistributedRecorder.UI
         public int      CurrentFrame;
         public int      TotalFrames;
         public string   LocalOutputDir;
+
+        // --- collect-to-dir (v1.4.8) ---
+        /// <summary>
+        /// Collection destination directory snapshotted at dispatch time.
+        /// May differ from the current UI value if the user edits the field mid-session.
+        /// </summary>
+        public string CollectDir;
+
+        /// <summary>
+        /// Short disambiguator appended to the destination sub-directory on collision.
+        /// Typically the first 8 chars of JobId.
+        /// </summary>
+        public string CollectDisambig;
     }
 }
