@@ -1146,9 +1146,9 @@ namespace DistributedRecorder.Worker
                 else
                 {
                     Debug.LogWarning($"[JobRunner] {_maxJobsBeforeRestart} 件完了。" +
-                                     "Worker を停止しました。" +
-                                     "DistributedRecorder > Stop Worker (Debug) から再起動してください。");
-                    Bootstrap.StopWorker();
+                                     "リスナーを一時停止します。WorkerAutoRecovery が自動で再起動します。" +
+                                     "（手動停止する場合は DistributedRecorder > Stop Worker (Debug)）");
+                    Bootstrap.StopWorkerForCycleRestart();
                 }
             }
         }

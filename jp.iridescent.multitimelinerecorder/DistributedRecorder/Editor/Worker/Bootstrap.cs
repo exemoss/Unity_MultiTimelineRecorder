@@ -43,6 +43,13 @@ namespace DistributedRecorder.Worker
     ///   When launched via the menu item (not -executeMethod), errors will show a
     ///   dialog and log to the Console instead of calling EditorApplication.Exit.
     ///   Use "DistributedRecorder > Stop Worker (Debug)" to stop a running Worker.
+    ///
+    /// Auto-recovery (v1.4.15):
+    ///   <see cref="WorkerAutoRecovery"/> monitors this class via
+    ///   <see cref="IsWorkerRunning"/> and the EditorPrefs flag
+    ///   <c>DistWorker_ShouldAutoRecover</c> (set by <see cref="RunWithConfig"/>,
+    ///   cleared by <see cref="StopWorker"/>; untouched by
+    ///   <see cref="StopWorkerForCycleRestart"/> so the loop re-triggers).
     /// </summary>
     public static class Bootstrap
     {
@@ -59,6 +66,27 @@ namespace DistributedRecorder.Worker
         public static bool IsWorkerRunning => _httpListener != null;
 
         // -----------------------------------------------------------------------
+        // Auto-recovery flag (EditorPrefs, persists across domain reloads)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// EditorPrefs key for the auto-recovery intent flag.
+        /// true  = Worker was intentionally started and should be auto-recovered.
+        /// false = User explicitly stopped the Worker; auto-recovery must not fire.
+        /// </summary>
+        internal const string KeyShouldAutoRecover = "DistWorker_ShouldAutoRecover";
+
+        /// <summary>
+        /// Whether the Worker should be automatically restarted by
+        /// <see cref="WorkerAutoRecovery"/> when the listener is found dead.
+        /// </summary>
+        public static bool ShouldAutoRecover
+        {
+            get => EditorPrefs.GetBool(KeyShouldAutoRecover, false);
+            private set => EditorPrefs.SetBool(KeyShouldAutoRecover, value);
+        }
+
+        // -----------------------------------------------------------------------
         // Menu items
         // -----------------------------------------------------------------------
 
@@ -71,6 +99,18 @@ namespace DistributedRecorder.Worker
                       $"Port: {config.Port}, " +
                       $"SharedKeyPath: {(string.IsNullOrEmpty(config.SharedKeyPath) ? "(default)" : config.SharedKeyPath)}");
 
+            RunWithConfig(config);
+        }
+
+        /// <summary>
+        /// Restarts the Worker using the same command-line config as <see cref="Run"/>.
+        /// Called by <see cref="WorkerAutoRecovery"/> when the listener is found dead
+        /// and <see cref="ShouldAutoRecover"/> is true.
+        /// </summary>
+        internal static void RestartFromAutoRecovery()
+        {
+            var config = WorkerCli.ParseCommandLine();
+            Debug.Log("[Bootstrap] WorkerAutoRecovery: restarting Worker listener.");
             RunWithConfig(config);
         }
 
@@ -90,7 +130,11 @@ namespace DistributedRecorder.Worker
                 return;
             }
 
-            Debug.Log("[Bootstrap] Stopping Worker (interactive request).");
+            // User-initiated stop: clear the auto-recovery flag so WorkerAutoRecovery
+            // does NOT restart the listener automatically.
+            ShouldAutoRecover = false;
+
+            Debug.Log("[Bootstrap] Stopping Worker (user request). Auto-recovery disabled.");
             _httpListener.Stop();
             _httpListener = null;
 
@@ -106,6 +150,29 @@ namespace DistributedRecorder.Worker
             return _httpListener != null;
         }
 
+        /// <summary>
+        /// Stops the Worker listener as part of the N-job cycle restart.
+        /// Unlike <see cref="StopWorker"/>, this does NOT clear
+        /// <see cref="ShouldAutoRecover"/>, so <see cref="WorkerAutoRecovery"/>
+        /// will detect the dead listener and call <see cref="RestartFromAutoRecovery"/>.
+        ///
+        /// Called from <see cref="JobRunner"/> in the interactive N-job path.
+        /// </summary>
+        internal static void StopWorkerForCycleRestart()
+        {
+            if (_httpListener == null)
+                return;
+
+            // ShouldAutoRecover intentionally left unchanged (remains true).
+            Debug.LogWarning("[Bootstrap] Stopping Worker after N-job cycle. " +
+                             "Auto-recovery hook will restart the listener shortly.");
+            _httpListener.Stop();
+            _httpListener = null;
+
+            _udpCts?.Cancel();
+            _udpCts = null;
+        }
+
         // -----------------------------------------------------------------------
         // Core startup
         // -----------------------------------------------------------------------
@@ -115,6 +182,11 @@ namespace DistributedRecorder.Worker
         /// </summary>
         public static void RunWithConfig(WorkerConfig config)
         {
+            // Mark intent to keep the Worker alive across listener restarts.
+            // WorkerAutoRecovery will restart the listener if it goes down,
+            // unless the user explicitly stops via StopWorker() (which clears this flag).
+            ShouldAutoRecover = true;
+
             Debug.Log("[Bootstrap] Starting Distributed Recorder Worker...");
 
             // worker-reload-survival 案A: sanity-restore for crash remnants.
@@ -247,8 +319,10 @@ namespace DistributedRecorder.Worker
                 return;
             }
 
-            Debug.Log($"[Bootstrap] Worker ready on port {config.Port}. " +
-                      $"Will auto-restart after {config.MaxJobsBeforeRestart} jobs.");
+            string restartNote = Application.isBatchMode
+                ? $"Will exit and be restarted by start-worker.ps1 after {config.MaxJobsBeforeRestart} jobs."
+                : $"WorkerAutoRecovery will restart the listener after {config.MaxJobsBeforeRestart} jobs (interactive mode).";
+            Debug.Log($"[Bootstrap] Worker ready on port {config.Port}. {restartNote}");
 
             // Start UDP discovery listener so Master can locate this Worker.
             // keyBytes is guaranteed non-null here (loaded == true check above).
