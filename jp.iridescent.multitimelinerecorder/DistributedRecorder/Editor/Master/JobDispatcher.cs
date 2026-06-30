@@ -310,6 +310,61 @@ namespace DistributedRecorder.Master
         private static readonly TimeSpan GitSyncTimeout = TimeSpan.FromSeconds(10);
 
         /// <summary>
+        /// Worker commit status record returned by <see cref="ProbeWithCommitAsync"/>.
+        /// Added in sync-before-dispatch (v1.4.14).
+        /// </summary>
+        public sealed class WorkerCommitStatus
+        {
+            /// <summary>true when the Worker responded to GET /health within the timeout.</summary>
+            public bool Online;
+            /// <summary>
+            /// Branch name reported by the Worker.  Empty when offline or pre-v1.4.11.
+            /// </summary>
+            public string Branch = string.Empty;
+            /// <summary>
+            /// Short (8-char) HEAD commit SHA reported by the Worker.
+            /// Empty when offline, pre-v1.4.11, or git unavailable on the Worker.
+            /// </summary>
+            public string CommitShort = string.Empty;
+        }
+
+        /// <summary>
+        /// Probes GET /health from <paramref name="worker"/> and returns
+        /// <see cref="WorkerCommitStatus"/> with the liveness state and
+        /// the git branch + short commit SHA fields (v1.4.11+).
+        ///
+        /// Used by the pre-flight sync check (sync-before-dispatch, v1.4.14) so
+        /// the master can classify each Worker before dispatch without a separate
+        /// /health round-trip per Worker.
+        ///
+        /// Returns <see cref="WorkerCommitStatus.Online"/> = false on any
+        /// <see cref="TransportException"/> (timeout, connection refused, etc.).
+        ///
+        /// Must NOT use ConfigureAwait(false) — caller is on the Unity main thread.
+        /// </summary>
+        public async Task<WorkerCommitStatus> ProbeWithCommitAsync(WorkerInfo worker)
+        {
+            if (worker == null) throw new ArgumentNullException(nameof(worker));
+
+            try
+            {
+                string json = await _transport.GetAsync(
+                    $"{worker.BaseUrl}/health", LivenessProbeTimeout);
+                var health = ProtocolSerializer.Deserialize<WorkerHealth>(json);
+                return new WorkerCommitStatus
+                {
+                    Online      = true,
+                    Branch      = health?.gitBranch      ?? string.Empty,
+                    CommitShort = health?.gitCommitShort ?? string.Empty,
+                };
+            }
+            catch (TransportException)
+            {
+                return new WorkerCommitStatus { Online = false };
+            }
+        }
+
+        /// <summary>
         /// Fetches GET /health from <paramref name="worker"/> and returns the
         /// <c>gitBranch</c> field for master's branch-match check.
         ///
