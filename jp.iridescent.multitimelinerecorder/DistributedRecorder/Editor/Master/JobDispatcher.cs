@@ -305,6 +305,84 @@ namespace DistributedRecorder.Master
             }
         }
 
+        // --- git-sync (worker-git-sync, v1.4.11) ------------------------------------
+
+        private static readonly TimeSpan GitSyncTimeout = TimeSpan.FromSeconds(10);
+
+        /// <summary>
+        /// Fetches GET /health from <paramref name="worker"/> and returns the
+        /// <c>gitBranch</c> field for master's branch-match check.
+        ///
+        /// Returns empty string when the Worker is unreachable or the field is absent
+        /// (older Workers without v1.4.11).
+        /// </summary>
+        public async Task<string> GetWorkerGitBranchAsync(WorkerInfo worker)
+        {
+            if (worker == null) throw new ArgumentNullException(nameof(worker));
+
+            try
+            {
+                string json = await _transport.GetAsync(
+                    $"{worker.BaseUrl}/health", LivenessProbeTimeout)
+                    .ConfigureAwait(false);
+                var health = ProtocolSerializer.Deserialize<WorkerHealth>(json);
+                return health?.gitBranch ?? string.Empty;
+            }
+            catch (TransportException)
+            {
+                return string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// Sends POST /git-sync to <paramref name="worker"/> requesting fetch + reset --hard.
+        ///
+        /// Security: no branch name is sent in the request body.  The Worker determines the
+        /// branch from its own local git state, preventing injection.
+        ///
+        /// Wire-compat: Workers older than v1.4.11 return 404.  Returns <c>(false, "404…")</c>
+        /// so the caller can log and skip gracefully.
+        ///
+        /// Must NOT use ConfigureAwait(false) when called from UI handlers (Unity main thread).
+        /// </summary>
+        /// <returns>(accepted, reasonOrSummary)</returns>
+        public async Task<(bool accepted, string message, string summary)> SendGitSyncAsync(
+            WorkerInfo worker)
+        {
+            if (worker == null) throw new ArgumentNullException(nameof(worker));
+
+            var req = new GitSyncRequest { requestId = System.Guid.NewGuid().ToString("N") };
+            string json = ProtocolSerializer.Serialize(req);
+
+            try
+            {
+                string ackJson = await _transport.PostJsonAsync(
+                    $"{worker.BaseUrl}/git-sync", json, GitSyncTimeout)
+                    .ConfigureAwait(false);
+
+                GitSyncAck ack;
+                try
+                {
+                    ack = ProtocolSerializer.Deserialize<GitSyncAck>(ackJson);
+                }
+                catch
+                {
+                    // 202 with unparseable body (shouldn't happen) — treat as accepted.
+                    return (true, "202 accepted (body unreadable)", string.Empty);
+                }
+
+                if (ack != null && ack.accepted)
+                    return (true, ack.reason ?? string.Empty, ack.summary ?? string.Empty);
+
+                return (false, ack?.reason ?? "Worker rejected the request.", string.Empty);
+            }
+            catch (TransportException ex)
+            {
+                // 404 = old Worker without /git-sync — not an error from master's perspective.
+                return (false, ex.Message, string.Empty);
+            }
+        }
+
         /// <summary>
         /// Dispatches the job to <paramref name="worker"/> and returns the result.
         /// This method is async and must be awaited.
