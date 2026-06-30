@@ -91,7 +91,9 @@ namespace DistributedRecorder.Master
 
             // Block obviously sensitive OS credential/config paths.
             // Convert to forward-slashes + lower-case for comparison.
-            string lc = normalized.ToLowerInvariant().Replace('\\', '/');
+            // Append a trailing slash so substring patterns like "/.gnupg/" match
+            // even when the user omitted the trailing slash (TrimEnd removed it above).
+            string lc = (normalized.ToLowerInvariant().Replace('\\', '/')) + "/";
 
             // Home-dir credential paths (common across Windows/macOS/Linux).
             string[] sensitiveSubstrings =
