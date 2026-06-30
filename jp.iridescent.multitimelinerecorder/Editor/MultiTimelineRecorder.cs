@@ -1164,7 +1164,7 @@ namespace Unity.MultiTimelineRecorder
                         recorderItem.enabled = true;
                     }
                 }
-                
+
                 if (GUILayout.Button("Disable All", GUILayout.Width(80)))
                 {
                     // Disable all recorders
@@ -1173,13 +1173,18 @@ namespace Unity.MultiTimelineRecorder
                         recorderItem.enabled = false;
                     }
                 }
-                
+
                 GUILayout.FlexibleSpace();
                 EditorGUILayout.EndHorizontal();
-                
+
                 EditorGUILayout.Space(2);
             }
-            
+
+            // Bulk-apply button: copy current timeline's recorder config to other selected timelines.
+            DrawBulkRecorderButton();
+
+            EditorGUILayout.Space(2);
+
             // マトリクスビュー風のリスト表示
             EditorGUILayout.BeginVertical("RL Background", GUILayout.ExpandWidth(true));
             
