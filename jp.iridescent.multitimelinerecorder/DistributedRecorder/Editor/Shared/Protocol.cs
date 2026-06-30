@@ -464,6 +464,47 @@ namespace DistributedRecorder.Shared
     }
 
     // ---------------------------------------------------------------------------
+    // Cancel job (stop-button)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Sent by Master → Worker via POST /cancel to request cancellation of a running job.
+    ///
+    /// Security design:
+    ///  - <see cref="jobId"/> is validated by <see cref="InputValidator"/> (alphanumeric/hyphen,
+    ///    max 64 chars). No path components; no ".." possible.
+    ///  - Endpoint requires HMAC authentication (same as /jobs and /align-recorder).
+    ///  - Wire-compat: Workers older than v1.4.9 return 404 (unknown route).
+    ///    The Master handles 404 gracefully (log + continue).
+    ///
+    /// Added in stop-button (v1.4.9).
+    /// </summary>
+    [Serializable]
+    public class CancelJobRequest
+    {
+        /// <summary>
+        /// ID of the job to cancel. Must match the ID sent in the original
+        /// <see cref="JobRequest"/>. Validated: alphanumeric+hyphen, max 64 chars.
+        /// </summary>
+        public string jobId = string.Empty;
+    }
+
+    /// <summary>
+    /// Synchronous acknowledgement returned by the Worker for POST /cancel.
+    /// The cancel operation is synchronous (Worker stops Play Mode before responding).
+    ///
+    /// Added in stop-button (v1.4.9).
+    /// </summary>
+    [Serializable]
+    public class CancelJobAck
+    {
+        /// <summary>Whether the cancel was accepted and acted upon.</summary>
+        public bool   accepted;
+        /// <summary>Human-readable reason when <see cref="accepted"/> is false.</summary>
+        public string reason = string.Empty;
+    }
+
+    // ---------------------------------------------------------------------------
     // Serialization helpers
     // ---------------------------------------------------------------------------
 

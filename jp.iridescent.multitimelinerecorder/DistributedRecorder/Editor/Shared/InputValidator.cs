@@ -600,7 +600,21 @@ namespace DistributedRecorder.Shared
         }
 
         private static bool IsAlphanumericOrHyphen(string s)
+            => IsAlphanumericOrHyphenStatic(s);
+
+        /// <summary>
+        /// Returns true when <paramref name="s"/> contains only letters, digits, hyphens,
+        /// and underscores.  Used to validate jobId on both the Validate() path and the
+        /// /cancel endpoint (which passes the ID from the URL without a full JobRequest).
+        ///
+        /// Made <c>internal static</c> so WorkerHttpListener can call it directly for the
+        /// /cancel endpoint without constructing a full JobRequest.
+        ///
+        /// Added in stop-button (v1.4.9).
+        /// </summary>
+        internal static bool IsAlphanumericOrHyphenStatic(string s)
         {
+            if (string.IsNullOrEmpty(s)) return false;
             foreach (char c in s)
             {
                 if (!char.IsLetterOrDigit(c) && c != '-' && c != '_')
