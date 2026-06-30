@@ -21,6 +21,9 @@ using UnityEngine.SceneManagement;
 // Allow DistributedRecorder test assembly to access internal helpers.
 // Refs: movie-recorder-support §F (ResolveOutputRelativePath test access)
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("DistributedRecorder.Tests.EditMode")]
+// Allow MTR-core test assembly to access BulkAddHelper and other internal helpers.
+// Refs: bulk-add-timelines
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("MultiTimelineRecorder.Tests.EditMode")]
 
 namespace Unity.MultiTimelineRecorder
 {
