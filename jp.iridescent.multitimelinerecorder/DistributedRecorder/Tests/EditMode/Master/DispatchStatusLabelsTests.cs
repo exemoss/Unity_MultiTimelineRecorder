@@ -28,7 +28,7 @@ namespace DistributedRecorder.Tests.Master
     ///   8. Completed + DownloadState.Done              → "完了"
     ///   9. Failed                                      → "失敗"
     ///  10. Unreachable                                 → "到達不能"
-    ///  11. Cancelled                                   → "失敗" (treated as failed)
+    ///  11. Cancelled                                   → "停止" (stop-button v1.4.9)
     ///  12. Running + TotalFrames==0 + Phase==Sending (Phase wins over TotalFrames) → "データ送信中"
     ///  13. Running + Phase.Recording + CurrentFrame==0  → "録画中 0/N" (first frame not yet)
     ///  14. Completed + DownloadState.InProgress         → "収集中" (DL in progress overrides)
@@ -185,14 +185,16 @@ namespace DistributedRecorder.Tests.Master
         }
 
         // ─── 11. Cancelled ────────────────────────────────────────────────────────
+        // stop-button (v1.4.9): Cancelled now returns LabelCancelled ("停止") to
+        // distinguish a user-initiated stop from a genuine failure.
 
         [Test]
-        public void ComputeJobStatusLabel_Cancelled_ReturnsFailed()
+        public void ComputeJobStatusLabel_Cancelled_ReturnsCancelled()
         {
             var vm    = MakeVm(state: JobState.Cancelled, phase: JobPhase.Terminal);
             var label = MultiTimelineRecorder.ComputeJobStatusLabel(vm);
-            Assert.AreEqual(MultiTimelineRecorder.LabelFailed, label,
-                "Cancelled state should return 失敗 (treated as failed in UI).");
+            Assert.AreEqual(MultiTimelineRecorder.LabelCancelled, label,
+                "Cancelled state should return 停止 (stop-button v1.4.9).");
         }
 
         // ─── 12. Phase.Sending wins over TotalFrames==0 ───────────────────────────
