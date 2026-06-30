@@ -170,6 +170,24 @@ namespace Unity.MultiTimelineRecorder
         public static double ProgressStreamConnectTimeoutSecondsPublic
             => ProgressMonitor.ConnectTimeout.TotalSeconds;
 
+        // reprobe-add-worker: guard flag ─────────────────────────────────────────
+        //
+        // Set to true while ReprobeAndAddWorkersAsync is running to prevent
+        // concurrent button-clicks from starting a second probe pass.
+        // Only accessed on the Editor main thread.
+
+        /// <summary>
+        /// True while the "ワーカーを再プローブ/追加" operation is in progress.
+        /// Prevents concurrent invocations from a rapid button double-click.
+        /// </summary>
+        private bool _reprobing;
+
+        /// <summary>
+        /// Last result message from the most recent reprobe operation, shown in the UI.
+        /// Cleared at the start of each new reprobe.
+        /// </summary>
+        private string _reprobeResultMessage;
+
         /// <summary>
         /// Jobs waiting to be dispatched (not yet sent to any Worker).
         /// Populated at batch start; consumed by <see cref="TryDispatchNextQueuedJob"/>.
@@ -413,6 +431,27 @@ namespace Unity.MultiTimelineRecorder
                     $"回収先: {outRoot}",
                     EditorStyles.miniLabel);
             }
+
+            // ── reprobe-add-worker: re-probe button ───────────────────────────
+            // Only enabled while a batch is in flight (_batchOnlineWorkers != null)
+            // and a probe is not already running.
+            // Placed above the job list so it is visible without scrolling.
+            EditorGUILayout.BeginHorizontal();
+            bool batchActive = _batchOnlineWorkers != null && _batchDispatcher != null && _batchAuth != null;
+            GUI.enabled = batchActive && !_reprobing;
+            if (GUILayout.Button(
+                    _reprobing ? "再プローブ中…" : "ワーカーを再プローブ/追加",
+                    GUILayout.Height(22)))
+            {
+                _ = ReprobeAndAddWorkersAsync();
+            }
+            GUI.enabled = true;
+            if (!string.IsNullOrEmpty(_reprobeResultMessage))
+            {
+                EditorGUILayout.LabelField(_reprobeResultMessage, EditorStyles.miniLabel);
+            }
+            EditorGUILayout.EndHorizontal();
+            // ─────────────────────────────────────────────────────────────────
 
             // Scrollable job list (max 150px)
             _distJobScrollPos = EditorGUILayout.BeginScrollView(
@@ -1965,6 +2004,240 @@ namespace Unity.MultiTimelineRecorder
 
             Debug.Log("[DistributedRecorder] 全ジョブが完了しました。バッチを終了します。");
             Repaint();
+        }
+
+        // -----------------------------------------------------------------------
+        // reprobe-add-worker: pure function + async operation
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Pure function: given all enabled Workers in the registry, the current
+        /// batch online pool, and fresh probe results, returns the subset of Workers
+        /// that should be added to the running pool.
+        ///
+        /// A Worker is added when ALL three conditions hold:
+        ///   1. It is enabled in the registry (<paramref name="allEnabledWorkers"/>).
+        ///   2. Its probe result is true (online) in <paramref name="probeResults"/>.
+        ///   3. It is NOT already in <paramref name="batchOnlineWorkers"/> (no duplicates).
+        ///
+        /// Workers absent from <paramref name="probeResults"/> are treated as offline.
+        ///
+        /// Made <c>public static</c> for hermetic EditMode tests.
+        /// </summary>
+        /// <param name="allEnabledWorkers">
+        /// All enabled Workers from the registry at the time of reprobe.
+        /// </param>
+        /// <param name="batchOnlineWorkers">
+        /// Workers already in the running batch pool (must not be duplicated).
+        /// </param>
+        /// <param name="probeResults">
+        /// Map of workerDisplayName → online result from the reprobe.
+        /// </param>
+        /// <returns>
+        /// Ordered list of Workers to add to the pool (may be empty; never null).
+        /// </returns>
+        public static List<WorkerInfo> ComputeWorkersToAdd(
+            IReadOnlyList<WorkerInfo> allEnabledWorkers,
+            IReadOnlyList<WorkerInfo> batchOnlineWorkers,
+            IReadOnlyDictionary<string, bool> probeResults)
+        {
+            var result = new List<WorkerInfo>();
+            if (allEnabledWorkers == null || allEnabledWorkers.Count == 0)
+                return result;
+
+            // Build a set of display names already in the batch pool for O(1) lookup.
+            var alreadyInPool = new HashSet<string>();
+            if (batchOnlineWorkers != null)
+            {
+                foreach (var w in batchOnlineWorkers)
+                {
+                    if (w != null)
+                        alreadyInPool.Add(w.displayName);
+                }
+            }
+
+            foreach (var w in allEnabledWorkers)
+            {
+                if (w == null) continue;
+
+                // Skip if already in pool
+                if (alreadyInPool.Contains(w.displayName)) continue;
+
+                // Skip if probe did not return true (offline or not probed)
+                if (probeResults == null) continue;
+                if (!probeResults.TryGetValue(w.displayName, out bool online) || !online) continue;
+
+                result.Add(w);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Probes all enabled Workers in the registry, adds newly online Workers to
+        /// <see cref="_batchOnlineWorkers"/>, initialises their inflight counter, and
+        /// pumps the pending queue by dispatching the next queued job to each newly
+        /// idle added Worker.
+        ///
+        /// Called from the UI button; no-ops safely when no batch is active.
+        /// Guard: <see cref="_reprobing"/> prevents concurrent invocations.
+        ///
+        /// Main-thread constraint: no <c>ConfigureAwait(false)</c>.  All Unity API
+        /// calls (Repaint, EditorCallbackOnce, _workerInflightCount) remain on the
+        /// main thread throughout.
+        /// </summary>
+        private async Task ReprobeAndAddWorkersAsync()
+        {
+            // Guard: no-op when batch not active or already probing
+            if (_batchOnlineWorkers == null || _batchDispatcher == null || _batchAuth == null)
+                return;
+            if (_reprobing) return;
+
+            _reprobing = true;
+            _reprobeResultMessage = "再プローブ中…";
+            Repaint();
+
+            try
+            {
+                var registry = _distWorkerRegistry;
+                if (registry == null)
+                {
+                    _reprobeResultMessage = "レジストリが未設定です。";
+                    return;
+                }
+
+                var allEnabled = registry.EnabledWorkers;
+                if (allEnabled.Count == 0)
+                {
+                    _reprobeResultMessage = "有効 Worker が 0 台です。";
+                    return;
+                }
+
+                // Probe all enabled Workers (same probe path as pre-flight: HMAC, 3s timeout).
+                // Use the batch dispatcher (already authenticated).
+                var probeResults = new Dictionary<string, bool>();
+                int probeCount = 0;
+                foreach (var worker in allEnabled)
+                {
+                    if (worker == null) continue;
+                    bool online = await _batchDispatcher.ProbeAsync(worker);
+                    probeResults[worker.displayName] = online;
+                    probeCount++;
+                }
+
+                // Compute which Workers should be added (pure function — hermetic testable).
+                var toAdd = ComputeWorkersToAdd(allEnabled, _batchOnlineWorkers, probeResults);
+
+                // Add new Workers to the batch pool and initialise their inflight counter.
+                int addedCount = 0;
+                foreach (var w in toAdd)
+                {
+                    _batchOnlineWorkers.Add(w);
+                    if (!_workerInflightCount.ContainsKey(w.displayName))
+                        _workerInflightCount[w.displayName] = 0;
+                    addedCount++;
+
+                    Debug.Log(
+                        $"[DistributedRecorder] 再プローブ: Worker '{w.displayName}' をバッチプールに追加しました。");
+                }
+
+                // Log offline Workers that were probed but not in the pool.
+                // "Already in pool" Workers that now probe offline are expected (Worker may
+                // be temporarily unreachable) — no log needed; they stay in the pool.
+                var toAddNames = new HashSet<string>();
+                foreach (var w2 in toAdd) if (w2 != null) toAddNames.Add(w2.displayName);
+
+                foreach (var worker in allEnabled)
+                {
+                    if (worker == null) continue;
+                    if (!probeResults.TryGetValue(worker.displayName, out bool workerOnline)
+                        || workerOnline)
+                        continue; // online or missing (should not happen): skip
+
+                    // Offline and NOT in the result set → log only once per offline Worker
+                    if (!toAddNames.Contains(worker.displayName))
+                    {
+                        Debug.Log(
+                            $"[DistributedRecorder] 再プローブ: Worker '{worker.displayName}' " +
+                            "はオフラインのためプールに追加しませんでした。");
+                    }
+                }
+
+                // Pump the pending queue: for each newly added (idle) Worker, dispatch
+                // the next job if any are waiting.
+                int pumpedCount = 0;
+                foreach (var w in toAdd)
+                {
+                    if (_pendingQueue.Count == 0) break;
+
+                    // Only pump if the newly added Worker is idle (inflight == 0).
+                    // It was just added so its count is 0, but guard defensively.
+                    _workerInflightCount.TryGetValue(w.displayName, out int inflight);
+                    if (inflight > 0) continue;
+
+                    // Peek next job – avoid dispatching if all workers for that job
+                    // have been tried and this newly added Worker is also excluded.
+                    // SelectIdleWorker with the next job's TriedWorkers will handle this.
+                    var nextVm = _pendingQueue.Peek();
+                    WorkerInfo target = SelectIdleWorker(
+                        _batchOnlineWorkers, w, _workerInflightCount, nextVm.TriedWorkers);
+
+                    if (target == null) continue;
+
+                    _pendingQueue.Dequeue();
+                    _ = DispatchQueuedJobAsync(target, nextVm);
+                    pumpedCount++;
+                }
+
+                // Build result message for UI
+                int alreadyInPoolCount = CountAlreadyInPool(allEnabled, toAdd);
+                int offlineCount = probeCount - addedCount - alreadyInPoolCount;
+                string offlineSuffix = offlineCount > 0
+                    ? $"、{offlineCount} 台オフライン"
+                    : string.Empty;
+                _reprobeResultMessage =
+                    $"{probeCount} 台プローブ / {addedCount} 台追加 / {pumpedCount} ジョブ再割当{offlineSuffix}";
+
+                Debug.Log(
+                    $"[DistributedRecorder] 再プローブ完了: {_reprobeResultMessage}");
+                Repaint();
+            }
+            finally
+            {
+                _reprobing = false;
+                Repaint();
+            }
+        }
+
+        /// <summary>
+        /// Helper: counts how many workers in <paramref name="allEnabled"/> are already
+        /// in the batch pool (i.e. not in <paramref name="toAdd"/> and not offline).
+        /// Used only for building the result message string in
+        /// <see cref="ReprobeAndAddWorkersAsync"/>.
+        /// </summary>
+        private int CountAlreadyInPool(
+            IReadOnlyList<WorkerInfo> allEnabled,
+            IReadOnlyList<WorkerInfo> toAdd)
+        {
+            if (allEnabled == null || _batchOnlineWorkers == null) return 0;
+            var toAddNames = new HashSet<string>();
+            if (toAdd != null)
+                foreach (var w in toAdd) if (w != null) toAddNames.Add(w.displayName);
+
+            int count = 0;
+            foreach (var w in allEnabled)
+            {
+                if (w == null) continue;
+                if (toAddNames.Contains(w.displayName)) continue;
+                foreach (var pw in _batchOnlineWorkers)
+                {
+                    if (pw != null && pw.displayName == w.displayName)
+                    {
+                        count++;
+                        break;
+                    }
+                }
+            }
+            return count;
         }
 
         // -----------------------------------------------------------------------
