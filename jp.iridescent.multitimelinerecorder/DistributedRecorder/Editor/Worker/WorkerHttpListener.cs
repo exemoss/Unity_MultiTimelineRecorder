@@ -851,7 +851,20 @@ namespace DistributedRecorder.Worker
 
                 Debug.Log(
                     $"[WorkerHttpListener] /git-sync: completed. {syncSummary}. " +
-                    "Unity will domain-reload to reflect code changes.");
+                    "Triggering AssetDatabase.Refresh() so Unity picks up changed assets " +
+                    "(timeline/.unity/.playable files). Code changes will trigger a domain reload.");
+
+                // sync-before-dispatch (v1.4.14): refresh the AssetDatabase so that
+                // non-script assets changed by reset --hard (scene files, timeline assets,
+                // RecorderConfigs, etc.) are visible to Unity before the next job is
+                // dispatched.  Without this, Unity continues to use its cached in-memory
+                // representation of the pre-reset assets even though the files on disk
+                // have been replaced by the new commit.
+                //
+                // C# script changes still trigger the normal domain reload via the
+                // standard compilation pipeline; Refresh() does not interfere with that.
+                // Main-thread call: this lambda is dispatched via MainThreadDispatcher.Enqueue.
+                AssetDatabase.Refresh();
             });
         }
 
