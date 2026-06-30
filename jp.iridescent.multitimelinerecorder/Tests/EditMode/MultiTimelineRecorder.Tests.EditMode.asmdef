@@ -1,0 +1,32 @@
+{
+    "name": "MultiTimelineRecorder.Tests.EditMode",
+    "rootNamespace": "Unity.MultiTimelineRecorder.Tests",
+    "references": [
+        "Unity.MultiTimelineRecorder.Editor",
+        "Unity.MultiTimelineRecorder.Runtime",
+        "Unity.Timeline",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.recorder",
+            "expression": "",
+            "define": "UNITY_RECORDER"
+        }
+    ],
+    "noEngineReferences": false
+}
