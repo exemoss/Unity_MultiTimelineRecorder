@@ -656,15 +656,19 @@ namespace Unity.MultiTimelineRecorder
                 menu.ShowAsContext();
                 Event.current.Use();
             }
-            
+
             // Show hover effect and cursor
             if (headerRect.Contains(Event.current.mousePosition))
             {
                 EditorGUIUtility.AddCursorRect(headerRect, MouseCursor.Link);
             }
-            
+
+            // "Add from Selection" button – bulk-adds Hierarchy-selected PlayableDirectors.
+            // Refs: bulk-add-timelines plan.md 案1
+            DrawBulkAddButton();
+
             // Begin horizontal scroll view for the entire column content
-            leftColumnScrollPos = EditorGUILayout.BeginScrollView(leftColumnScrollPos, 
+            leftColumnScrollPos = EditorGUILayout.BeginScrollView(leftColumnScrollPos,
                 GUILayout.ExpandHeight(true), GUILayout.ExpandWidth(true));
             
             EditorGUILayout.Space(Styles.StandardSpacing);
