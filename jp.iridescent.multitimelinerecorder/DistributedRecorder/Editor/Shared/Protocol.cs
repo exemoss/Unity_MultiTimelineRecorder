@@ -369,6 +369,8 @@ namespace DistributedRecorder.Shared
 
     /// <summary>
     /// Response from GET /health.
+    /// Fields added in v1.4.11 (worker-git-sync): <see cref="gitBranch"/>, <see cref="gitCommitShort"/>.
+    /// Backward compatible: older Masters that do not read the new fields are unaffected.
     /// </summary>
     [Serializable]
     public class WorkerHealth
@@ -380,6 +382,58 @@ namespace DistributedRecorder.Shared
         public JobState currentJobState = JobState.Pending;
         public int    jobsProcessed;
         public long   uptimeSeconds;
+
+        // worker-git-sync (v1.4.11): current branch + HEAD short SHA for master's branch-match check.
+        // Empty when git is unavailable or the repo is in detached HEAD state.
+        // JsonUtility serializes these as normal fields; older Masters that ignore unknown fields are unaffected.
+        /// <summary>Current git branch name on this Worker (e.g. "main").  Empty when unavailable.</summary>
+        public string gitBranch         = string.Empty;
+        /// <summary>Short (8-char) HEAD commit SHA on this Worker.  Empty when unavailable.</summary>
+        public string gitCommitShort    = string.Empty;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Git sync (worker-git-sync, v1.4.11)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Request sent by Master → Worker via POST /git-sync.
+    ///
+    /// Security design:
+    ///  - No branch name is included in this DTO. The Worker uses its own current branch
+    ///    (obtained via GitInfo.TryGetCurrentBranch), preventing branch injection.
+    ///  - Endpoint requires HMAC authentication.
+    ///  - Wire-compat: Workers older than v1.4.11 return 404. Master handles 404 gracefully.
+    ///
+    /// Added in worker-git-sync (v1.4.11).
+    /// </summary>
+    [Serializable]
+    public class GitSyncRequest
+    {
+        // Intentionally empty: the Worker determines the branch from its own local state.
+        // A placeholder field is included for JsonUtility serialization compatibility.
+        /// <summary>Ignored by Worker. Reserved for future extensibility.</summary>
+        public string requestId = string.Empty;
+    }
+
+    /// <summary>
+    /// Synchronous acknowledgement returned by the Worker for POST /git-sync.
+    ///
+    /// Added in worker-git-sync (v1.4.11).
+    /// </summary>
+    [Serializable]
+    public class GitSyncAck
+    {
+        /// <summary>Whether the sync was accepted and completed successfully.</summary>
+        public bool   accepted;
+        /// <summary>Human-readable reason when <see cref="accepted"/> is false.</summary>
+        public string reason        = string.Empty;
+        /// <summary>New HEAD commit SHA after reset --hard (short, 8 chars).  Empty on failure.</summary>
+        public string newHead       = string.Empty;
+        /// <summary>Human-readable summary of what was discarded and the new HEAD.</summary>
+        public string summary       = string.Empty;
+        /// <summary>Branch name that was synced (read from Worker's own repo).</summary>
+        public string branch        = string.Empty;
     }
 
     // ---------------------------------------------------------------------------
