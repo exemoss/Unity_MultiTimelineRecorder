@@ -317,6 +317,91 @@ namespace DistributedRecorder.Shared
         }
 
         // ---------------------------------------------------------------------------
+        // Ahead count (sync-before-dispatch, v1.4.14)
+        // ---------------------------------------------------------------------------
+
+        /// <summary>
+        /// Returns the number of local commits that are ahead of
+        /// <c>origin/&lt;branch&gt;</c> by running
+        /// <c>git -C &lt;projectRoot&gt; rev-list --count origin/&lt;branch&gt;..HEAD</c>.
+        ///
+        /// This is used to detect whether the master has unpushed commits before
+        /// attempting to sync Workers via <c>/git-sync</c>.
+        ///
+        /// Design notes:
+        ///  - Does NOT run <c>git fetch</c>: uses the locally-cached remote-tracking ref.
+        ///    This avoids network calls in the pre-flight hot path. If the remote-tracking
+        ///    ref is absent (no upstream configured, first clone before fetch) the method
+        ///    returns <c>false</c> so the caller treats the state as "unknown" and
+        ///    falls through to the existing flow rather than blocking.
+        ///  - <paramref name="branch"/> is validated by <see cref="IsValidRefName"/> before
+        ///    being used in the ArgumentList, providing injection defence-in-depth.
+        ///  - Process.Start is in <see cref="RunGit"/> — no new Process.Start site here.
+        ///
+        /// Security: branch is obtained from <see cref="TryGetCurrentBranch"/> (local repo
+        /// read). The remote ref "origin/<branch>" is assembled in code; no external input
+        /// touches the git arguments.
+        /// </summary>
+        /// <param name="projectRoot">Absolute path of the Unity project root.</param>
+        /// <param name="branch">
+        /// Current branch name (must pass <see cref="IsValidRefName"/>).
+        /// Obtain via <see cref="TryGetCurrentBranch"/>.
+        /// </param>
+        /// <param name="aheadCount">
+        /// On success: the number of local commits not yet present on
+        /// <c>origin/&lt;branch&gt;</c>.  0 means the local branch is in sync with
+        /// (or behind) the remote.
+        /// On failure: -1.
+        /// </param>
+        /// <param name="error">Human-readable error when returning <c>false</c>.</param>
+        /// <returns>
+        /// <c>true</c> when the count was successfully obtained.
+        /// <c>false</c> when the remote-tracking ref does not exist, git is unavailable, or
+        /// any other error occurs — the caller should treat the ahead count as unknown.
+        /// </returns>
+        public static bool TryGetAheadCount(
+            string projectRoot, string branch, out int aheadCount, out string error)
+        {
+            aheadCount = -1;
+            error      = string.Empty;
+
+            if (string.IsNullOrEmpty(projectRoot))
+            {
+                error = "projectRoot is null or empty.";
+                return false;
+            }
+
+            if (!IsValidRefName(branch))
+            {
+                error = $"Invalid branch name: '{branch}'";
+                return false;
+            }
+
+            // Build "origin/<branch>" in code so no external value touches ArgumentList.
+            string remoteRef = "origin/" + branch;
+
+            // git rev-list --count <remoteRef>..HEAD
+            // Non-zero exit typically means the remote-tracking ref does not exist yet
+            // (branch never pushed, or repo cloned but not fetched). Treat as unknown.
+            string stdout;
+            if (!RunGit(new[] { "-C", projectRoot, "rev-list", "--count", remoteRef + "..HEAD" },
+                        GitTimeout, out stdout, out error))
+            {
+                return false;
+            }
+
+            string trimmed = stdout.Trim();
+            if (!int.TryParse(trimmed, out int parsed) || parsed < 0)
+            {
+                error = $"git rev-list --count output is not a non-negative integer: '{trimmed}'";
+                return false;
+            }
+
+            aheadCount = parsed;
+            return true;
+        }
+
+        // ---------------------------------------------------------------------------
         // Pure-function helpers (no Process.Start – directly EditMode-testable)
         // ---------------------------------------------------------------------------
 
