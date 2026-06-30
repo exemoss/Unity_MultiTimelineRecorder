@@ -348,6 +348,14 @@ namespace DistributedRecorder.Shared
             if (refName[0] == '/' || refName[refName.Length - 1] == '/')
                 return false;
 
+            // Leading hyphen would be misinterpreted by git as an option flag
+            // (e.g. "fetch origin -x" / "reset --hard origin/-x"); reject defensively.
+            // ArgumentList already prevents shell injection and the branch comes from
+            // `git rev-parse --abbrev-ref HEAD` (git won't produce a '-'-leading branch),
+            // so this is defence-in-depth for a destructive remote-triggered op.
+            if (refName[0] == '-')
+                return false;
+
             // ".." is forbidden (would construct relative refs like "HEAD..origin/main").
             if (refName.Contains(".."))
                 return false;

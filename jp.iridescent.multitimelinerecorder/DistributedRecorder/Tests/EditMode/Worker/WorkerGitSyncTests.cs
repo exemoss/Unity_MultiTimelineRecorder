@@ -89,6 +89,15 @@ namespace DistributedRecorder.Tests.Worker
         }
 
         [Test]
+        public void IsValidRefName_LeadingHyphen_ReturnsFalse()
+        {
+            Assert.IsFalse(GitInfo.IsValidRefName("-x"),
+                "Leading hyphen must be rejected (git would read it as an option flag).");
+            Assert.IsFalse(GitInfo.IsValidRefName("--upload-pack=evil"),
+                "Option-like ref names must be rejected.");
+        }
+
+        [Test]
         public void IsValidRefName_Space_ReturnsFalse()
         {
             Assert.IsFalse(GitInfo.IsValidRefName("feature branch"),
