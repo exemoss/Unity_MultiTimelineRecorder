@@ -1332,6 +1332,350 @@ namespace Unity.MultiTimelineRecorder
         }
 
         // -----------------------------------------------------------------------
+        // sync-before-dispatch (v1.4.14) – pre-flight git sync gate
+        // -----------------------------------------------------------------------
+
+        // How long to wait for each re-health poll after sending /git-sync.
+        private static readonly TimeSpan SyncRePollInterval = TimeSpan.FromSeconds(5);
+        // Total time to wait for workers to converge before giving up and falling
+        // through to the per-job CommitMismatch "send anyway" path.
+        private static readonly TimeSpan SyncRePollTimeout  = TimeSpan.FromSeconds(90);
+
+        /// <summary>
+        /// Worker classification used by <see cref="RunPreFlightSyncGateAsync"/>.
+        /// Internal so EditMode tests can reference it via InternalsVisibleTo.
+        /// </summary>
+        internal enum WorkerSyncClass
+        {
+            /// <summary>Same branch, same commit — already in sync.</summary>
+            Synced,
+            /// <summary>Same branch, different commit — sync candidate.</summary>
+            NeedsSync,
+            /// <summary>Different branch from master — skip (never cross-branch reset).</summary>
+            DifferentBranch,
+            /// <summary>gitCommitShort empty (pre-v1.4.11 worker or git unavailable) — skip.</summary>
+            CommitUnknown,
+        }
+
+        /// <summary>
+        /// Pure-function worker classifier for the pre-flight sync gate.
+        ///
+        /// Compares 8-character short SHAs (case-insensitive).  Both inputs are
+        /// trimmed and compared with <see cref="StringComparison.OrdinalIgnoreCase"/>
+        /// because <c>gitCommitShort</c> from the Worker may use a different case
+        /// than the master-side abbreviation.
+        ///
+        /// This is a pure static helper with no side effects — directly EditMode-testable.
+        ///
+        /// Security: no external input is used as a git argument here; classification
+        /// is purely in-process string comparison.
+        /// </summary>
+        /// <param name="masterBranch">Branch currently checked out on the master.</param>
+        /// <param name="masterCommitFull">Full 40-char HEAD SHA of the master.</param>
+        /// <param name="workerBranch">Branch reported by the Worker's /health.</param>
+        /// <param name="workerCommitShort">Short (8-char) commit SHA from Worker /health.</param>
+        /// <returns>The appropriate <see cref="WorkerSyncClass"/> for this Worker.</returns>
+        internal static WorkerSyncClass ClassifyWorkerSync(
+            string masterBranch, string masterCommitFull,
+            string workerBranch, string workerCommitShort)
+        {
+            // (d) No commit info from worker → treat as unknown.
+            if (string.IsNullOrEmpty(workerCommitShort))
+                return WorkerSyncClass.CommitUnknown;
+
+            // (c) Different branch → skip (never cross-branch reset).
+            if (!string.Equals(workerBranch, masterBranch, StringComparison.Ordinal))
+                return WorkerSyncClass.DifferentBranch;
+
+            // Abbreviate master commit to the same length as workerCommitShort for comparison.
+            // Worker reports 8 chars; master HEAD is 40 chars.
+            string workerShort = workerCommitShort.Trim();
+            int    abbrevLen   = workerShort.Length;  // typically 8
+            string masterShort = masterCommitFull.Length >= abbrevLen
+                ? masterCommitFull.Substring(0, abbrevLen)
+                : masterCommitFull;
+
+            // (a) Commits match → already synced.
+            // (b) Commits differ → needs sync.
+            return string.Equals(masterShort, workerShort, StringComparison.OrdinalIgnoreCase)
+                ? WorkerSyncClass.Synced
+                : WorkerSyncClass.NeedsSync;
+        }
+
+        /// <summary>
+        /// Executes the pre-flight git sync gate for <paramref name="onlineWorkers"/>.
+        ///
+        /// Returns <c>true</c> when dispatch should be aborted (user cancelled or
+        /// master-ahead guard blocked), <c>false</c> when dispatch may proceed.
+        ///
+        /// Design (sync-before-dispatch plan.md 案3):
+        ///   A. Master ahead-count guard: block if master has unpushed commits.
+        ///   B. Classify each online worker.
+        ///   C. Sync candidates: confirmation dialog → /git-sync → re-health polling.
+        ///   D. User declines → abort (return true).
+        ///
+        /// Must NOT use ConfigureAwait(false): called from StartDistributedRecordingInternalAsync
+        /// which is on the Unity main thread (EditorUtility.DisplayDialog, Repaint).
+        /// </summary>
+        private async Task<bool> RunPreFlightSyncGateAsync(
+            List<WorkerInfo> onlineWorkers, string barTitle)
+        {
+            // ── A. Master ahead-count guard ──────────────────────────────────────
+            // Obtain master branch + HEAD commit (both needed for worker classification too).
+            bool masterGitAvailable = false;
+            string masterBranch      = string.Empty;
+            string masterCommitFull  = string.Empty;
+
+            string branchErr;
+            bool gotBranch = GitInfo.TryGetCurrentBranch(
+                ProjectPaths.ProjectRoot, out masterBranch, out branchErr);
+
+            string commitErr;
+            bool gotCommit = GitInfo.TryGetHeadCommit(
+                ProjectPaths.ProjectRoot, out masterCommitFull, out commitErr);
+
+            masterGitAvailable = gotBranch && gotCommit;
+
+            if (masterGitAvailable)
+            {
+                // Check whether master has unpushed commits.
+                int aheadCount;
+                string aheadErr;
+                bool gotAhead = GitInfo.TryGetAheadCount(
+                    ProjectPaths.ProjectRoot, masterBranch, out aheadCount, out aheadErr);
+
+                if (gotAhead && aheadCount > 0)
+                {
+                    // Master is ahead of origin: syncing workers would not make them
+                    // match master HEAD (they can only reach origin/<branch>).
+                    // Block and prompt the user to push first.
+                    EditorUtility.DisplayDialog(
+                        "Master が未 push です",
+                        $"Master は origin/{masterBranch} より {aheadCount} コミット先行しています。\n\n" +
+                        "Worker を同期しても Master と同じコミットにはなりません\n" +
+                        "（Worker は origin/<branch> にしか揃えられないため）。\n\n" +
+                        "先に Master を commit & push してから再度「分散処理を開始」を押してください。",
+                        "OK");
+                    Debug.LogWarning(
+                        $"[DistributedRecorder] sync-gate: master is {aheadCount} commit(s) ahead of " +
+                        $"origin/{masterBranch}. Dispatch blocked until master is pushed.");
+                    return true; // abort
+                }
+                // gotAhead=false means upstream ref absent (never pushed / no origin configured):
+                // treat as "unknown" and skip the ahead guard — fall through to worker classification.
+                if (!gotAhead)
+                {
+                    Debug.Log(
+                        $"[DistributedRecorder] sync-gate: ahead-count check failed " +
+                        $"({aheadErr}). Skipping master-ahead guard.");
+                }
+            }
+            else
+            {
+                // git not available on master or not a git repo — skip entire sync gate.
+                Debug.Log(
+                    "[DistributedRecorder] sync-gate: master git not available " +
+                    $"(branch:{branchErr} / commit:{commitErr}). Skipping sync gate.");
+                return false; // proceed with dispatch as-is
+            }
+
+            // ── B. Classify each online worker ───────────────────────────────────
+            EditorUtility.DisplayCancelableProgressBar(
+                barTitle, "Worker のコミットを確認しています…", 0.78f);
+
+            var needsSyncWorkers    = new List<WorkerInfo>();
+            var diffBranchWorkers   = new List<WorkerInfo>();
+            var unknownCommitWorkers = new List<WorkerInfo>();
+
+            foreach (var worker in onlineWorkers)
+            {
+                var status = await _batchDispatcher.ProbeWithCommitAsync(worker);
+                if (!status.Online)
+                {
+                    // fell offline between initial probe and now — skip silently.
+                    Debug.LogWarning(
+                        $"[DistributedRecorder] sync-gate: '{worker.displayName}' went offline. Skipping.");
+                    continue;
+                }
+
+                WorkerSyncClass cls = ClassifyWorkerSync(
+                    masterBranch, masterCommitFull,
+                    status.Branch, status.CommitShort);
+
+                switch (cls)
+                {
+                    case WorkerSyncClass.Synced:
+                        Debug.Log(
+                            $"[DistributedRecorder] sync-gate: '{worker.displayName}' commit matches master. OK.");
+                        break;
+
+                    case WorkerSyncClass.NeedsSync:
+                        Debug.Log(
+                            $"[DistributedRecorder] sync-gate: '{worker.displayName}' commit mismatch " +
+                            $"(worker={status.CommitShort}, master={masterCommitFull.Substring(0, System.Math.Min(8, masterCommitFull.Length))}). " +
+                            "Queued for sync.");
+                        needsSyncWorkers.Add(worker);
+                        break;
+
+                    case WorkerSyncClass.DifferentBranch:
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] sync-gate: '{worker.displayName}' is on branch " +
+                            $"'{status.Branch}' (master: '{masterBranch}'). Skipping sync.");
+                        diffBranchWorkers.Add(worker);
+                        break;
+
+                    case WorkerSyncClass.CommitUnknown:
+                        Debug.LogWarning(
+                            $"[DistributedRecorder] sync-gate: '{worker.displayName}' commit unknown " +
+                            "(pre-v1.4.11 worker or git unavailable). Skipping sync.");
+                        unknownCommitWorkers.Add(worker);
+                        break;
+                }
+            }
+
+            // If nothing needs sync, proceed.
+            if (needsSyncWorkers.Count == 0)
+            {
+                // Build info about skipped workers for the log.
+                if (diffBranchWorkers.Count > 0 || unknownCommitWorkers.Count > 0)
+                {
+                    var skippedLog = new System.Text.StringBuilder();
+                    foreach (var w in diffBranchWorkers)
+                        skippedLog.AppendLine(
+                            $"  {w.displayName}: 別ブランチ → スキップ（commit mismatch は per-job で対処）");
+                    foreach (var w in unknownCommitWorkers)
+                        skippedLog.AppendLine(
+                            $"  {w.displayName}: commit 不明 → スキップ（旧 Worker）");
+                    Debug.Log(
+                        $"[DistributedRecorder] sync-gate: no workers need sync.\n{skippedLog}");
+                }
+                return false; // proceed
+            }
+
+            // ── C. Confirmation dialog for sync ──────────────────────────────────
+            string masterShortForDisplay =
+                masterCommitFull.Length >= 8 ? masterCommitFull.Substring(0, 8) : masterCommitFull;
+
+            string targetList = string.Join(
+                "\n", needsSyncWorkers.Select(w => $"  • {w.displayName}"));
+
+            var skipWarnSb = new System.Text.StringBuilder();
+            foreach (var w in diffBranchWorkers)
+                skipWarnSb.AppendLine(
+                    $"  {w.displayName}: 別ブランチ（{masterBranch} ではない）→ スキップ");
+            foreach (var w in unknownCommitWorkers)
+                skipWarnSb.AppendLine(
+                    $"  {w.displayName}: commit 不明（旧 Worker / git なし）→ スキップ");
+
+            string skipSection = skipWarnSb.Length > 0
+                ? $"\n\n以下はスキップされます:\n{skipWarnSb}"
+                : string.Empty;
+
+            bool confirmed = EditorUtility.DisplayDialog(
+                "Worker のコミットがずれています",
+                $"以下の {needsSyncWorkers.Count} 台の Worker が Master と異なるコミットです。\n\n" +
+                $"Master commit: {masterShortForDisplay}…\n\n" +
+                $"{targetList}\n\n" +
+                "同期しますか？\n" +
+                "（git fetch origin → git reset --hard origin/<branch>）\n" +
+                "Worker のローカルの未コミット変更は破棄されます。取り消せません。" +
+                skipSection,
+                "同期する",
+                "キャンセル（ディスパッチ中止）");
+
+            if (!confirmed)
+            {
+                Debug.Log(
+                    "[DistributedRecorder] sync-gate: user declined sync. Aborting dispatch.");
+                return true; // abort
+            }
+
+            // ── Send /git-sync to each NeedsSync worker ──────────────────────────
+            EditorUtility.DisplayCancelableProgressBar(
+                barTitle, "Worker を同期中…", 0.82f);
+
+            foreach (var worker in needsSyncWorkers)
+            {
+                EditorUtility.DisplayCancelableProgressBar(
+                    barTitle, $"{worker.displayName} に同期リクエスト送信中…", 0.84f);
+
+                var (accepted, msg, summary) = await _batchDispatcher.SendGitSyncAsync(worker);
+                if (accepted)
+                {
+                    Debug.Log(
+                        $"[DistributedRecorder] sync-gate: '{worker.displayName}' accepted /git-sync. {summary}");
+                }
+                else
+                {
+                    Debug.LogWarning(
+                        $"[DistributedRecorder] sync-gate: '{worker.displayName}' rejected /git-sync: {msg}. " +
+                        "Will fall through to per-job send-anyway.");
+                }
+            }
+
+            // ── Re-health polling: wait for commits to converge ──────────────────
+            // /git-sync is async (202): worker runs fetch+reset in background.
+            // We poll /health until commits match or SyncRePollTimeout elapses.
+            // Workers that still mismatch after timeout are left in _batchOnlineWorkers
+            // so they get the per-job CommitMismatch "send anyway" dialog (F7 fallback).
+            EditorUtility.DisplayCancelableProgressBar(
+                barTitle, "Worker の同期完了を待機中…", 0.86f);
+
+            var deadline = DateTime.UtcNow + SyncRePollTimeout;
+            var stillWaiting = new HashSet<string>(
+                needsSyncWorkers.Select(w => w.displayName));
+
+            while (stillWaiting.Count > 0 && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay((int)SyncRePollInterval.TotalMilliseconds);
+
+                var converged = new List<string>();
+                foreach (var worker in needsSyncWorkers)
+                {
+                    if (!stillWaiting.Contains(worker.displayName)) continue;
+
+                    var reStatus = await _batchDispatcher.ProbeWithCommitAsync(worker);
+                    if (!reStatus.Online)
+                    {
+                        // Worker went offline during reset (domain reload). Keep waiting.
+                        Debug.Log(
+                            $"[DistributedRecorder] sync-gate poll: '{worker.displayName}' offline " +
+                            "(may be domain-reloading). Retrying…");
+                        continue;
+                    }
+
+                    WorkerSyncClass reCls = ClassifyWorkerSync(
+                        masterBranch, masterCommitFull,
+                        reStatus.Branch, reStatus.CommitShort);
+
+                    if (reCls == WorkerSyncClass.Synced)
+                    {
+                        Debug.Log(
+                            $"[DistributedRecorder] sync-gate: '{worker.displayName}' synced OK " +
+                            $"({reStatus.CommitShort}).");
+                        converged.Add(worker.displayName);
+                    }
+                }
+
+                foreach (string name in converged)
+                    stillWaiting.Remove(name);
+            }
+
+            if (stillWaiting.Count > 0)
+            {
+                // Some workers did not converge within the timeout.
+                // Log a warning and let per-job CommitMismatch fallback handle them.
+                string notSynced = string.Join(", ", stillWaiting);
+                Debug.LogWarning(
+                    $"[DistributedRecorder] sync-gate: {stillWaiting.Count} worker(s) did not converge " +
+                    $"within {SyncRePollTimeout.TotalSeconds}s: {notSynced}. " +
+                    "Per-job 'send anyway' fallback will handle them.");
+            }
+
+            return false; // proceed with dispatch
+        }
+
+        // -----------------------------------------------------------------------
         // Lazy initialization
         // -----------------------------------------------------------------------
 
@@ -2098,6 +2442,42 @@ namespace Unity.MultiTimelineRecorder
             // use this list instead of EnabledWorkers so that pre-flight-offline Workers are
             // not selected as failover targets during the batch.
             _batchOnlineWorkers = onlineWorkers;
+
+            // ── sync-before-dispatch (v1.4.14): pre-flight git sync gate ────────
+            // Before seeding jobs, compare each online Worker's HEAD commit to the
+            // master's HEAD.  If any Worker is out of sync, offer a blocking dialog
+            // that lets the user sync (via the existing /git-sync API) before dispatch.
+            //
+            // Flow:
+            //   A. Guard: master must have no unpushed commits.  If ahead>0, block and
+            //      prompt "commit & push first" (worker can only reach origin/<branch>,
+            //      so syncing while master is ahead would fail to match).
+            //   B. Classify each online worker:
+            //      (a) same branch + same commit  → already in sync
+            //      (b) same branch + different commit → sync candidate
+            //      (c) different branch            → skip + warn (never cross-branch reset)
+            //      (d) gitCommitShort empty (old worker / git unavailable) → skip + warn
+            //   C. If sync candidates exist → confirmation dialog → /git-sync → re-health
+            //      polling until commits match or timeout.  Workers still mismatched after
+            //      timeout fall through to the per-job CommitMismatch "send anyway" path
+            //      (DispatchOneWithOverrideAsync) – no deadlock.
+            //   D. If user declines sync → abort batch (No = stop, not "send anyway").
+            //      This is the safest default; the per-job fallback remains available the
+            //      next time the user presses dispatch without syncing.
+            //
+            // All awaits here are WITHOUT ConfigureAwait(false) so continuations stay on
+            // the Unity main thread (required for EditorUtility.DisplayDialog, Repaint).
+            // ProbeWithCommitAsync also must not ConfigureAwait(false) for the same reason.
+            if (onlineWorkers.Count > 0)
+            {
+                cancelled = await RunPreFlightSyncGateAsync(onlineWorkers, k_BarTitle);
+                if (cancelled)
+                {
+                    Debug.Log("[DistributedRecorder] pre-flight sync gate: user aborted dispatch.");
+                    return;
+                }
+            }
+            // ── end sync-before-dispatch ─────────────────────────────────────────
 
             // Generate a single dispatch timestamp for the whole batch so all Timeline results
             // land under the same parent folder (worker-recording-fix requirement C).
