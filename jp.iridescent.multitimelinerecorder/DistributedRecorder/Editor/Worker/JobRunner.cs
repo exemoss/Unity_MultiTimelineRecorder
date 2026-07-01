@@ -1122,6 +1122,12 @@ namespace DistributedRecorder.Worker
 
             _store.UpdateStatus(jobId, s => s.state = JobState.Completed);
             _store.SetResult(jobId, result);
+
+            // retry-failed-collection phase 2: persist the jobId → output-directory
+            // mapping so GET /jobs/{id}/files keeps working after a Worker restart
+            // (the in-memory JobStore is otherwise lost on every N-job cycle restart).
+            _store.WriteJobIndex(jobId);
+
             _progress.Push(new ProgressEvent
             {
                 jobId        = jobId,

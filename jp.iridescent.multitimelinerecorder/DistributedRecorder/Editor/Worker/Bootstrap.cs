@@ -272,6 +272,13 @@ namespace DistributedRecorder.Worker
             string projRoot = ProjectPaths.ProjectRoot;
             var store       = new JobStore(projRoot);
 
+            // retry-failed-collection phase 2: re-populate the store from
+            // Recordings/.jobindex/ so jobs completed before a Worker restart (e.g.
+            // the N-job auto-restart cycle) can still be re-collected via
+            // GET /jobs/{id}/files instead of returning 404. Cheap (index-file
+            // listing only, no result-file bodies read) and never throws.
+            store.RestoreFromDiskIndex();
+
             // Create the listener first (it implements IProgressSink).
             // JobRunner is wired to the listener as its progress sink.
             // The listener holds a reference to the runner for job dispatch.
