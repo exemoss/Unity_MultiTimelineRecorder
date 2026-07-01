@@ -18,9 +18,9 @@ namespace DistributedRecorder.Worker
     /// Trigger: called once from <c>JobRunner.FinalizeCompletedJob</c> after every
     /// completed job (plan.md 採用案 = 案1).
     ///
-    /// Configuration: <see cref="MaxDiskGB"/> is read from EditorPrefs
-    /// (<see cref="MaxDiskGbPrefsKey"/>), set via the Setup Hub UI. Default
-    /// <see cref="DefaultMaxDiskGB"/> = 100 GB; 0 = unlimited (sweep disabled).
+    /// Configuration: the quota (GB) is read via <see cref="GetMaxDiskGB"/> from
+    /// EditorPrefs (<see cref="MaxDiskGbPrefsKey"/>), set via the Setup Hub UI.
+    /// Default <see cref="DefaultMaxDiskGB"/> = 100 GB; 0 = unlimited (sweep disabled).
     /// </summary>
     public static class DiskQuotaManager
     {

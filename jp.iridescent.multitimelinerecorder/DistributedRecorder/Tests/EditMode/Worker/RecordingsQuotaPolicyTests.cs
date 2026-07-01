@@ -197,7 +197,8 @@ namespace DistributedRecorder.Tests.Worker
             var result = RecordingsQuotaPolicy.SelectFoldersToDelete(folders, 10 * OneGb, protectRecentCount: 3);
 
             Assert.IsFalse(result.QuotaUnattainable);
-            Assert.AreEqual(87, result.FoldersToDelete.Count); // 100 - 3 protected - 10 kept = 87 deleted
+            // 1GB granules deleted oldest-first until remaining <= 10GB quota: 90 deleted, 10GB left.
+            Assert.AreEqual(90, result.FoldersToDelete.Count);
             Assert.LessOrEqual(result.ProjectedRemainingBytes, 10 * OneGb);
         }
 

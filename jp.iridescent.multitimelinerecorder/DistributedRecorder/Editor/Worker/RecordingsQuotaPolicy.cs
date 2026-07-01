@@ -13,7 +13,7 @@ namespace DistributedRecorder.Worker
     /// be exhaustively unit-tested. Callers (<see cref="DiskQuotaManager"/>) are
     /// responsible for turning the returned folder names into actual
     /// <c>Directory.Delete</c> calls, subject to the additional security gate in
-    /// <see cref="IsDeletableTimestampFolderName"/> / <see cref="DiskQuotaManager"/>.
+    /// <c>RecordingsDeletionGuard</c>.
     /// </summary>
     public static class RecordingsQuotaPolicy
     {
@@ -50,8 +50,8 @@ namespace DistributedRecorder.Worker
 
             /// <summary>
             /// True when even deleting every non-protected, eligible folder would not
-            /// bring the total under <see cref="MaxBytes"/>. When true, the caller
-            /// must WARN and stop — data protection takes priority over strict quota
+            /// bring the total under the requested quota. When true, the caller must
+            /// WARN and stop — data protection takes priority over strict quota
             /// compliance (plan.md §不明点2 resolution).
             /// </summary>
             public bool QuotaUnattainable { get; }
