@@ -23,10 +23,13 @@ namespace DistributedRecorder.Worker
     /// on the next editor tick. Because the in-memory scene is then in sync with disk,
     /// Unity's own external-change prompt has nothing to complain about.
     ///
-    /// Scope guards:
-    ///   - Only runs on a Worker machine (<see cref="IsWorkerContext"/> —
-    ///     <c>Bootstrap.ShouldAutoRecover || Bootstrap.IsWorkerRunning</c>), so it never
-    ///     reloads scenes out from under someone editing on the Master.
+    /// Scope guards (defence in depth — a Master and a Worker can share one machine,
+    /// so no single "is-worker" flag can exclude the Master; the dirty-scene guard is the
+    /// real safety net):
+    ///   - NEVER reloads a scene with unsaved in-memory edits (<c>scene.isDirty</c>) — so
+    ///     it can never discard someone's unsaved work, even on a Master/Worker combo box.
+    ///   - Only runs while this editor is actively serving as a Worker
+    ///     (<c>Bootstrap.IsWorkerRunning</c>); a pure Master (no listener) is excluded.
     ///   - Skips while in Play Mode (a recording job owns the scene lifecycle then).
     ///   - Can be disabled via the <see cref="IsEnabled"/> EditorPrefs toggle (default on).
     ///
@@ -138,13 +141,22 @@ namespace DistributedRecorder.Worker
 
         private static bool IsWorkerContext()
         {
-            return Bootstrap.ShouldAutoRecover || Bootstrap.IsWorkerRunning;
+            // Only while actively serving as a Worker (listener up). A pure Master never
+            // runs the listener, so it is excluded. A machine that is BOTH master and
+            // worker still passes here — the dirty-scene guard in ScheduleReload is what
+            // protects an editing user's unsaved work in that case.
+            return Bootstrap.IsWorkerRunning;
         }
 
         /// <summary>
         /// Reload the scene on the next editor tick (never mid-import). Re-validates that
-        /// the scene is still open and the editor is idle before touching it, and never
-        /// throws out of the delayCall.
+        /// the scene is still open, clean, and the editor is idle before touching it, and
+        /// never throws out of the delayCall.
+        ///
+        /// Hard rule: a scene with unsaved in-memory edits (<c>isDirty</c>) is NEVER
+        /// reloaded — auto-reload must not be able to discard unsaved work (important on a
+        /// machine that is both Master and Worker). Unity's own external-change prompt
+        /// still covers that (attended) case.
         /// </summary>
         private static void ScheduleReload(string scenePath)
         {
@@ -159,24 +171,22 @@ namespace DistributedRecorder.Worker
                 if (!scene.IsValid() || !scene.isLoaded)
                     return;
 
-                bool wasDirty = scene.isDirty;
+                // Never clobber unsaved edits — skip dirty scenes entirely.
+                if (scene.isDirty)
+                {
+                    Debug.LogWarning(
+                        $"[WorkerSceneAutoReloader] Scene changed on disk but has unsaved in-memory " +
+                        $"edits — NOT auto-reloading (to avoid discarding work): {scenePath}");
+                    return;
+                }
+
                 try
                 {
-                    // OpenScene(Single) reloads the scene from disk, discarding the stale
-                    // in-memory copy. On a Worker any local scene edits are disposable
-                    // (git-sync hard-resets the tree anyway), so a reload is always safe.
+                    // OpenScene(Single) reloads the (clean) scene from disk, replacing the
+                    // stale in-memory copy so Unity's external-change prompt never fires.
                     EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Single);
-                    if (wasDirty)
-                    {
-                        Debug.LogWarning(
-                            $"[WorkerSceneAutoReloader] Reloaded externally-changed scene that had " +
-                            $"unsaved in-memory edits (discarded): {scenePath}");
-                    }
-                    else
-                    {
-                        Debug.Log(
-                            $"[WorkerSceneAutoReloader] Reloaded externally-changed scene: {scenePath}");
-                    }
+                    Debug.Log(
+                        $"[WorkerSceneAutoReloader] Reloaded externally-changed scene: {scenePath}");
                 }
                 catch (Exception e)
                 {
