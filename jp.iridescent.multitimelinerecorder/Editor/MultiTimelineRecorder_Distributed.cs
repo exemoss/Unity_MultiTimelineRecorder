@@ -4488,15 +4488,24 @@ namespace Unity.MultiTimelineRecorder
                     vm.Phase = JobPhase.Terminal; // dispatch-status-labels
                     vm.LastDownloadFailureKind = DownloadFailureKind.None;
                     vm.AutoRetryCount = 0;
+
+                    // movie-flat-collect (v1.4.18): a single-file result (e.g. a movie)
+                    // is moved out of its per-job sub-folder and placed directly under
+                    // the dispatch-timestamp directory, renamed to the Timeline name.
+                    // Multi-file results (e.g. an image sequence) keep the pre-existing
+                    // <ts>/<TimelineName>/ folder layout untouched.
+                    IReadOnlyList<string> collectedFiles =
+                        FlattenLocalOutputIfSingleFile(vm, result.Files);
+
                     Debug.Log(
-                        $"[DistributedRecorder] 回収完了: {result.Files.Count} ファイル → {vm.LocalOutputDir}");
+                        $"[DistributedRecorder] 回収完了: {collectedFiles.Count} ファイル → {vm.LocalOutputDir}");
 
                     // collect-to-dir (v1.4.10): auto-copy to collect dir if set at dispatch time.
                     if (!string.IsNullOrEmpty(vm.CollectDir) &&
                         CollectPathValidator.Validate(vm.CollectDir, out _))
                     {
                         // Fire-and-forget; errors are logged inside CopyToCollectDirAsync.
-                        _ = CopyToCollectDirAsync(vm, result.Files);
+                        _ = CopyToCollectDirAsync(vm, collectedFiles);
                     }
                 }
                 else
@@ -4537,15 +4546,93 @@ namespace Unity.MultiTimelineRecorder
         }
 
         // -----------------------------------------------------------------------
+        // Flat single-file output (movie-flat-collect, v1.4.18)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// When exactly one file was downloaded, moves it out of its per-job
+        /// sub-folder (<c>&lt;ts&gt;/&lt;TimelineName&gt;/file.ext</c>) directly under
+        /// the dispatch-timestamp directory, renamed to the Timeline name
+        /// (<c>&lt;ts&gt;/&lt;TimelineName&gt;.ext</c>), then removes the now-empty
+        /// sub-folder. Updates <see cref="MtrJobViewModel.LocalOutputDir"/> to the new
+        /// file path so the "開く" button and collect-to-dir copy target the flat file.
+        ///
+        /// Multi-file (or zero-file) results are left untouched — the pre-existing
+        /// folder layout is used as-is, matching image-sequence output.
+        ///
+        /// Idempotent: re-running collection downloads into a fresh per-job folder
+        /// (same path every time) and re-flattens, overwriting the previous flat file.
+        /// </summary>
+        /// <param name="vm">Job view model; <see cref="MtrJobViewModel.LocalOutputDir"/> is mutated in place.</param>
+        /// <param name="downloadedFiles">Files written by <see cref="ResultDownloader.DownloadAsync"/>.</param>
+        /// <returns>
+        /// The file list to use for downstream steps (collect-to-dir): the single
+        /// flattened path when flattening occurred, otherwise <paramref name="downloadedFiles"/> unchanged.
+        /// </returns>
+        private IReadOnlyList<string> FlattenLocalOutputIfSingleFile(
+            MtrJobViewModel vm, IReadOnlyList<string> downloadedFiles)
+        {
+            if (downloadedFiles == null || !FlatOutputPathResolver.ShouldFlatten(downloadedFiles.Count))
+                return downloadedFiles;
+
+            string sourceFile = downloadedFiles[0];
+            string perJobFolder = vm.LocalOutputDir;
+            string parentDir = Path.GetDirectoryName(perJobFolder);
+            string sanitizedName = Path.GetFileName(perJobFolder);
+
+            if (string.IsNullOrEmpty(parentDir) || string.IsNullOrEmpty(sanitizedName))
+                return downloadedFiles; // unexpected shape; leave the folder layout as-is
+
+            string flatDest = FlatOutputPathResolver.ResolveLocalDestination(
+                parentDir, sanitizedName, downloadedFiles.Count, Path.GetFileName(sourceFile));
+
+            try
+            {
+                if (!File.Exists(sourceFile))
+                    return downloadedFiles;
+
+                // Idempotent re-collection: replace a previous flat file if present.
+                if (File.Exists(flatDest))
+                    File.Delete(flatDest);
+
+                File.Move(sourceFile, flatDest);
+
+                // Remove the now-empty per-job folder (best-effort).
+                if (Directory.Exists(perJobFolder) &&
+                    Directory.GetFileSystemEntries(perJobFolder).Length == 0)
+                {
+                    Directory.Delete(perJobFolder);
+                }
+
+                vm.LocalOutputDir = flatDest;
+                return new List<string> { flatDest };
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError(
+                    $"[DistributedRecorder] 単一ファイルの直置き移動に失敗しました " +
+                    $"({sourceFile} → {flatDest}): {ex.Message}. フォルダ構成のまま維持します。");
+                return downloadedFiles;
+            }
+        }
+
+        // -----------------------------------------------------------------------
         // Collect-to-dir helpers (v1.4.10)
         // -----------------------------------------------------------------------
 
         /// <summary>
-        /// Copies <paramref name="localFiles"/> to a sub-directory under
-        /// <see cref="MtrJobViewModel.CollectDir"/>.
+        /// Copies <paramref name="localFiles"/> to <see cref="MtrJobViewModel.CollectDir"/>.
         ///
-        /// Destination naming: <c>CollectDir / TimelineName_disambig /</c>
-        /// (collision avoidance via <see cref="CollectPathValidator.BuildDestinationPath"/>).
+        /// Destination naming (movie-flat-collect, v1.4.18):
+        /// <list type="bullet">
+        ///   <item>Exactly one file (e.g. a movie): copied directly to
+        ///     <c>CollectDir / TimelineName.ext</c> (no sub-folder). Collision avoidance
+        ///     inserts <c>_disambig</c> before the extension.</item>
+        ///   <item>Zero or multiple files (e.g. an image sequence): copied into
+        ///     <c>CollectDir / TimelineName_disambig /</c>, unchanged from the
+        ///     pre-existing behaviour
+        ///     (collision avoidance via <see cref="CollectPathValidator.BuildDestinationPath"/>).</item>
+        /// </list>
         ///
         /// I/O runs on a background thread (<see cref="Task.Run"/>); Unity API calls
         /// are routed to the main thread via <see cref="MainThreadDispatcher.Enqueue"/>.
@@ -4561,36 +4648,53 @@ namespace Unity.MultiTimelineRecorder
             string targetDir = vm.CollectDir;
             if (string.IsNullOrEmpty(targetDir)) return;
 
-            // Use TimelineName as the sub-directory label, falling back to jobId prefix.
+            // Use TimelineName as the label, falling back to jobId prefix.
             string label = !string.IsNullOrEmpty(vm.TimelineName) ? vm.TimelineName : vm.JobId;
             string disambig = vm.CollectDisambig ?? vm.JobId.Substring(0, Math.Min(8, vm.JobId.Length));
 
-            string destDir = CollectPathValidator.BuildDestinationPath(
+            bool flatten = FlatOutputPathResolver.ShouldFlatten(localFiles.Count);
+            string singleFileName = flatten ? Path.GetFileName(localFiles[0]) : null;
+
+            string dest = FlatOutputPathResolver.ResolveCollectDestination(
                 targetDir,
                 label,
                 disambig,
-                Directory.Exists);
+                localFiles.Count,
+                singleFileName,
+                path => File.Exists(path) || Directory.Exists(path));
 
             try
             {
                 await Task.Run(() =>
                 {
-                    CollectPathValidator.EnsureDirectory(destDir);
-                    foreach (string src in localFiles)
+                    if (flatten)
                     {
-                        if (!File.Exists(src)) continue;
-                        string fileName = Path.GetFileName(src);
-                        string dest     = Path.Combine(destDir, fileName);
+                        string src = localFiles[0];
+                        if (!File.Exists(src)) return;
 
-                        // Avoid overwriting an identically-named file (simple name check).
-                        if (File.Exists(dest))
+                        CollectPathValidator.EnsureDirectory(Path.GetDirectoryName(dest));
+                        File.Copy(src, dest, overwrite: true); // idempotent re-collection
+                    }
+                    else
+                    {
+                        string destDir = dest;
+                        CollectPathValidator.EnsureDirectory(destDir);
+                        foreach (string src in localFiles)
                         {
-                            string stem = Path.GetFileNameWithoutExtension(fileName);
-                            string ext  = Path.GetExtension(fileName);
-                            dest = Path.Combine(destDir, $"{stem}_{disambig}{ext}");
-                        }
+                            if (!File.Exists(src)) continue;
+                            string fileName = Path.GetFileName(src);
+                            string filePath = Path.Combine(destDir, fileName);
 
-                        File.Copy(src, dest, overwrite: false);
+                            // Avoid overwriting an identically-named file (simple name check).
+                            if (File.Exists(filePath))
+                            {
+                                string stem = Path.GetFileNameWithoutExtension(fileName);
+                                string ext  = Path.GetExtension(fileName);
+                                filePath = Path.Combine(destDir, $"{stem}_{disambig}{ext}");
+                            }
+
+                            File.Copy(src, filePath, overwrite: false);
+                        }
                     }
                 }).ConfigureAwait(false);
 
@@ -4598,7 +4702,7 @@ namespace Unity.MultiTimelineRecorder
                 // route Unity API calls to the main thread.
                 MainThreadDispatcher.Enqueue(() =>
                 {
-                    Debug.Log($"[DistributedRecorder] 収集完了: {localFiles.Count} ファイル → {destDir}");
+                    Debug.Log($"[DistributedRecorder] 収集完了: {localFiles.Count} ファイル → {dest}");
                     Repaint();
                 });
             }
@@ -4662,15 +4766,25 @@ namespace Unity.MultiTimelineRecorder
                         $"[DistributedRecorder]   [{++done}/{eligible.Count}] " +
                         $"{job.JobId.Substring(0, Math.Min(8, job.JobId.Length))}...");
 
-                    if (!Directory.Exists(job.LocalOutputDir))
+                    // movie-flat-collect (v1.4.18): LocalOutputDir may now point at a
+                    // single flattened file (movie) instead of a per-job folder
+                    // (image sequence). Handle both shapes.
+                    List<string> files;
+                    if (File.Exists(job.LocalOutputDir))
+                    {
+                        files = new List<string> { job.LocalOutputDir };
+                    }
+                    else if (Directory.Exists(job.LocalOutputDir))
+                    {
+                        files = new List<string>(
+                            Directory.GetFiles(job.LocalOutputDir, "*", SearchOption.AllDirectories));
+                    }
+                    else
                     {
                         Debug.LogWarning(
                             $"[DistributedRecorder]   [WARN] ローカルキャッシュが見つかりません: {job.LocalOutputDir}");
                         continue;
                     }
-
-                    var files = new List<string>(
-                        Directory.GetFiles(job.LocalOutputDir, "*", SearchOption.AllDirectories));
 
                     // Override the per-job snapshot with current _collectDir for bulk op.
                     var bulkVm = new MtrJobViewModel
