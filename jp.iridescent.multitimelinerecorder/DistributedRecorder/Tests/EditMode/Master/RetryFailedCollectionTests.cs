@@ -332,6 +332,71 @@ namespace DistributedRecorder.Tests.Master
         }
 
         // ═══════════════════════════════════════════════════════════════════════
+        // ShouldRetryCollectionBeforeNextJob: one immediate pre-dispatch retry
+        // (retry-collection-before-next-job, v1.5.2)
+        // ═══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        public void ShouldRetryCollectionBeforeNextJob_CompletedFailed_ReturnsTrue()
+        {
+            Assert.IsTrue(
+                MultiTimelineRecorder.ShouldRetryCollectionBeforeNextJob(
+                    JobState.Completed, DownloadState.Failed),
+                "A completed job whose collection failed must get one pre-dispatch retry.");
+        }
+
+        [Test]
+        public void ShouldRetryCollectionBeforeNextJob_IgnoresFailureKind_UnlikeWatchdog()
+        {
+            // Unlike ShouldAutoRetryDownload (Connection-only), the pre-dispatch retry does
+            // NOT gate on failure kind — it takes no kind parameter, so a NotFound-failed
+            // job is retried once too (an immediate retry can catch a transient 404 where
+            // the Worker had not yet finalized its job index). This asserts the contrast.
+            Assert.IsFalse(
+                MultiTimelineRecorder.ShouldAutoRetryDownload(
+                    JobState.Completed, DownloadState.Failed, DownloadFailureKind.NotFound,
+                    autoRetryCount: 0, lastAttemptTime: 0.0, nowTime: 100000.0,
+                    maxAutoRetries: MultiTimelineRecorder.MaxAutoRetries,
+                    baseDelaySeconds: MultiTimelineRecorder.AutoRetryBaseDelaySeconds),
+                "Sanity: the backoff watchdog never retries NotFound.");
+            Assert.IsTrue(
+                MultiTimelineRecorder.ShouldRetryCollectionBeforeNextJob(
+                    JobState.Completed, DownloadState.Failed),
+                "The pre-dispatch retry must fire for a failed collection of any kind.");
+        }
+
+        [Test]
+        public void ShouldRetryCollectionBeforeNextJob_CompletedDone_ReturnsFalse()
+        {
+            Assert.IsFalse(
+                MultiTimelineRecorder.ShouldRetryCollectionBeforeNextJob(
+                    JobState.Completed, DownloadState.Done),
+                "A successful collection must not be retried.");
+        }
+
+        [Test]
+        public void ShouldRetryCollectionBeforeNextJob_CompletedInProgress_ReturnsFalse()
+        {
+            Assert.IsFalse(
+                MultiTimelineRecorder.ShouldRetryCollectionBeforeNextJob(
+                    JobState.Completed, DownloadState.InProgress),
+                "A download still in progress must not be double-triggered.");
+        }
+
+        [Test]
+        public void ShouldRetryCollectionBeforeNextJob_NotCompleted_ReturnsFalse()
+        {
+            Assert.IsFalse(
+                MultiTimelineRecorder.ShouldRetryCollectionBeforeNextJob(
+                    JobState.Running, DownloadState.Failed),
+                "A job that is not Completed must never trigger a pre-dispatch collection retry.");
+            Assert.IsFalse(
+                MultiTimelineRecorder.ShouldRetryCollectionBeforeNextJob(
+                    JobState.Failed, DownloadState.Failed),
+                "A recording-Failed job must not trigger a pre-dispatch collection retry.");
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
         // CountFailedDownloads: pure counter for the bulk-retry button
         // ═══════════════════════════════════════════════════════════════════════
 
