@@ -803,13 +803,14 @@ namespace Unity.MultiTimelineRecorder
             }
             EditorGUILayout.EndHorizontal();
 
-            // Inline validation feedback.
+            // Inline validation feedback. The path already shows in the text field
+            // above, so on a valid path we intentionally render nothing here (this
+            // removes the earlier duplicate path echo that looked like a UI glitch) —
+            // only surface a problem when the path is invalid.
             if (!string.IsNullOrEmpty(_collectDir))
             {
                 if (!CollectPathValidator.Validate(_collectDir, out string valErr))
                     EditorGUILayout.HelpBox($"パスが無効です: {valErr}", MessageType.Error);
-                else
-                    EditorGUILayout.LabelField("  " + _collectDir, EditorStyles.miniLabel);
             }
             else
             {
@@ -881,10 +882,13 @@ namespace Unity.MultiTimelineRecorder
         {
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
 
-            // Job ID short + Timeline name + Worker
+            // Job ID short + Timeline name + Worker. The job state is already shown
+            // (localized) on the progress bar via ComputeJobStatusLabel, so the row
+            // text omits the raw "[State]" prefix to avoid the "[Completed] … 完了"
+            // duplication.
             string idShort = vm.JobId.Length >= 8 ? vm.JobId.Substring(0, 8) : vm.JobId;
             EditorGUILayout.LabelField(
-                $"[{vm.State}] {idShort}… {vm.TimelineName} → {vm.WorkerName}",
+                $"{idShort}… {vm.TimelineName} → {vm.WorkerName}",
                 GUILayout.Width(280));
 
             // Progress bar
