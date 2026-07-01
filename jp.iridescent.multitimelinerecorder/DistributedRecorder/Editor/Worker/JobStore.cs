@@ -448,10 +448,16 @@ namespace DistributedRecorder.Worker
         }
 
         /// <summary>
-        /// Returns the fully-qualified, normalised (no trailing separator) path for
-        /// <paramref name="path"/>. Resolves any relative segments and symlinks via
-        /// <see cref="Path.GetFullPath"/> so downstream containment checks cannot be
-        /// bypassed by "..", "." components, or mixed separators.
+        /// Returns the fully-qualified, lexically-normalised (no trailing separator)
+        /// path for <paramref name="path"/> via <see cref="Path.GetFullPath"/>, so
+        /// downstream containment checks cannot be bypassed by "..", "." components,
+        /// or mixed separators.
+        ///
+        /// NOTE: this is LEXICAL normalisation only — it does NOT resolve symbolic
+        /// links / reparse points. A symlink placed inside the Recordings root that
+        /// targets an outside location would still pass the containment check. This is
+        /// an accepted residual risk: creating such a symlink already requires write
+        /// access to the worker's Recordings directory (i.e. a prior compromise).
         /// </summary>
         private static string NormalizeFullPath(string path)
         {
