@@ -55,7 +55,9 @@ namespace DistributedRecorder.Master
             }
             catch (TransportException ex)
             {
-                return DownloadResult.Fail($"Failed to retrieve file list: {ex.Message}");
+                return DownloadResult.Fail(
+                    $"Failed to retrieve file list: {ex.Message}",
+                    ClassifyFailure(ex));
             }
 
             FileListResponse fileList;
@@ -102,9 +104,54 @@ namespace DistributedRecorder.Master
 
             return DownloadResult.Ok(downloaded);
         }
+
+        /// <summary>
+        /// Classifies a <see cref="TransportException"/> raised while fetching the file
+        /// list into a <see cref="DownloadFailureKind"/> so callers (retry-failed-collection
+        /// phase 1) can decide whether a retry is worthwhile.
+        ///
+        /// <list type="bullet">
+        ///   <item><see cref="DownloadFailureKind.NotFound"/>: HTTP 404 — the Worker no
+        ///     longer knows about this job (e.g. it lost its in-memory JobStore across a
+        ///     10-job restart cycle). Retrying without Worker-side recovery (phase 2)
+        ///     will keep failing, so callers should not auto-retry this.</item>
+        ///   <item><see cref="DownloadFailureKind.Connection"/>: everything else
+        ///     (timeouts, refused connections, other non-2xx statuses). These are
+        ///     transient — the Worker may simply be down for a moment (e.g. mid
+        ///     restart-cycle) and a later retry is likely to succeed.</item>
+        /// </list>
+        /// </summary>
+        internal static DownloadFailureKind ClassifyFailure(TransportException ex)
+            => ex != null && ex.HttpStatusCode == 404
+                ? DownloadFailureKind.NotFound
+                : DownloadFailureKind.Connection;
     }
 
     // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Wire-independent classification of why a <see cref="ResultDownloader.DownloadAsync"/>
+    /// call failed. Used only on the Master side (never serialized) to decide whether an
+    /// automatic/manual retry can plausibly succeed.
+    /// </summary>
+    public enum DownloadFailureKind
+    {
+        /// <summary>No failure (or not yet classified) — default for successful results.</summary>
+        None,
+
+        /// <summary>
+        /// Transient connection failure (timeout, refused connection, non-404 HTTP error).
+        /// The Worker may recover on its own; retrying later is worthwhile.
+        /// </summary>
+        Connection,
+
+        /// <summary>
+        /// The Worker responded but does not know this job (HTTP 404) — its JobStore
+        /// entry was lost, most likely across a restart cycle. Retrying will keep
+        /// failing until Worker-side jobindex persistence (phase 2) lands.
+        /// </summary>
+        NotFound,
+    }
 
     public class DownloadResult
     {
@@ -112,10 +159,18 @@ namespace DistributedRecorder.Master
         public string            ErrorMessage;
         public IReadOnlyList<string> Files;
 
-        public static DownloadResult Ok(List<string> files)
-            => new DownloadResult { Success = true, Files = files };
+        /// <summary>
+        /// Classification of the failure, or <see cref="DownloadFailureKind.None"/> when
+        /// <see cref="Success"/> is <c>true</c>. Populated for the file-list fetch failure
+        /// path (§1); per-file download failures inside a successful list fetch are logged
+        /// but do not change this classification (partial success is still <c>Success=true</c>).
+        /// </summary>
+        public DownloadFailureKind FailureKind;
 
-        public static DownloadResult Fail(string error)
-            => new DownloadResult { Success = false, ErrorMessage = error, Files = new List<string>() };
+        public static DownloadResult Ok(List<string> files)
+            => new DownloadResult { Success = true, Files = files, FailureKind = DownloadFailureKind.None };
+
+        public static DownloadResult Fail(string error, DownloadFailureKind kind = DownloadFailureKind.Connection)
+            => new DownloadResult { Success = false, ErrorMessage = error, Files = new List<string>(), FailureKind = kind };
     }
 }
