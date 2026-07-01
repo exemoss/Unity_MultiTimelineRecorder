@@ -118,6 +118,13 @@ namespace Unity.MultiTimelineRecorder
         /// </summary>
         private bool _isBulkCollecting;
 
+        /// <summary>
+        /// Guard flag for the "失敗した回収を一括再試行" button (retry-failed-collection
+        /// phase 1). Prevents concurrent invocations from rapid double-clicks; mirrors
+        /// the <see cref="_isBulkCollecting"/> pattern.
+        /// </summary>
+        private bool _isRetryingDownloads;
+
         // Default relative output root (relative to project root)
         private const string DistOutputRelRoot = "Recordings/Distributed";
 
@@ -546,6 +553,24 @@ namespace Unity.MultiTimelineRecorder
             DrawCollectDirUI();
             // ─────────────────────────────────────────────────────────────────
 
+            // ── retry-failed-collection (phase 1): bulk retry button ────────────
+            // "失敗した回収を一括再試行 [N 件]" — retries every job currently in
+            // DownloadState.Failed. Disabled while empty (N==0) or already running.
+            EditorGUILayout.BeginHorizontal();
+            int failedDownloadCount = CountFailedDownloads();
+            using (new EditorGUI.DisabledScope(_isRetryingDownloads || failedDownloadCount == 0))
+            {
+                string retryLabel = _isRetryingDownloads
+                    ? "再試行中..."
+                    : $"失敗した回収を一括再試行 [{failedDownloadCount} 件]";
+                if (GUILayout.Button(retryLabel, GUILayout.Height(22)))
+                {
+                    RetryFailedDownloadsAsync();
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+            // ─────────────────────────────────────────────────────────────────
+
             // Scrollable job list (max 150px)
             _distJobScrollPos = EditorGUILayout.BeginScrollView(
                 _distJobScrollPos, GUILayout.Height(Mathf.Min(150, _dispatchedJobs.Count * 36 + 4)));
@@ -838,7 +863,7 @@ namespace Unity.MultiTimelineRecorder
             {
                 if (GUILayout.Button("再回収", GUILayout.Width(56)))
                 {
-                    DownloadResultsAsync(vm.Worker, vm, isManualRetry: true);
+                    _ = DownloadResultsAsync(vm.Worker, vm, isManualRetry: true);
                 }
             }
 
@@ -3683,7 +3708,7 @@ namespace Unity.MultiTimelineRecorder
 
                     if (capturedEvt.state == JobState.Completed)
                     {
-                        DownloadResultsAsync(worker, vm);
+                        _ = DownloadResultsAsync(worker, vm);
                         // Free the Worker slot and dispatch next queued job
                         OnJobTerminated(worker, vm);
                     }
@@ -3922,7 +3947,7 @@ namespace Unity.MultiTimelineRecorder
                                 $"[DistributedRecorder] Stall watchdog: Worker がジョブ {jobIdShort}… " +
                                 "を完了済みと判定。結果を回収します。");
                             vm.State = JobState.Completed;
-                            DownloadResultsAsync(worker, vm);
+                            _ = DownloadResultsAsync(worker, vm);
                             OnJobTerminated(worker, vm);
                             break;
 
@@ -3940,7 +3965,7 @@ namespace Unity.MultiTimelineRecorder
                                 $"[DistributedRecorder] Stall watchdog: Worker アイドル、ジョブ " +
                                 $"{jobIdShort}… の状態不明 → Completed 扱いで回収を試みます。");
                             vm.State = JobState.Completed;
-                            DownloadResultsAsync(worker, vm);
+                            _ = DownloadResultsAsync(worker, vm);
                             OnJobTerminated(worker, vm);
                             break;
                     }
@@ -4054,7 +4079,7 @@ namespace Unity.MultiTimelineRecorder
                                 $"[DistributedRecorder] フェイルセーフ: Worker がジョブ {jobIdShort}… " +
                                 "を完了済みと判定。結果を回収します (ストリームは接続できませんでした)。");
                             vm.State = JobState.Completed;
-                            DownloadResultsAsync(worker, vm);
+                            _ = DownloadResultsAsync(worker, vm);
                             OnJobTerminated(worker, vm);
                             break;
 
@@ -4076,7 +4101,7 @@ namespace Unity.MultiTimelineRecorder
                                 $"[DistributedRecorder] フェイルセーフ: Worker がアイドル、ジョブ " +
                                 $"{jobIdShort}… の結果状態不明 → Completed 扱いで回収を試みます。");
                             vm.State = JobState.Completed;
-                            DownloadResultsAsync(worker, vm);
+                            _ = DownloadResultsAsync(worker, vm);
                             OnJobTerminated(worker, vm);
                             break;
                     }
@@ -4211,7 +4236,13 @@ namespace Unity.MultiTimelineRecorder
         /// <c>false</c> for the original post-recording pull and for the automatic
         /// watchdog retry (which must stay silent — no dialogs from a background tick).
         /// </param>
-        private async void DownloadResultsAsync(
+        /// <remarks>
+        /// retry-failed-collection (phase 1): returns <see cref="Task"/> (was <c>async void</c>)
+        /// so <see cref="RetryFailedDownloadsAsync"/> can <c>await</c> each job sequentially.
+        /// Existing fire-and-forget call sites (<c>DownloadResultsAsync(worker, vm);</c>) are
+        /// source-compatible — the returned Task is simply discarded, matching prior behavior.
+        /// </remarks>
+        private async Task DownloadResultsAsync(
             WorkerInfo worker, MtrJobViewModel vm, bool isManualRetry = false)
         {
             if (isManualRetry)
