@@ -70,6 +70,12 @@ namespace DistributedRecorder.Setup
         // to avoid Unity leaking the password into serialised window state on disk.
         private string _passwordInput = string.Empty;
 
+        // worker-disk-quota: Recordings/ disk quota UI state (transient — re-read
+        // from EditorPrefs via DiskQuotaManager on every OnEnable / after save).
+        private string _maxDiskGbInput = string.Empty;
+        private long   _currentRecordingsBytes;
+        private bool   _currentRecordingsBytesLoaded;
+
         // ------------------------------------------------------------------
         // Menu item
         // ------------------------------------------------------------------
@@ -91,6 +97,9 @@ namespace DistributedRecorder.Setup
             EditorApplication.update += OnUpdate;
             // Pre-populate password field from EditorPrefs on window open.
             _passwordInput = EditorPrefs.GetString(SharedKeyLoader.PasswordPrefsKey, string.Empty);
+            // worker-disk-quota: pre-populate the quota field from EditorPrefs.
+            _maxDiskGbInput = DiskQuotaManager.GetMaxDiskGB().ToString();
+            RefreshRecordingsSize();
             RefreshHealthSnapshot();
             _lastHealthRefresh = EditorApplication.timeSinceStartup;
         }
@@ -134,6 +143,8 @@ namespace DistributedRecorder.Setup
             DrawSyncSection();
             EditorGUILayout.Space(8);
             DrawWorkerSection();
+            EditorGUILayout.Space(8);
+            DrawDiskQuotaSection();
 
             if (!string.IsNullOrEmpty(_statusMessage))
             {
@@ -506,6 +517,77 @@ namespace DistributedRecorder.Setup
 #endif
 
             EditorGUILayout.EndVertical();
+        }
+
+        // ------------------------------------------------------------------
+        // Section: Recordings disk quota (worker-disk-quota)
+        // ------------------------------------------------------------------
+
+        private void DrawDiskQuotaSection()
+        {
+            EditorGUILayout.LabelField("Recordings ディスク上限", EditorStyles.boldLabel);
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+
+            EditorGUILayout.HelpBox(
+                "ジョブ完了ごとに Recordings/ の合計サイズをチェックし、上限を超えていれば " +
+                $"古いタイムスタンプフォルダから削除します（直近 {DiskQuotaManager.ProtectRecentCount} 件は無条件で保護）。\n" +
+                "0 を指定すると無制限（自動削除しません）。既定値: " +
+                $"{DiskQuotaManager.DefaultMaxDiskGB} GB。",
+                MessageType.Info);
+
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("上限 (GB):", GUILayout.Width(90));
+            _maxDiskGbInput = EditorGUILayout.TextField(_maxDiskGbInput, GUILayout.Width(80));
+            GUILayout.FlexibleSpace();
+
+            bool parsedOk = int.TryParse(_maxDiskGbInput, out int parsedGb) && parsedGb >= 0;
+
+            using (new EditorGUI.DisabledGroupScope(!parsedOk))
+            {
+                if (GUILayout.Button("保存", GUILayout.Width(80)))
+                {
+                    DiskQuotaManager.SetMaxDiskGB(parsedGb);
+                    _statusMessage = parsedGb == 0
+                        ? "Recordings 上限を無制限に設定しました。"
+                        : $"Recordings 上限を {parsedGb} GB に設定しました。";
+                }
+            }
+
+            EditorGUILayout.EndHorizontal();
+
+            if (!parsedOk)
+            {
+                EditorGUILayout.HelpBox("0 以上の整数を入力してください。", MessageType.Warning);
+            }
+
+            int savedGb = DiskQuotaManager.GetMaxDiskGB();
+            string savedLabel = savedGb == 0 ? "無制限" : $"{savedGb} GB";
+            EditorGUILayout.LabelField($"現在の設定: {savedLabel}", EditorStyles.miniLabel);
+
+            EditorGUILayout.Space(4);
+
+            string sizeLabel = _currentRecordingsBytesLoaded
+                ? FormatBytesForDisplay(_currentRecordingsBytes)
+                : "計測中...";
+            EditorGUILayout.LabelField($"Recordings/ 現在の合計サイズ: {sizeLabel}", EditorStyles.miniLabel);
+
+            if (GUILayout.Button("サイズを再計測", GUILayout.Width(120)))
+                RefreshRecordingsSize();
+
+            EditorGUILayout.EndVertical();
+        }
+
+        private void RefreshRecordingsSize()
+        {
+            string recordingsRoot = Path.Combine(ProjectPaths.ProjectRoot, "Recordings");
+            _currentRecordingsBytes = DiskQuotaManager.GetTotalRecordingsBytes(recordingsRoot);
+            _currentRecordingsBytesLoaded = true;
+        }
+
+        private static string FormatBytesForDisplay(long bytes)
+        {
+            const double gb = 1024.0 * 1024.0 * 1024.0;
+            return $"{bytes / gb:F2} GB";
         }
 
         // ------------------------------------------------------------------
