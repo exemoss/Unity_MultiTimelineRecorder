@@ -793,7 +793,15 @@ namespace Unity.MultiTimelineRecorder
 
         // ─────────────────────────────────────────────────────────────────────────
 
-        private static void DrawMtrJobRow(MtrJobViewModel vm)
+        /// <summary>
+        /// Draws a single job row in the distributed job list.
+        ///
+        /// retry-failed-collection (phase 1): no longer <c>static</c> — the "再回収"
+        /// button needs to call the instance method <see cref="DownloadResultsAsync"/>.
+        /// Only call site is the single <c>foreach</c> loop in
+        /// <see cref="DrawDistributedJobList"/>.
+        /// </summary>
+        private void DrawMtrJobRow(MtrJobViewModel vm)
         {
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
 
@@ -822,6 +830,17 @@ namespace Unity.MultiTimelineRecorder
             EditorGUI.ProgressBar(
                 EditorGUILayout.GetControlRect(GUILayout.Width(120), GUILayout.Height(16)),
                 progress, barLabel);
+
+            // retry-failed-collection (phase 1): "再回収" button for jobs whose
+            // recording succeeded but whose result pull failed. Disabled while a
+            // download is already in flight (multi-fire guard).
+            if (vm.State == JobState.Completed && vm.DownloadState == DownloadState.Failed)
+            {
+                if (GUILayout.Button("再回収", GUILayout.Width(56)))
+                {
+                    DownloadResultsAsync(vm.Worker, vm, isManualRetry: true);
+                }
+            }
 
             // "Open" button for completed+downloaded jobs
             if (vm.State == JobState.Completed && vm.DownloadState == DownloadState.Done
