@@ -194,6 +194,57 @@ namespace Unity.MultiTimelineRecorder
         public static double ProgressStreamConnectTimeoutSecondsPublic
             => ProgressMonitor.ConnectTimeout.TotalSeconds;
 
+        // retry-failed-collection (phase 1): automatic re-collection watchdog constants ──
+        //
+        // A periodic EditorApplication.update tick (throttled to AutoRetryTickIntervalSeconds)
+        // scans _dispatchedJobs for jobs stuck in DownloadState.Failed with a Connection-kind
+        // failure (NotFound is a phase-2 concern — never auto-retried) and retries them once
+        // the exponential-backoff delay has elapsed, capped at MaxAutoRetries attempts.
+        // Manual retries (per-job / bulk buttons) reset AutoRetryCount, so they are never
+        // blocked by this cap.
+
+        /// <summary>
+        /// Maximum number of automatic re-collection attempts per job. Once exceeded, the
+        /// watchdog stops retrying that job automatically (the user can still use the manual
+        /// "再回収" / bulk buttons, which reset the counter). Public for EditMode tests.
+        /// </summary>
+        public const int MaxAutoRetries = 4;
+
+        /// <summary>
+        /// Base delay (seconds) for the exponential backoff between automatic retry
+        /// attempts: delay for attempt <c>n</c> (1-indexed) is
+        /// <c>AutoRetryBaseDelaySeconds * 2^(n-1)</c> — 5s, 10s, 20s, 40s for
+        /// <see cref="MaxAutoRetries"/> = 4. Public for EditMode tests.
+        /// </summary>
+        public const double AutoRetryBaseDelaySeconds = 5.0;
+
+        /// <summary>
+        /// Minimum real-time interval between successive <see cref="AutoRetryDownloadsTick"/>
+        /// scans, to avoid re-evaluating backoff eligibility on every single Editor frame.
+        /// Public for EditMode tests.
+        /// </summary>
+        public const double AutoRetryTickIntervalSeconds = 2.0;
+
+        /// <summary>
+        /// Whether the auto-retry-downloads EditorApplication.update callback is registered.
+        /// </summary>
+        private bool _autoRetryWatchdogRegistered;
+
+        /// <summary>
+        /// <see cref="EditorApplication.timeSinceStartup"/> at the last
+        /// <see cref="AutoRetryDownloadsTick"/> scan; used to throttle scans to
+        /// <see cref="AutoRetryTickIntervalSeconds"/>.
+        /// </summary>
+        private double _lastAutoRetryTickTime;
+
+        /// <summary>
+        /// Job IDs currently being auto-retried (re-entrancy guard, mirrors
+        /// <see cref="_stallWatchdogActive"/>). Prevents the tick from firing a second
+        /// concurrent <see cref="DownloadResultsAsync"/> for a job whose previous
+        /// auto-retry attempt has not yet completed.
+        /// </summary>
+        private readonly HashSet<string> _autoRetryActive = new HashSet<string>();
+
         // reprobe-add-worker: guard flag ─────────────────────────────────────────
         //
         // Set to true while ReprobeAndAddWorkersAsync is running to prevent
@@ -3885,6 +3936,148 @@ namespace Unity.MultiTimelineRecorder
         /// </summary>
         public static double FailsafeStallSecondsPublic => FailsafeStallSeconds;
 
+        // -----------------------------------------------------------------------
+        // retry-failed-collection (phase 1): automatic re-collection watchdog
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Pure predicate: decides whether a job should be auto-retried right now.
+        ///
+        /// All conditions must hold:
+        /// <list type="bullet">
+        ///   <item><paramref name="state"/> == <see cref="JobState.Completed"/> and
+        ///     <paramref name="downloadState"/> == <see cref="DownloadState.Failed"/>
+        ///     (the "回収失敗" case — never touches jobs that are still in flight or
+        ///     genuinely Failed/Unreachable on the Worker side).</item>
+        ///   <item><paramref name="failureKind"/> == <see cref="DownloadFailureKind.Connection"/>
+        ///     — a NotFound (404, Worker forgot the job) is never auto-retried; that is a
+        ///     phase-2 concern and retrying blindly would just repeat the same 404.</item>
+        ///   <item><paramref name="autoRetryCount"/> &lt; <paramref name="maxAutoRetries"/> —
+        ///     the auto-retry budget is not exhausted (manual retries reset this counter).</item>
+        ///   <item>The exponential-backoff delay for attempt <c>autoRetryCount + 1</c> has
+        ///     elapsed since <paramref name="lastAttemptTime"/>:
+        ///     <c>baseDelaySeconds * 2^autoRetryCount</c>.</item>
+        /// </list>
+        ///
+        /// Made <c>public static</c> for hermetic EditMode tests.
+        /// </summary>
+        public static bool ShouldAutoRetryDownload(
+            JobState state,
+            DownloadState downloadState,
+            DownloadFailureKind failureKind,
+            int autoRetryCount,
+            double lastAttemptTime,
+            double nowTime,
+            int maxAutoRetries,
+            double baseDelaySeconds)
+        {
+            if (state != JobState.Completed || downloadState != DownloadState.Failed)
+                return false;
+
+            if (failureKind != DownloadFailureKind.Connection)
+                return false;
+
+            if (autoRetryCount >= maxAutoRetries)
+                return false;
+
+            double backoffDelay = baseDelaySeconds * Math.Pow(2, autoRetryCount);
+            return (nowTime - lastAttemptTime) >= backoffDelay;
+        }
+
+        /// <summary>
+        /// Registers <see cref="AutoRetryDownloadsTick"/> on
+        /// <c>EditorApplication.update</c> if not already registered. Mirrors
+        /// <see cref="EnsureStallWatchdogRegistered"/>.
+        /// </summary>
+        private void EnsureAutoRetryWatchdogRegistered()
+        {
+            if (_autoRetryWatchdogRegistered) return;
+            _autoRetryWatchdogRegistered = true;
+            EditorApplication.update += AutoRetryDownloadsTick;
+        }
+
+        /// <summary>
+        /// Called every Editor frame via <c>EditorApplication.update</c> (throttled to
+        /// <see cref="AutoRetryTickIntervalSeconds"/>). Scans <see cref="_dispatchedJobs"/>
+        /// for jobs eligible per <see cref="ShouldAutoRetryDownload"/> and retries them via
+        /// the same idempotent <see cref="DownloadResultsAsync"/> entry point used by the
+        /// manual buttons (<c>isManualRetry: false</c> — silent, no DisplayDialog, and does
+        /// not reset <see cref="MtrJobViewModel.AutoRetryCount"/>).
+        ///
+        /// Auto-unregisters when there are no dispatched jobs at all, mirroring
+        /// <see cref="StallWatchdogTick"/>'s self-unregistration. Registration itself is
+        /// lazy: <see cref="EnsureAutoRetryWatchdogRegistered"/> is called from
+        /// <see cref="DownloadResultsAsync"/>'s Connection-failure paths, so the tick only
+        /// starts running once at least one job has actually failed to download; it
+        /// re-registers itself the next time a job fails after a prior all-clear unregister.
+        /// </summary>
+        private void AutoRetryDownloadsTick()
+        {
+            if (_dispatchedJobs.Count == 0)
+            {
+                EditorApplication.update -= AutoRetryDownloadsTick;
+                _autoRetryWatchdogRegistered = false;
+                return;
+            }
+
+            double now = EditorApplication.timeSinceStartup;
+            if (now - _lastAutoRetryTickTime < AutoRetryTickIntervalSeconds)
+                return;
+            _lastAutoRetryTickTime = now;
+
+            // Snapshot to avoid mutating _dispatchedJobs while iterating (defensive;
+            // DownloadResultsAsync mutates vm fields in place, not the list itself).
+            var jobs = new List<MtrJobViewModel>(_dispatchedJobs);
+            foreach (var vm in jobs)
+            {
+                if (_autoRetryActive.Contains(vm.JobId)) continue; // already retrying
+
+                bool eligible = ShouldAutoRetryDownload(
+                    vm.State,
+                    vm.DownloadState,
+                    vm.LastDownloadFailureKind,
+                    vm.AutoRetryCount,
+                    vm.LastDownloadAttemptTime,
+                    now,
+                    MaxAutoRetries,
+                    AutoRetryBaseDelaySeconds);
+
+                if (!eligible) continue;
+                if (vm.Worker == null) continue; // defensive: no endpoint to retry against
+
+                string jobIdShort = vm.JobId.Length >= 8 ? vm.JobId.Substring(0, 8) : vm.JobId;
+                Debug.Log(
+                    $"[DistributedRecorder] 自動再回収: ジョブ {jobIdShort}… " +
+                    $"(試行 {vm.AutoRetryCount + 1}/{MaxAutoRetries})");
+
+                vm.AutoRetryCount++;
+                _autoRetryActive.Add(vm.JobId);
+                _ = AutoRetryOneAsync(vm);
+            }
+        }
+
+        /// <summary>
+        /// Runs one automatic retry attempt for <paramref name="vm"/> and clears the
+        /// <see cref="_autoRetryActive"/> re-entrancy guard when done, regardless of outcome.
+        /// Split out from <see cref="AutoRetryDownloadsTick"/> so the tick itself stays
+        /// synchronous (fire-and-forget per job, like <see cref="HandleStalledJobAsync"/>'s
+        /// call site).
+        /// </summary>
+        private async Task AutoRetryOneAsync(MtrJobViewModel vm)
+        {
+            try
+            {
+                // isManualRetry: false — silent (no dialog) and preserves AutoRetryCount,
+                // which DownloadResultsAsync itself increments only via the manual-reset
+                // path; the tick above already incremented it for this attempt.
+                await DownloadResultsAsync(vm.Worker, vm, isManualRetry: false);
+            }
+            finally
+            {
+                _autoRetryActive.Remove(vm.JobId);
+            }
+        }
+
         /// <summary>
         /// worker-reload-survival 案D: async health probe for a stalled in-flight job.
         ///
@@ -4264,6 +4457,7 @@ namespace Unity.MultiTimelineRecorder
                 vm.DownloadState = DownloadState.Failed;
                 vm.LastDownloadFailureKind   = DownloadFailureKind.Connection;
                 vm.LastDownloadAttemptTime   = EditorApplication.timeSinceStartup;
+                EnsureAutoRetryWatchdogRegistered();
                 Repaint();
                 return;
             }
@@ -4328,6 +4522,11 @@ namespace Unity.MultiTimelineRecorder
                             "（フェーズ 2 で対応予定）",
                             "OK");
                     }
+
+                    // Connection-kind failures are eligible for the automatic retry
+                    // watchdog; ensure it is ticking (no-op if already registered).
+                    if (vm.LastDownloadFailureKind == DownloadFailureKind.Connection)
+                        EnsureAutoRetryWatchdogRegistered();
                 }
             }
             finally
