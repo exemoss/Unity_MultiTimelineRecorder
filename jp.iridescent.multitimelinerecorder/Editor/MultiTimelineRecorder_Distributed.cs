@@ -474,6 +474,13 @@ namespace Unity.MultiTimelineRecorder
                         EditorStyles.miniLabel);
                 }
 
+                // ── collect-to-dir UI (v1.4.10; moved out of the job list in v1.5.1) ──
+                // Drawn here (always visible while distributed mode is on) so the collect
+                // directory can be specified BEFORE pressing 分散実行. The dispatch-time
+                // auto-download reads _collectDir, so a pre-set directory takes effect on
+                // the very first batch.
+                DrawCollectDirUI();
+
                 // ── Job progress list ────────────────────────────────────────
                 if (_dispatchedJobs.Count > 0)
                 {
@@ -598,11 +605,8 @@ namespace Unity.MultiTimelineRecorder
             EditorGUILayout.EndHorizontal();
             // ─────────────────────────────────────────────────────────────────
 
-            // ── collect-to-dir UI (v1.4.10) ──────────────────────────────────
-            // Placed directly below the stop button so both controls are visible
-            // in the same section of the MTR window.
-            DrawCollectDirUI();
-            // ─────────────────────────────────────────────────────────────────
+            // (collect-to-dir UI moved above the job list in v1.5.1 so the collect
+            //  directory can be set before dispatch — see DrawDistributedSection.)
 
             // ── retry-failed-collection (phase 1): bulk retry button ────────────
             // "失敗した回収を一括再試行 [N 件]" — retries every job currently in
