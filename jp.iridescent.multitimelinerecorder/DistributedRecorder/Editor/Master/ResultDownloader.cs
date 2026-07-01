@@ -120,8 +120,12 @@ namespace DistributedRecorder.Master
         ///     transient — the Worker may simply be down for a moment (e.g. mid
         ///     restart-cycle) and a later retry is likely to succeed.</item>
         /// </list>
+        ///
+        /// Public (rather than internal) so hermetic EditMode tests in the
+        /// DistributedRecorder.Tests.EditMode assembly can call it directly without
+        /// requiring an InternalsVisibleTo declaration.
         /// </summary>
-        internal static DownloadFailureKind ClassifyFailure(TransportException ex)
+        public static DownloadFailureKind ClassifyFailure(TransportException ex)
             => ex != null && ex.HttpStatusCode == 404
                 ? DownloadFailureKind.NotFound
                 : DownloadFailureKind.Connection;
