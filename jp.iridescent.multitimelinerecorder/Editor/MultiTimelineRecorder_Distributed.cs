@@ -4496,6 +4496,101 @@ namespace Unity.MultiTimelineRecorder
         }
 
         // -----------------------------------------------------------------------
+        // retry-failed-collection (phase 1): bulk manual retry
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Pure function: counts jobs currently in <see cref="DownloadState.Failed"/>.
+        /// Drives the "失敗した回収を一括再試行 [N 件]" button label/enabled-state and is
+        /// re-derived every OnGUI frame (cheap: linear scan, no allocation beyond the int).
+        ///
+        /// Made <c>internal static</c> for hermetic EditMode tests.
+        /// </summary>
+        internal static int CountFailedDownloads(IReadOnlyList<MtrJobViewModel> jobs)
+        {
+            if (jobs == null) return 0;
+            int count = 0;
+            foreach (var job in jobs)
+            {
+                if (job != null && job.DownloadState == DownloadState.Failed)
+                    count++;
+            }
+            return count;
+        }
+
+        private int CountFailedDownloads() => CountFailedDownloads(_dispatchedJobs);
+
+        /// <summary>
+        /// Retries every job currently in <see cref="DownloadState.Failed"/>, sequentially,
+        /// re-using the same idempotent <see cref="DownloadResultsAsync"/> entry point as the
+        /// per-job "再回収" button (<paramref name="isManualRetry"/>-equivalent: <c>true</c>).
+        ///
+        /// Guard: <see cref="_isRetryingDownloads"/> prevents concurrent invocations from
+        /// rapid double-clicks, mirroring <see cref="BulkCollectAsync"/>'s
+        /// <see cref="_isBulkCollecting"/> pattern.
+        ///
+        /// A single job's failure (e.g. NotFound / result vanished — dialog shown inside
+        /// <see cref="DownloadResultsAsync"/>) does not stop the remaining jobs in the batch
+        /// from being retried (acceptance criterion: "一括再試行中に一部が結果消失でも、
+        /// 残りのジョブの再回収は継続する").
+        /// </summary>
+        private async void RetryFailedDownloadsAsync()
+        {
+            if (_isRetryingDownloads) return;
+
+            // Snapshot the eligible job list synchronously on the main thread so
+            // concurrent state changes (e.g. a per-job manual retry) mid-batch do not
+            // mutate the collection we are iterating.
+            var eligible = new List<MtrJobViewModel>();
+            foreach (var job in _dispatchedJobs)
+            {
+                if (job.DownloadState == DownloadState.Failed)
+                    eligible.Add(job);
+            }
+
+            if (eligible.Count == 0)
+            {
+                Debug.Log("[DistributedRecorder] 一括再試行: 対象ジョブ（回収失敗）がありません。");
+                return;
+            }
+
+            _isRetryingDownloads = true;
+            Repaint();
+
+            try
+            {
+                Debug.Log($"[DistributedRecorder] 失敗した回収を一括再試行 開始 – {eligible.Count} 件");
+
+                int done = 0;
+                foreach (var job in eligible)
+                {
+                    Debug.Log(
+                        $"[DistributedRecorder]   [{++done}/{eligible.Count}] " +
+                        $"{job.JobId.Substring(0, Math.Min(8, job.JobId.Length))}...");
+
+                    // job.Worker can be null only if dispatch bookkeeping is corrupted;
+                    // guard defensively so one bad entry cannot abort the whole batch.
+                    if (job.Worker == null)
+                    {
+                        Debug.LogWarning(
+                            $"[DistributedRecorder]   [WARN] Worker 情報がありません。スキップ: " +
+                            $"{job.JobId.Substring(0, Math.Min(8, job.JobId.Length))}");
+                        continue;
+                    }
+
+                    await DownloadResultsAsync(job.Worker, job, isManualRetry: true);
+                }
+
+                Debug.Log("[DistributedRecorder] 失敗した回収を一括再試行 完了");
+            }
+            finally
+            {
+                _isRetryingDownloads = false;
+                Repaint();
+            }
+        }
+
+        // -----------------------------------------------------------------------
         // Helpers
         // -----------------------------------------------------------------------
 
