@@ -1140,6 +1140,12 @@ namespace DistributedRecorder.Worker
 
             ResetState();
 
+            // worker-disk-quota: sweep Recordings/ for quota compliance after every
+            // completed job. Run BEFORE the auto-restart check below since that
+            // branch may call EditorApplication.Exit(0), which would otherwise skip
+            // the sweep entirely in batch mode.
+            DiskQuotaManager.EnforceIfNeeded(_projectRoot);
+
             // Auto-restart check
             if (_store.CompletedJobCount >= _maxJobsBeforeRestart)
             {
