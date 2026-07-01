@@ -703,16 +703,20 @@ namespace Unity.MultiTimelineRecorder
                     selectedDirectorIndices.Clear();
                     currentTimelineIndexForRecorder = -1;
                 }
-                
+
                 GUILayout.FlexibleSpace();
                 EditorGUILayout.EndHorizontal();
-                
+
+                // Delete every checked (selected) timeline from the recording queue.
+                // Refs: bulk-delete-checked
+                DrawDeleteCheckedTimelinesButton();
+
                 EditorGUILayout.Space(2);
             }
-            
+
             // マトリクスビュー風のリスト表示
             EditorGUILayout.BeginVertical("RL Background", GUILayout.ExpandWidth(true));
-            
+
             if (recordingQueueDirectors.Count > 0)
             {
                 // Ensure GUI is enabled for timeline selection
@@ -1183,6 +1187,10 @@ namespace Unity.MultiTimelineRecorder
             // Bulk-apply button: copy current timeline's recorder config to other selected timelines.
             DrawBulkRecorderButton();
 
+            // Delete every recorder marked via its per-row delete-selection checkbox.
+            // Refs: bulk-delete-checked
+            DrawDeleteCheckedRecordersButton();
+
             EditorGUILayout.Space(2);
 
             // マトリクスビュー風のリスト表示
@@ -1297,7 +1305,11 @@ namespace Unity.MultiTimelineRecorder
                     item.name = newName;
                     SaveSettings();
                 }
-                
+
+                // Per-row delete-selection checkbox (separate from the `enabled` toggle).
+                // Refs: bulk-delete-checked
+                DrawRecorderDeleteCheckbox(item);
+
                 // 右クリックメニュー対応（既存の機能を維持）
                 if (Event.current.type == EventType.ContextClick && isHover)
                 {
