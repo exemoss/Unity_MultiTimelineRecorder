@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using NUnit.Framework;
 using UnityEditor;
+using UnityEngine;
+using UnityEngine.TestTools;
 using DistributedRecorder.Worker;
 
 namespace DistributedRecorder.Tests.Worker
@@ -196,7 +198,15 @@ namespace DistributedRecorder.Tests.Worker
         [Test]
         public void EnforceIfNeeded_EmptyProjectRoot_NoOpDoesNotThrow()
         {
+            // EnforceIfNeeded intentionally logs a diagnostic error and no-ops for an
+            // empty/null projectRoot (a "should never happen" misconfiguration). Expect
+            // that error so the Test Framework does not treat it as an unhandled failure.
+            const string expected = "[DiskQuotaManager] projectRoot is empty — refusing to run the Recordings sweep.";
+
+            LogAssert.Expect(LogType.Error, expected);
             Assert.DoesNotThrow(() => DiskQuotaManager.EnforceIfNeeded(string.Empty));
+
+            LogAssert.Expect(LogType.Error, expected);
             Assert.DoesNotThrow(() => DiskQuotaManager.EnforceIfNeeded(null));
         }
 
