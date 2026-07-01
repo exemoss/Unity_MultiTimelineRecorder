@@ -3767,9 +3767,13 @@ namespace Unity.MultiTimelineRecorder
 
                     if (capturedEvt.state == JobState.Completed)
                     {
-                        _ = DownloadResultsAsync(worker, vm);
-                        // Free the Worker slot and dispatch next queued job
-                        OnJobTerminated(worker, vm);
+                        // retry-collection-before-next-job (v1.5.2): collect the results
+                        // BEFORE freeing this Worker for its next job, so a failed
+                        // collection gets one automatic retry while the results are still
+                        // fresh on the Worker (see DownloadThenTerminateAsync). The Worker
+                        // stays in-flight until collection settles; OnJobTerminated is
+                        // called inside that method's finally so it is never stranded.
+                        _ = DownloadThenTerminateAsync(worker, vm);
                     }
                     else if (capturedEvt.state == JobState.Failed)
                     {
@@ -4550,6 +4554,71 @@ namespace Unity.MultiTimelineRecorder
             {
                 transport.Dispose();
                 Repaint();
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // retry-collection-before-next-job (v1.5.2)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Pure predicate: should a completed job's collection be retried once, right now,
+        /// before its Worker is freed for the next job?
+        ///
+        /// True whenever the job is <see cref="JobState.Completed"/> and its download is
+        /// <see cref="DownloadState.Failed"/> — regardless of failure kind (both
+        /// <see cref="DownloadFailureKind.Connection"/> AND <see cref="DownloadFailureKind.NotFound"/>
+        /// get the one immediate retry; an immediate retry can still catch a transient 404
+        /// where the Worker had not yet finalized its job index). This is deliberately
+        /// broader than the backoff watchdog's <see cref="ShouldAutoRetryDownload"/>
+        /// (Connection-only), because here the results are still fresh on the Worker.
+        ///
+        /// Made <c>public static</c> for hermetic EditMode tests.
+        /// </summary>
+        public static bool ShouldRetryCollectionBeforeNextJob(JobState state, DownloadState downloadState)
+        {
+            return state == JobState.Completed && downloadState == DownloadState.Failed;
+        }
+
+        /// <summary>
+        /// Collect a completed job's results, then free its Worker and dispatch the next
+        /// queued job — in that order (retry-collection-before-next-job, v1.5.2).
+        ///
+        /// The first <see cref="DownloadResultsAsync"/> runs; if it fails
+        /// (per <see cref="ShouldRetryCollectionBeforeNextJob"/>) exactly ONE immediate
+        /// retry is attempted before the Worker is released. Because this is awaited before
+        /// <see cref="OnJobTerminated"/>, the Worker stays counted as in-flight and receives
+        /// no new job until collection settles — so the retry never races the next job (or
+        /// the disk-quota sweep) for the Worker's on-disk results.
+        ///
+        /// A failed list-fetch is bounded by <c>ResultDownloader.ListTimeout</c> (30 s), so
+        /// the worst-case extra hold on a persistently-unreachable Worker is ~two list
+        /// timeouts; <see cref="OnJobTerminated"/> is invoked from <c>finally</c> so a
+        /// download exception can never strand the Worker or stall the batch.
+        /// </summary>
+        private async Task DownloadThenTerminateAsync(WorkerInfo worker, MtrJobViewModel vm)
+        {
+            try
+            {
+                await DownloadResultsAsync(worker, vm);
+
+                if (ShouldRetryCollectionBeforeNextJob(vm.State, vm.DownloadState))
+                {
+                    Debug.Log(
+                        $"[DistributedRecorder] 回収に失敗したため、次ジョブ投入前に1回だけ自動再回収します: " +
+                        $"ジョブ {vm.JobId.Substring(0, 8)}… (種別={vm.LastDownloadFailureKind})");
+                    await DownloadResultsAsync(worker, vm);
+                }
+            }
+            catch (Exception e)
+            {
+                // Never let a collection error strand the Worker; log and fall through to
+                // OnJobTerminated so the slot is freed and the batch can progress.
+                Debug.LogException(e);
+            }
+            finally
+            {
+                OnJobTerminated(worker, vm);
             }
         }
 
