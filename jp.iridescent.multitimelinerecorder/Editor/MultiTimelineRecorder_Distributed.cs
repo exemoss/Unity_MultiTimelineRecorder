@@ -574,6 +574,9 @@ namespace Unity.MultiTimelineRecorder
         internal const string LabelUnreachable = "到達不能";
         internal const string LabelCollecting  = "収集中";
         internal const string LabelCancelled   = "停止";
+        // retry-failed-collection (phase 1): distinct label for Completed+DownloadState==Failed
+        // so the UI does not misreport a failed collection as "完了".
+        internal const string LabelDownloadFailed = "回収失敗";
         // "録画中 N/M" is built at call-site from LabelRecordingFmt
         internal const string LabelRecordingFmt = "録画中 {0}/{1}";
 
@@ -586,6 +589,9 @@ namespace Unity.MultiTimelineRecorder
         ///     the Collecting label is shown while DownloadState == InProgress)</item>
         ///   <item>Terminal: Failed     → "失敗"</item>
         ///   <item>Terminal: Unreachable → "到達不能"</item>
+        ///   <item>Terminal: Completed + DownloadState == Failed → "回収失敗"
+        ///     (retry-failed-collection phase 1: recording succeeded but the result
+        ///     pull failed; previously mis-shown as "完了")</item>
         ///   <item>DownloadState == InProgress → "収集中" (overrides state label)</item>
         ///   <item>Queued (Phase == Queued / Sending) → label based on Phase</item>
         ///   <item>Running + TotalFrames == 0 (Phase == Preparing) → "Editor 起動中…"</item>
@@ -595,7 +601,7 @@ namespace Unity.MultiTimelineRecorder
         /// </list>
         ///
         /// Made <c>public static</c> for hermetic EditMode tests.
-        /// Added in dispatch-status-labels.
+        /// Added in dispatch-status-labels. Extended in retry-failed-collection (phase 1).
         /// </summary>
         public static string ComputeJobStatusLabel(MtrJobViewModel vm)
         {
@@ -617,6 +623,12 @@ namespace Unity.MultiTimelineRecorder
             // because the result files are still being pulled from the Worker.
             if (vm.DownloadState == DownloadState.InProgress)
                 return LabelCollecting;
+
+            // retry-failed-collection (phase 1): recording finished but the result
+            // pull failed — surface this distinctly instead of "完了" so the user
+            // knows a manual/automatic re-collection is needed.
+            if (vm.State == JobState.Completed && vm.DownloadState == DownloadState.Failed)
+                return LabelDownloadFailed;
 
             // Completed (and download done or not started)
             if (vm.State == JobState.Completed)
