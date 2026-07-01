@@ -41,22 +41,28 @@ namespace DistributedRecorder.Worker
             if (!string.Equals(leafName, "Recordings", StringComparison.Ordinal))
                 return false;
 
-            // Reject drive roots / filesystem roots ("C:\", "C:\Recordings" is fine,
-            // but a root whose parent is null or itself a root is not plausible).
+            // A valid Recordings root always has a real project directory as its
+            // parent (e.g. "C:\Projects\MyGame\Recordings"). Reject any path whose
+            // parent is missing or IS the drive/filesystem root — the latter means
+            // ProjectRoot resolved to a drive root like "C:\" (so Recordings would be
+            // "C:\Recordings"), which is never a valid Unity project root.
             string parent = Path.GetDirectoryName(fullRecordingsRoot);
             if (string.IsNullOrEmpty(parent))
                 return false;
 
-            // Path.GetPathRoot("C:\Recordings") == "C:\" — reject the case where the
-            // parent IS the drive/filesystem root, since that would mean
-            // ProjectRoot resolved to "C:\" (a drive root), which is never a valid
-            // Unity project root.
-            string rootOfParent = Path.GetPathRoot(fullRecordingsRoot);
-            if (!string.IsNullOrEmpty(rootOfParent) &&
-                string.Equals(parent, rootOfParent.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                    StringComparison.OrdinalIgnoreCase))
+            // Trim trailing separators on BOTH sides before comparing: for a drive-root
+            // Recordings, Path.GetDirectoryName keeps the separator ("C:\Recordings" ->
+            // parent "C:\") while Path.GetPathRoot also yields "C:\"; without trimming
+            // parent too, the compare was "C:\" vs "C:" and never matched, so the
+            // drive-root rejection silently never fired.
+            string rootOfPath = Path.GetPathRoot(fullRecordingsRoot);
+            if (!string.IsNullOrEmpty(rootOfPath))
             {
-                return false;
+                char[] separators = { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
+                string parentTrimmed = parent.TrimEnd(separators);
+                string rootTrimmed = rootOfPath.TrimEnd(separators);
+                if (string.Equals(parentTrimmed, rootTrimmed, StringComparison.OrdinalIgnoreCase))
+                    return false;
             }
 
             return true;
