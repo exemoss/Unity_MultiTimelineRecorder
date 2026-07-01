@@ -4164,8 +4164,40 @@ namespace Unity.MultiTimelineRecorder
         // Result download
         // -----------------------------------------------------------------------
 
-        private async void DownloadResultsAsync(WorkerInfo worker, MtrJobViewModel vm)
+        /// <summary>
+        /// Downloads the result files for <paramref name="vm"/> from <paramref name="worker"/>.
+        /// Re-entrant/idempotent: safe to call again for a job whose previous attempt
+        /// failed (writes into the same <see cref="MtrJobViewModel.LocalOutputDir"/>).
+        ///
+        /// retry-failed-collection (phase 1) additions:
+        /// <list type="bullet">
+        ///   <item><paramref name="isManualRetry"/> resets <see cref="MtrJobViewModel.AutoRetryCount"/>
+        ///     so a user-triggered "再回収" is never blocked by the auto-retry cap, and
+        ///     (only for manual attempts) shows a <see cref="EditorUtility.DisplayDialog"/>
+        ///     when the failure is not retry-worthy (result vanished on the Worker).</item>
+        ///   <item>Records <see cref="MtrJobViewModel.LastDownloadFailureKind"/> /
+        ///     <see cref="MtrJobViewModel.LastDownloadAttemptTime"/> on every attempt so the
+        ///     periodic auto-retry watchdog (<see cref="AutoRetryDownloadsTick"/>) can decide
+        ///     eligibility without re-deriving state from logs.</item>
+        ///   <item>A <c>Success</c> result with zero files (Worker responded but has nothing
+        ///     for this job — e.g. it forgot the job across a restart cycle) is treated as a
+        ///     NotFound-style failure, not as Done, matching the "結果消失" acceptance
+        ///     criterion (DownloadState stays Failed).</item>
+        /// </list>
+        /// </summary>
+        /// <param name="worker">Worker endpoint to pull from.</param>
+        /// <param name="vm">Job view model; mutated in place.</param>
+        /// <param name="isManualRetry">
+        /// <c>true</c> when invoked from the "再回収" / "失敗した回収を一括再試行" buttons;
+        /// <c>false</c> for the original post-recording pull and for the automatic
+        /// watchdog retry (which must stay silent — no dialogs from a background tick).
+        /// </param>
+        private async void DownloadResultsAsync(
+            WorkerInfo worker, MtrJobViewModel vm, bool isManualRetry = false)
         {
+            if (isManualRetry)
+                vm.AutoRetryCount = 0; // manual action always gets a fresh auto-retry budget
+
             vm.DownloadState = DownloadState.InProgress;
             // dispatch-status-labels: show "収集中" while pulling result files
             vm.Phase = JobPhase.Collecting;
@@ -4180,6 +4212,8 @@ namespace Unity.MultiTimelineRecorder
             {
                 Debug.LogError($"[DistributedRecorder] 結果回収: 共有キーのロードに失敗: {keyError}");
                 vm.DownloadState = DownloadState.Failed;
+                vm.LastDownloadFailureKind   = DownloadFailureKind.Connection;
+                vm.LastDownloadAttemptTime   = EditorApplication.timeSinceStartup;
                 Repaint();
                 return;
             }
@@ -4197,10 +4231,19 @@ namespace Unity.MultiTimelineRecorder
                     (name, cur, total) =>
                         Debug.Log($"[DistributedRecorder]  [{cur}/{total}] {name}"));
 
-                if (result.Success)
+                vm.LastDownloadAttemptTime = EditorApplication.timeSinceStartup;
+
+                // A Success result with zero files means the Worker answered but has
+                // nothing recorded for this job (result vanished / Worker forgot it).
+                // Treat this the same as a NotFound failure rather than Done.
+                bool resultVanished = result.Success && result.Files.Count == 0;
+
+                if (result.Success && !resultVanished)
                 {
                     vm.DownloadState = DownloadState.Done;
                     vm.Phase = JobPhase.Terminal; // dispatch-status-labels
+                    vm.LastDownloadFailureKind = DownloadFailureKind.None;
+                    vm.AutoRetryCount = 0;
                     Debug.Log(
                         $"[DistributedRecorder] 回収完了: {result.Files.Count} ファイル → {vm.LocalOutputDir}");
 
@@ -4216,9 +4259,25 @@ namespace Unity.MultiTimelineRecorder
                 {
                     vm.DownloadState = DownloadState.Failed;
                     vm.Phase = JobPhase.Terminal; // dispatch-status-labels
+                    vm.LastDownloadFailureKind = resultVanished
+                        ? DownloadFailureKind.NotFound
+                        : result.FailureKind;
+
+                    string reason = resultVanished
+                        ? "Worker responded but reported no output files for this job."
+                        : result.ErrorMessage;
                     Debug.LogError(
-                        $"[DistributedRecorder] 回収失敗 ジョブ {vm.JobId.Substring(0, 8)}…: " +
-                        result.ErrorMessage);
+                        $"[DistributedRecorder] 回収失敗 ジョブ {vm.JobId.Substring(0, 8)}…: {reason}");
+
+                    if (isManualRetry && vm.LastDownloadFailureKind == DownloadFailureKind.NotFound)
+                    {
+                        EditorUtility.DisplayDialog(
+                            "再回収できません",
+                            "成果物が Worker 上に見つかりません。\n" +
+                            "既に削除されているか、Worker が再起動して情報を失った可能性があります。\n" +
+                            "（フェーズ 2 で対応予定）",
+                            "OK");
+                    }
                 }
             }
             finally
@@ -4885,5 +4944,37 @@ namespace Unity.MultiTimelineRecorder
         /// destination sub-directory names on collision.
         /// </summary>
         public string CollectDisambig;
+
+        // ── retry-failed-collection fields (phase 1) ────────────────────────────
+
+        /// <summary>
+        /// Classification of the most recent <see cref="DownloadResult"/> failure for
+        /// this job (<see cref="DistributedRecorder.Master.DownloadFailureKind.None"/> when
+        /// the last attempt succeeded or none has run yet). Drives whether the
+        /// auto-retry watchdog considers this job eligible (Connection only —
+        /// NotFound is a phase-2 concern) and which DisplayDialog text a manual
+        /// retry shows on failure.
+        /// Master-local only; never sent over the wire.
+        /// </summary>
+        public DistributedRecorder.Master.DownloadFailureKind LastDownloadFailureKind;
+
+        /// <summary>
+        /// Number of automatic re-collection attempts made by the periodic auto-retry
+        /// watchdog for this job since it last entered <see cref="DownloadState.Failed"/>.
+        /// Reset to 0 whenever a manual retry ("再回収" / bulk) is triggered, so manual
+        /// retries are never blocked by the auto-retry cap.
+        /// Master-local only; never sent over the wire.
+        /// </summary>
+        public int AutoRetryCount;
+
+        /// <summary>
+        /// <see cref="EditorApplication.timeSinceStartup"/> at the moment this job's
+        /// download last transitioned to <see cref="DownloadState.Failed"/> (or the most
+        /// recent auto-retry attempt). Used together with <see cref="AutoRetryCount"/> to
+        /// compute the exponential-backoff due time in
+        /// <see cref="MultiTimelineRecorder.ShouldAutoRetryDownload"/>.
+        /// Master-local only; never sent over the wire.
+        /// </summary>
+        public double LastDownloadAttemptTime;
     }
 }
