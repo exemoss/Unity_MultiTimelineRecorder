@@ -28,11 +28,21 @@ namespace DistributedRecorder.Shared
     /// </summary>
     public static class GitInfo
     {
-        // Git process timeout (rev-parse is nearly instant; allow 5s for slow disks/cold start).
+        // Git process timeout for fast metadata ops (rev-parse / status / branch /
+        // ahead-count). These are nearly instant; allow 5s for slow disks/cold start.
         private static readonly TimeSpan GitTimeout = TimeSpan.FromSeconds(5);
 
-        // Longer timeout for network-involving operations (fetch).
-        private static readonly TimeSpan FetchTimeout = TimeSpan.FromSeconds(30);
+        // Network fetch can transfer a large delta over the LAN on a heavy update, so it
+        // gets a generous timeout. worker-git-sync-robustness (v1.5.3): raised 30s -> 180s
+        // — a big commit (large FBX / motion assets) legitimately takes far longer than 30s
+        // to fetch, and cutting it off surfaced as a spurious "sync failed" on the master.
+        private static readonly TimeSpan FetchTimeout = TimeSpan.FromSeconds(180);
+
+        // `git reset --hard` writes the entire changed working tree to disk; a heavy update
+        // (many/large files) can take well over the 5s metadata budget. Give it the same
+        // generous window as fetch so large checkouts complete instead of failing.
+        // worker-git-sync-robustness (v1.5.3).
+        private static readonly TimeSpan ResetTimeout = TimeSpan.FromSeconds(180);
 
         // ---------------------------------------------------------------------------
         // Commit SHA retrieval
@@ -292,7 +302,7 @@ namespace DistributedRecorder.Shared
             string remoteRef = "origin/" + branch;
             string resetStdout;
             if (!RunGit(new[] { "-C", projectRoot, "reset", "--hard", remoteRef },
-                        GitTimeout, out resetStdout, out error))
+                        ResetTimeout, out resetStdout, out error))
                 return false;
 
             // Read new HEAD after reset.
@@ -552,17 +562,35 @@ namespace DistributedRecorder.Shared
                 using var process = new Process { StartInfo = psi };
                 process.Start();
 
-                // Read stdout before WaitForExit to avoid deadlock on large stderr.
-                string stdoutResult = process.StandardOutput.ReadToEnd();
-                string stderrResult = process.StandardError.ReadToEnd();
+                // worker-git-sync-robustness (v1.5.3): drain stdout and stderr CONCURRENTLY
+                // on background threads. The previous code read stdout fully, then stderr,
+                // then WaitForExit — which (a) deadlocks when a heavy `git fetch` fills the
+                // stderr pipe buffer while we are still blocked reading stdout (git can't
+                // exit, so stdout never hits EOF), and (b) made the WaitForExit timeout a
+                // no-op because the unbounded ReadToEnd already blocked until git exited.
+                // Reading both streams on separate threads means neither pipe can fill, and
+                // WaitForExit(timeout) below is now the real, enforced bound.
+                string stdoutResult = string.Empty;
+                string stderrResult = string.Empty;
+                var readOut = System.Threading.Tasks.Task.Run(
+                    () => { stdoutResult = process.StandardOutput.ReadToEnd(); });
+                var readErr = System.Threading.Tasks.Task.Run(
+                    () => { stderrResult = process.StandardError.ReadToEnd(); });
 
-                bool exited = process.WaitForExit((int)timeout.TotalMilliseconds);
-                if (!exited)
+                if (!process.WaitForExit((int)timeout.TotalMilliseconds))
                 {
+                    // Genuine hang (network stall, huge op beyond the budget): kill so the
+                    // calling thread is never blocked forever, then let the readers observe
+                    // the closed pipes.
                     try { process.Kill(); } catch { /* best-effort */ }
-                    error = "git process timed out.";
+                    try { System.Threading.Tasks.Task.WaitAll(new[] { readOut, readErr }, 2000); } catch { /* best-effort */ }
+                    error = $"git process timed out after {timeout.TotalSeconds:0}s.";
                     return false;
                 }
+
+                // Process exited within the budget; the reader threads reach EOF and
+                // complete. Bounded join so a stuck reader can never hang the caller.
+                try { System.Threading.Tasks.Task.WaitAll(new[] { readOut, readErr }, 5000); } catch { /* best-effort */ }
 
                 if (process.ExitCode != 0)
                 {
