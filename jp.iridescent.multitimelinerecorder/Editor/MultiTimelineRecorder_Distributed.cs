@@ -1454,7 +1454,12 @@ namespace Unity.MultiTimelineRecorder
         private static readonly TimeSpan SyncRePollInterval = TimeSpan.FromSeconds(5);
         // Total time to wait for workers to converge before giving up and falling
         // through to the per-job CommitMismatch "send anyway" path.
-        private static readonly TimeSpan SyncRePollTimeout  = TimeSpan.FromSeconds(90);
+        // worker-git-sync-robustness (v1.5.3): raised 90s -> 240s. A heavy update (large
+        // FBX / motion assets) can take minutes for the Worker to fetch + reset --hard, and
+        // the old 90s window gave up while the sync was still legitimately in progress,
+        // surfacing as a spurious "not synced / send anyway". Matches the Worker's raised
+        // fetch/reset timeouts (GitInfo.FetchTimeout + ResetTimeout = up to ~180s each).
+        private static readonly TimeSpan SyncRePollTimeout  = TimeSpan.FromSeconds(240);
 
         /// <summary>
         /// Worker classification used by <see cref="RunPreFlightSyncGateAsync"/>.
