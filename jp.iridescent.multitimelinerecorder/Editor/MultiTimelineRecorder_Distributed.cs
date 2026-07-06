@@ -481,6 +481,12 @@ namespace Unity.MultiTimelineRecorder
                 // the very first batch.
                 DrawCollectDirUI();
 
+                // ── worker-git-sync (v1.4.11): "Worker を最新に同期" button ─────────
+                // Drawn here (always visible while distributed mode is on) so Workers can
+                // be synced at ANY time — it is not batch-gated. Moved out of the job list
+                // in v1.5.4 (previously it only appeared after the first dispatch).
+                DrawWorkerSyncButton();
+
                 // ── Job progress list ────────────────────────────────────────
                 if (_dispatchedJobs.Count > 0)
                 {
@@ -492,6 +498,42 @@ namespace Unity.MultiTimelineRecorder
             {
                 EditorGUILayout.EndVertical();
             }
+        }
+
+        // -----------------------------------------------------------------------
+        // worker-git-sync (v1.4.11): "Worker を最新に同期" button
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Draws the "Worker を最新に同期" button. Always-visible while distributed mode is
+        /// on (moved out of the job list in v1.5.4 so it can be pressed at any time, not
+        /// only after a batch has been dispatched). Destructive: discards each Worker's
+        /// local uncommitted changes.
+        ///   - Enabled whenever a registry with Workers is loaded (NOT batch-gated).
+        ///   - Master's own branch is fetched via GitInfo; Workers on a different branch are
+        ///     skipped to prevent accidental cross-branch sync.
+        ///   - Confirmation dialog required before execution (inside SyncWorkersToLatestAsync).
+        ///   - 404 from old Workers (&lt; v1.4.11) is handled gracefully (skip + log).
+        /// </summary>
+        private void DrawWorkerSyncButton()
+        {
+            EditorGUILayout.BeginHorizontal();
+            bool hasRegistry = _distWorkerRegistry != null
+                               && _distWorkerRegistry.workers != null
+                               && _distWorkerRegistry.workers.Count > 0;
+            GUI.enabled = hasRegistry && !_syncingWorkers;
+            if (GUILayout.Button(
+                    _syncingWorkers ? "同期中…" : "Worker を最新に同期",
+                    GUILayout.Height(22)))
+            {
+                _ = SyncWorkersToLatestAsync();
+            }
+            GUI.enabled = true;
+            if (!string.IsNullOrEmpty(_syncResultMessage))
+            {
+                EditorGUILayout.LabelField(_syncResultMessage, EditorStyles.miniLabel);
+            }
+            EditorGUILayout.EndHorizontal();
         }
 
         // -----------------------------------------------------------------------
@@ -579,34 +621,9 @@ namespace Unity.MultiTimelineRecorder
             EditorGUILayout.EndHorizontal();
             // ─────────────────────────────────────────────────────────────────
 
-            // ── worker-git-sync (v1.4.11): "Worker を最新に同期" button ─────────
-            // Destructive operation: discards Worker's local uncommitted changes.
-            // - Enabled when a registry is loaded (not batch-gated: useful before dispatch).
-            // - Master's own branch is fetched via GitInfo; Workers on a different branch
-            //   are skipped to prevent accidental cross-branch sync.
-            // - Confirmation dialog required before execution.
-            // - 404 from old Workers (< v1.4.11) is handled gracefully (skip + log).
-            EditorGUILayout.BeginHorizontal();
-            bool hasRegistry = _distWorkerRegistry != null
-                               && _distWorkerRegistry.workers != null
-                               && _distWorkerRegistry.workers.Count > 0;
-            GUI.enabled = hasRegistry && !_syncingWorkers;
-            if (GUILayout.Button(
-                    _syncingWorkers ? "同期中…" : "Worker を最新に同期",
-                    GUILayout.Height(22)))
-            {
-                _ = SyncWorkersToLatestAsync();
-            }
-            GUI.enabled = true;
-            if (!string.IsNullOrEmpty(_syncResultMessage))
-            {
-                EditorGUILayout.LabelField(_syncResultMessage, EditorStyles.miniLabel);
-            }
-            EditorGUILayout.EndHorizontal();
-            // ─────────────────────────────────────────────────────────────────
-
-            // (collect-to-dir UI moved above the job list in v1.5.1 so the collect
-            //  directory can be set before dispatch — see DrawDistributedSection.)
+            // (worker-git-sync "Worker を最新に同期" button moved above the job list in
+            //  v1.5.4 so it can be pressed at any time — see DrawWorkerSyncButton.
+            //  collect-to-dir UI likewise moved out in v1.5.1.)
 
             // ── retry-failed-collection (phase 1): bulk retry button ────────────
             // "失敗した回収を一括再試行 [N 件]" — retries every job currently in
