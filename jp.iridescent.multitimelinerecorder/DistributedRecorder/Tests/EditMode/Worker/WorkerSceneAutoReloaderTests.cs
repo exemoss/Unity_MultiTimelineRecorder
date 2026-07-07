@@ -95,4 +95,37 @@ namespace DistributedRecorder.Tests.Worker
             Assert.AreEqual("Assets/Scenes/Main.unity", result[0]);
         }
     }
+
+    /// <summary>
+    /// Hermetic EditMode tests for <see cref="WorkerSceneReloadHelper.IsSafeToCloseAndReopen"/>
+    /// (worker-git-sync-scene-modal, v1.5.5) — the pure gate deciding whether the git-sync
+    /// handler may close-and-reopen the open scenes to suppress Unity's external-change
+    /// modal. The actual close/reopen touches the live SceneManager and is covered by the
+    /// "実機検証手順", not here.
+    /// </summary>
+    [TestFixture]
+    public class WorkerSceneReloadHelperTests
+    {
+        [Test]
+        public void IsSafeToCloseAndReopen_OpenAndAllClean_IsTrue()
+        {
+            var open = new[] { "Assets/Scenes/Main.unity" };
+            Assert.IsTrue(WorkerSceneReloadHelper.IsSafeToCloseAndReopen(open, anyDirty: false));
+        }
+
+        [Test]
+        public void IsSafeToCloseAndReopen_AnyDirty_IsFalse()
+        {
+            // Never close a scene with unsaved edits — fall back and let Unity prompt.
+            var open = new[] { "Assets/Scenes/Main.unity", "Assets/Scenes/Add.unity" };
+            Assert.IsFalse(WorkerSceneReloadHelper.IsSafeToCloseAndReopen(open, anyDirty: true));
+        }
+
+        [Test]
+        public void IsSafeToCloseAndReopen_NoOpenScenes_IsFalse()
+        {
+            Assert.IsFalse(WorkerSceneReloadHelper.IsSafeToCloseAndReopen(new string[0], anyDirty: false));
+            Assert.IsFalse(WorkerSceneReloadHelper.IsSafeToCloseAndReopen(null, anyDirty: false));
+        }
+    }
 }
