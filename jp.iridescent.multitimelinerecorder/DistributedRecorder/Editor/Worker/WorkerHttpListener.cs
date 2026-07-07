@@ -839,32 +839,49 @@ namespace DistributedRecorder.Worker
                 Debug.Log(
                     $"[WorkerHttpListener] /git-sync: fetch succeeded. Running git reset --hard origin/{branch}…");
 
-                // Step C: reset --hard.
-                if (!DistributedRecorder.Shared.GitInfo.TryResetHard(
-                        capturedProjectRoot, branch,
-                        out string newHead, out string syncSummary, out string resetErr))
+                // worker-git-sync-scene-modal (v1.5.5): close any open scene BEFORE the
+                // reset so the on-disk scene change + Refresh below cannot pop Unity's
+                // blocking "The open scene(s) have been modified externally — Reload?"
+                // modal on an unattended Worker (the reactive WorkerSceneAutoReloader loses
+                // the race because the modal blocks the main thread first). Reopen after
+                // Refresh so references resolve against the freshly-imported assets. A
+                // dirty scene is left untouched (fallback), so unsaved work is never lost.
+                var scenesToReopen = WorkerSceneReloadHelper.CloseOpenScenesForSync();
+                try
                 {
-                    Debug.LogError(
-                        $"[WorkerHttpListener] /git-sync: git reset --hard origin/{branch} failed: {resetErr}");
-                    return;
+                    // Step C: reset --hard.
+                    if (!DistributedRecorder.Shared.GitInfo.TryResetHard(
+                            capturedProjectRoot, branch,
+                            out string newHead, out string syncSummary, out string resetErr))
+                    {
+                        Debug.LogError(
+                            $"[WorkerHttpListener] /git-sync: git reset --hard origin/{branch} failed: {resetErr}");
+                        return;
+                    }
+
+                    Debug.Log(
+                        $"[WorkerHttpListener] /git-sync: completed. {syncSummary}. " +
+                        "Triggering AssetDatabase.Refresh() so Unity picks up changed assets " +
+                        "(timeline/.unity/.playable files). Code changes will trigger a domain reload.");
+
+                    // sync-before-dispatch (v1.4.14): refresh the AssetDatabase so that
+                    // non-script assets changed by reset --hard (scene files, timeline assets,
+                    // RecorderConfigs, etc.) are visible to Unity before the next job is
+                    // dispatched.  Without this, Unity continues to use its cached in-memory
+                    // representation of the pre-reset assets even though the files on disk
+                    // have been replaced by the new commit.
+                    //
+                    // C# script changes still trigger the normal domain reload via the
+                    // standard compilation pipeline; Refresh() does not interfere with that.
+                    // Main-thread call: this lambda is dispatched via MainThreadDispatcher.Enqueue.
+                    AssetDatabase.Refresh();
                 }
-
-                Debug.Log(
-                    $"[WorkerHttpListener] /git-sync: completed. {syncSummary}. " +
-                    "Triggering AssetDatabase.Refresh() so Unity picks up changed assets " +
-                    "(timeline/.unity/.playable files). Code changes will trigger a domain reload.");
-
-                // sync-before-dispatch (v1.4.14): refresh the AssetDatabase so that
-                // non-script assets changed by reset --hard (scene files, timeline assets,
-                // RecorderConfigs, etc.) are visible to Unity before the next job is
-                // dispatched.  Without this, Unity continues to use its cached in-memory
-                // representation of the pre-reset assets even though the files on disk
-                // have been replaced by the new commit.
-                //
-                // C# script changes still trigger the normal domain reload via the
-                // standard compilation pipeline; Refresh() does not interfere with that.
-                // Main-thread call: this lambda is dispatched via MainThreadDispatcher.Enqueue.
-                AssetDatabase.Refresh();
+                finally
+                {
+                    // Always reopen (even if reset failed) so the Worker is never left on
+                    // the temporary empty scene we opened above.
+                    WorkerSceneReloadHelper.ReopenScenes(scenesToReopen);
+                }
             });
         }
 
