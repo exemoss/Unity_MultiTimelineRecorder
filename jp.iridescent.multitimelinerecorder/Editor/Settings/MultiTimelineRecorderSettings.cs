@@ -120,7 +120,7 @@ namespace Unity.MultiTimelineRecorder
         {
             public int timelineIndex;
             public int takeNumber;
-            
+
             public TimelineTakeNumberEntry(int index, int take)
             {
                 timelineIndex = index;
@@ -128,7 +128,25 @@ namespace Unity.MultiTimelineRecorder
             }
         }
         public List<TimelineTakeNumberEntry> timelineTakeNumbers = new List<TimelineTakeNumberEntry>();
-        
+
+        // タイムライン固有の「排他ルート」明示上書き管理
+        // Refs: mtr-batch-scene-activation 案1
+        // 既定では ControlClip の排他対象は「Directorの外側プレハブインスタンスルート」を
+        // 自動推定するが、命名/構造の例外セクション向けに明示上書きできるようにする。
+        [Serializable]
+        public class TimelineExclusiveRootEntry
+        {
+            public int timelineIndex;
+            public GameObjectReference rootOverride;
+
+            public TimelineExclusiveRootEntry(int index, GameObjectReference root)
+            {
+                timelineIndex = index;
+                rootOverride = root;
+            }
+        }
+        public List<TimelineExclusiveRootEntry> timelineExclusiveRootOverrides = new List<TimelineExclusiveRootEntry>();
+
         // シーンごとの設定管理
         [Serializable]
         public class SceneSpecificSettings
@@ -141,7 +159,8 @@ namespace Unity.MultiTimelineRecorder
             public int currentTimelineIndexForRecorder = 0;
             public List<TimelineRecorderConfigEntry> timelineRecorderConfigEntries = new List<TimelineRecorderConfigEntry>();
             public List<TimelineTakeNumberEntry> timelineTakeNumbers = new List<TimelineTakeNumberEntry>();
-            
+            public List<TimelineExclusiveRootEntry> timelineExclusiveRootOverrides = new List<TimelineExclusiveRootEntry>();
+
             public SceneSpecificSettings(string path, string name)
             {
                 scenePath = path;
@@ -280,6 +299,43 @@ namespace Unity.MultiTimelineRecorder
                 dict[entry.timelineIndex] = entry.takeNumber;
             }
             return dict;
+        }
+
+        /// <summary>
+        /// 指定Timelineの「排他ルート」明示上書きを取得する（未設定なら null）。
+        /// 呼び出し側（ControlClip生成側）は null の場合、外側プレハブインスタンス
+        /// ルートを既定値として使う。
+        /// </summary>
+        public GameObject GetTimelineExclusiveRootOverride(int timelineIndex)
+        {
+            var entry = timelineExclusiveRootOverrides.Find(e => e.timelineIndex == timelineIndex);
+            return entry?.rootOverride?.GameObject;
+        }
+
+        /// <summary>
+        /// 指定Timelineの「排他ルート」明示上書きを設定する。null を渡すとエントリを削除し
+        /// 既定推定（外側プレハブインスタンスルート）に戻す。
+        /// </summary>
+        public void SetTimelineExclusiveRootOverride(int timelineIndex, GameObject root)
+        {
+            var entry = timelineExclusiveRootOverrides.Find(e => e.timelineIndex == timelineIndex);
+            if (root == null)
+            {
+                if (entry != null)
+                {
+                    timelineExclusiveRootOverrides.Remove(entry);
+                }
+            }
+            else if (entry != null)
+            {
+                entry.rootOverride.GameObject = root;
+            }
+            else
+            {
+                var reference = new GameObjectReference { GameObject = root };
+                timelineExclusiveRootOverrides.Add(new TimelineExclusiveRootEntry(timelineIndex, reference));
+            }
+            Save();
         }
         
         /// <summary>
