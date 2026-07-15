@@ -1150,6 +1150,29 @@ namespace Unity.MultiTimelineRecorder
                     
                     EditorGUILayout.LabelField("", GUILayout.ExpandWidth(true)); // スペーサー
                     EditorGUILayout.EndHorizontal();
+
+                    // Exclusive root override (Refs: mtr-batch-scene-activation 案1)
+                    // 空欄の場合は外側プレハブインスタンスルートを自動推定して使用する。
+                    EditorGUILayout.BeginHorizontal();
+                    EditorGUILayout.LabelField("Exclusive Root", EditorStyles.miniBoldLabel, GUILayout.Width(110));
+
+                    var currentRootOverride = settings.GetTimelineExclusiveRootOverride(currentTimelineIndexForRecorder);
+                    EditorGUI.BeginChangeCheck();
+                    var newRootOverride = EditorGUILayout.ObjectField(currentRootOverride, typeof(GameObject), true) as GameObject;
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        settings.SetTimelineExclusiveRootOverride(currentTimelineIndexForRecorder, newRootOverride);
+                        Repaint();
+                        SaveSettings();
+                    }
+                    EditorGUILayout.EndHorizontal();
+
+                    // Show what will actually be used, so an empty override is not mistaken for "no exclusion".
+                    var resolvedRoot = newRootOverride != null
+                        ? newRootOverride
+                        : PrefabUtility.GetOutermostPrefabInstanceRoot(currentDirector.gameObject);
+                    string resolvedRootLabel = resolvedRoot != null ? resolvedRoot.name : currentDirector.gameObject.name;
+                    EditorGUILayout.LabelField($"(default: {resolvedRootLabel})", EditorStyles.miniLabel);
                 }
             }
             else
@@ -2037,6 +2060,29 @@ namespace Unity.MultiTimelineRecorder
                     renderingData.encoderMemoryHighWatermarkMB = encoderMemoryHighWatermarkMB;
                     renderingData.encoderMemoryResumeWatermarkMB = encoderMemoryResumeWatermarkMB;
                     renderingData.encoderMemoryPollIntervalMs = encoderMemoryPollIntervalMs;
+
+                    // 結合Timelineの「Exclusive Root Activation Track」から、このバッチに
+                    // 含まれる全セクションの排他ルートを収集する。PlayModeTimelineRenderer が
+                    // director.Play() 呼び出し前にこれらを一時的に無効化する。
+                    // Refs: mtr-batch-scene-activation 案1
+                    var exclusiveRoots = new List<GameObject>();
+                    foreach (var track in renderTimeline.GetOutputTracks())
+                    {
+                        if (track == null || track.name != ExclusiveRootActivationTrackName)
+                            continue;
+
+                        foreach (var clip in track.GetClips())
+                        {
+                            var controlAsset = clip.asset as ControlPlayableAsset;
+                            GameObject root = controlAsset != null ? controlAsset.sourceGameObject.defaultValue : null;
+                            if (root != null && !exclusiveRoots.Contains(root))
+                            {
+                                exclusiveRoots.Add(root);
+                            }
+                        }
+                    }
+                    renderingData.exclusiveRoots = exclusiveRoots;
+                    MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Collected {exclusiveRoots.Count} exclusive root(s) for this batch: {string.Join(", ", exclusiveRoots.ConvertAll(r => r.name))}");
 
                     // PlayModeTimelineRenderer GameObjectを作成
                     var rendererGO = new GameObject("[PlayModeTimelineRenderer]");
@@ -4242,7 +4288,11 @@ namespace Unity.MultiTimelineRecorder
                     new MultiTimelineRecorderSettings.TimelineTakeNumberEntry(kvp.Key, kvp.Value)
                 );
             }
-            
+
+            // 排他ルート明示上書きを保存 (Refs: mtr-batch-scene-activation)
+            sceneSettings.timelineExclusiveRootOverrides.Clear();
+            sceneSettings.timelineExclusiveRootOverrides.AddRange(settings.timelineExclusiveRootOverrides);
+
             // グローバル設定も保存
             SaveSettings();
             
@@ -4302,7 +4352,11 @@ namespace Unity.MultiTimelineRecorder
                 {
                     settings.timelineTakeNumbers.Add(entry);
                 }
-                
+
+                // 排他ルート明示上書きを復元 (Refs: mtr-batch-scene-activation)
+                settings.timelineExclusiveRootOverrides.Clear();
+                settings.timelineExclusiveRootOverrides.AddRange(sceneSettings.timelineExclusiveRootOverrides);
+
                 // インデックスの有効性を検証
                 ValidateIndices();
                 
