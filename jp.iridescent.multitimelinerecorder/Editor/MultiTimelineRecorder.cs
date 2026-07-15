@@ -237,6 +237,12 @@ namespace Unity.MultiTimelineRecorder
         public bool enableReadbackBackpressure = true;
         public int readbackDrainIntervalFrames = 1;
 
+        // Encoder input queue memory backpressure settings (RAM/OOM crash prevention)
+        public bool enableEncoderMemoryBackpressure = true;
+        public int encoderMemoryHighWatermarkMB = 2048;
+        public int encoderMemoryResumeWatermarkMB = 1024;
+        public int encoderMemoryPollIntervalMs = 500;
+
         // Debug settings
         public bool debugMode = false; // Keep generated assets for debugging
         private string lastGeneratedAssetPath = null; // Track the last generated asset
@@ -1946,6 +1952,10 @@ namespace Unity.MultiTimelineRecorder
                     int preRollFrames = EditorPrefs.GetInt("STR_PreRollFrames", 0);
                     bool enableReadbackBackpressure = EditorPrefs.GetBool("STR_EnableReadbackBackpressure", true);
                     int readbackDrainIntervalFrames = EditorPrefs.GetInt("STR_ReadbackDrainIntervalFrames", 1);
+                    bool enableEncoderMemoryBackpressure = EditorPrefs.GetBool("STR_EnableEncoderMemoryBackpressure", true);
+                    int encoderMemoryHighWatermarkMB = EditorPrefs.GetInt("STR_EncoderMemoryHighWatermarkMB", 2048);
+                    int encoderMemoryResumeWatermarkMB = EditorPrefs.GetInt("STR_EncoderMemoryResumeWatermarkMB", 1024);
+                    int encoderMemoryPollIntervalMs = EditorPrefs.GetInt("STR_EncoderMemoryPollIntervalMs", 500);
 
                     // 診断情報をログ出力
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Play Mode diagnostic info:");
@@ -1956,6 +1966,10 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.Log($"  - PreRollFrames: {preRollFrames}");
                     MultiTimelineRecorderLogger.Log($"  - EnableReadbackBackpressure: {enableReadbackBackpressure}");
                     MultiTimelineRecorderLogger.Log($"  - ReadbackDrainIntervalFrames: {readbackDrainIntervalFrames}");
+                    MultiTimelineRecorderLogger.Log($"  - EnableEncoderMemoryBackpressure: {enableEncoderMemoryBackpressure}");
+                    MultiTimelineRecorderLogger.Log($"  - EncoderMemoryHighWatermarkMB: {encoderMemoryHighWatermarkMB}");
+                    MultiTimelineRecorderLogger.Log($"  - EncoderMemoryResumeWatermarkMB: {encoderMemoryResumeWatermarkMB}");
+                    MultiTimelineRecorderLogger.Log($"  - EncoderMemoryPollIntervalMs: {encoderMemoryPollIntervalMs}");
                     
                     // Render Timelineをロード
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Attempting to load timeline from: {tempAssetPath}");
@@ -2019,7 +2033,11 @@ namespace Unity.MultiTimelineRecorder
                     renderingData.recorderType = (RecorderSettingsType)EditorPrefs.GetInt("STR_RecorderType", 0);
                     renderingData.enableReadbackBackpressure = enableReadbackBackpressure;
                     renderingData.readbackDrainIntervalFrames = readbackDrainIntervalFrames;
-                    
+                    renderingData.enableEncoderMemoryBackpressure = enableEncoderMemoryBackpressure;
+                    renderingData.encoderMemoryHighWatermarkMB = encoderMemoryHighWatermarkMB;
+                    renderingData.encoderMemoryResumeWatermarkMB = encoderMemoryResumeWatermarkMB;
+                    renderingData.encoderMemoryPollIntervalMs = encoderMemoryPollIntervalMs;
+
                     // PlayModeTimelineRenderer GameObjectを作成
                     var rendererGO = new GameObject("[PlayModeTimelineRenderer]");
                     var renderer = rendererGO.AddComponent<PlayModeTimelineRenderer>();
@@ -2569,6 +2587,51 @@ namespace Unity.MultiTimelineRecorder
             EditorGUILayout.Space(10);
             Rect readbackSeparatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
             EditorGUI.DrawRect(readbackSeparatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
+            EditorGUILayout.Space(10);
+
+            // Encoder Memory Safety Section (RAM/OOM crash prevention)
+            EditorGUILayout.LabelField("Encoder Memory Safety", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "上記のGPU側背圧だけでは、読み戻し後のフレームがエンコーダ入力キュー（プロセスRAM）に\n" +
+                "無制限に滞留し、RAM/コミット枯渇でクラッシュすることがあります。有効にすると、開始時からの\n" +
+                "メモリ増分がPause Watermarkを超えた時点でPlay Modeを一時停止し、Resume Watermarkまで\n" +
+                "下がったら自動的に再開します。",
+                EditorStyles.wordWrappedMiniLabel);
+            EditorGUILayout.Space(3);
+
+            EditorGUI.BeginChangeCheck();
+            enableEncoderMemoryBackpressure = EditorGUILayout.Toggle(
+                new GUIContent("Enable Encoder Memory Backpressure", "エンコーダ入力キュー（プロセスRAM）の無制限な滞留を防ぐため、メモリ増分が上限を超えたらPlay Modeを一時停止します（推奨: ON）"),
+                enableEncoderMemoryBackpressure);
+            if (EditorGUI.EndChangeCheck())
+            {
+                SaveSettings();
+            }
+
+            using (new EditorGUI.DisabledScope(!enableEncoderMemoryBackpressure))
+            {
+                EditorGUI.BeginChangeCheck();
+                encoderMemoryHighWatermarkMB = EditorGUILayout.IntField(
+                    new GUIContent("Pause Watermark (MB)", "レンダリング開始時からのプロセスメモリ増分がこの値(MB)を超えたらPlay Modeを一時停止します（既定: 2048）"),
+                    encoderMemoryHighWatermarkMB);
+                encoderMemoryResumeWatermarkMB = EditorGUILayout.IntField(
+                    new GUIContent("Resume Watermark (MB)", "一時停止後、メモリ増分がこの値(MB)まで下がったらPlay Modeを自動再開します（既定: 1024。Pause Watermark以下にしてください）"),
+                    encoderMemoryResumeWatermarkMB);
+                encoderMemoryPollIntervalMs = EditorGUILayout.IntField(
+                    new GUIContent("Poll Interval (ms)", "メモリ使用量を確認する間隔（ミリ秒、既定: 500）"),
+                    encoderMemoryPollIntervalMs);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    encoderMemoryHighWatermarkMB = Mathf.Max(1, encoderMemoryHighWatermarkMB);
+                    encoderMemoryResumeWatermarkMB = Mathf.Clamp(encoderMemoryResumeWatermarkMB, 0, encoderMemoryHighWatermarkMB);
+                    encoderMemoryPollIntervalMs = Mathf.Max(50, encoderMemoryPollIntervalMs);
+                    SaveSettings();
+                }
+            }
+
+            EditorGUILayout.Space(10);
+            Rect encoderMemorySeparatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
+            EditorGUI.DrawRect(encoderMemorySeparatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
             EditorGUILayout.Space(10);
 
             // Debug Tools Section
@@ -3205,6 +3268,10 @@ namespace Unity.MultiTimelineRecorder
                 EditorPrefs.SetInt("STR_PreRollFrames", preRollFrames);
                 EditorPrefs.SetBool("STR_EnableReadbackBackpressure", enableReadbackBackpressure);
                 EditorPrefs.SetInt("STR_ReadbackDrainIntervalFrames", readbackDrainIntervalFrames);
+                EditorPrefs.SetBool("STR_EnableEncoderMemoryBackpressure", enableEncoderMemoryBackpressure);
+                EditorPrefs.SetInt("STR_EncoderMemoryHighWatermarkMB", encoderMemoryHighWatermarkMB);
+                EditorPrefs.SetInt("STR_EncoderMemoryResumeWatermarkMB", encoderMemoryResumeWatermarkMB);
+                EditorPrefs.SetInt("STR_EncoderMemoryPollIntervalMs", encoderMemoryPollIntervalMs);
                 // exposedNameも保存（CreateRenderTimelineで生成されたもの）
                 if (renderTimeline != null)
                 {
@@ -3759,7 +3826,11 @@ namespace Unity.MultiTimelineRecorder
             outputResolution = settings.outputResolution;
             enableReadbackBackpressure = settings.enableReadbackBackpressure;
             readbackDrainIntervalFrames = settings.readbackDrainIntervalFrames;
-            
+            enableEncoderMemoryBackpressure = settings.enableEncoderMemoryBackpressure;
+            encoderMemoryHighWatermarkMB = settings.encoderMemoryHighWatermarkMB;
+            encoderMemoryResumeWatermarkMB = settings.encoderMemoryResumeWatermarkMB;
+            encoderMemoryPollIntervalMs = settings.encoderMemoryPollIntervalMs;
+
             selectedDirectorIndex = settings.selectedDirectorIndex;
             selectedDirectorIndices = new List<int>(settings.selectedDirectorIndices);
             
@@ -3919,7 +3990,11 @@ namespace Unity.MultiTimelineRecorder
             settings.outputResolution = outputResolution;
             settings.enableReadbackBackpressure = enableReadbackBackpressure;
             settings.readbackDrainIntervalFrames = readbackDrainIntervalFrames;
-            
+            settings.enableEncoderMemoryBackpressure = enableEncoderMemoryBackpressure;
+            settings.encoderMemoryHighWatermarkMB = encoderMemoryHighWatermarkMB;
+            settings.encoderMemoryResumeWatermarkMB = encoderMemoryResumeWatermarkMB;
+            settings.encoderMemoryPollIntervalMs = encoderMemoryPollIntervalMs;
+
             settings.selectedDirectorIndex = selectedDirectorIndex;
             settings.selectedDirectorIndices = new List<int>(selectedDirectorIndices);
             settings.timelineMarginFrames = timelineMarginFrames;

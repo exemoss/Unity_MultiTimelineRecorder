@@ -29,7 +29,18 @@ namespace Unity.MultiTimelineRecorder
         // AsyncGPUReadback.WaitAllRequests() で描画側を待たせて滞留を上限内に抑える。
         public bool enableReadbackBackpressure = true;
         public int readbackDrainIntervalFrames = 1;
-        
+
+        // エンコーダ入力キュー滞留対策（RAM/OOM クラッシュ対策）:
+        // 上記の読み戻し背圧は GPU 共有メモリ側の滞留は防ぐが、ドレインされたフレームは
+        // 下流のエンコーダ入力キュー（Unity Recorder 内部実装、プロセス RAM）へ引き渡される
+        // だけで、そちらの滞留には上限が無い（実測: 約80MB/sで無制限増加、135GB到達を確認）。
+        // レンダリング開始時からのプロセスメモリ増分がPause Watermarkを超えたらPlay Mode
+        // 自体を一時停止し、Resume Watermarkまで下がったら自動的に再開する。
+        public bool enableEncoderMemoryBackpressure = true;
+        public int encoderMemoryHighWatermarkMB = 2048;
+        public int encoderMemoryResumeWatermarkMB = 1024;
+        public int encoderMemoryPollIntervalMs = 500;
+
         // Image Recorder設定（Single Recorder Mode用）
         public UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat imageOutputFormat = UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat.PNG;
         public bool imageCaptureAlpha = false;
