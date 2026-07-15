@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.Playables;
 using UnityEngine.Timeline;
+using UnityEngine.Rendering;
 using System.Collections;
 #if UNITY_EDITOR
 using UnityEditor;
@@ -18,6 +19,10 @@ namespace Unity.MultiTimelineRecorder
         private float lastReportedProgress = -1f;
         private bool isRendering = false;
         private float renderStartTime;
+
+        // AsyncGPUReadback 滞留対策（GPU device-removed クラッシュ対策）:
+        // 直近で強制ドレインしてから経過したフレーム数
+        private int framesSinceReadbackDrain = 0;
         
         void Start()
         {
@@ -91,7 +96,9 @@ namespace Unity.MultiTimelineRecorder
         {
             if (!isRendering || director == null || renderingData == null)
                 return;
-            
+
+            ApplyReadbackBackpressure();
+
             // 進捗を計算
             double currentTime = director.time;
             double duration = renderingData.renderTimeline.duration;
@@ -135,7 +142,30 @@ namespace Unity.MultiTimelineRecorder
                 OnRenderingComplete();
             }
         }
-        
+
+        /// <summary>
+        /// GPU の描画速度がエンコーダの消費速度を大きく上回る環境（高速GPU x 4K長尺 等）では、
+        /// Recorder が発行する AsyncGPUReadback（GPU→CPU の読み戻し）のステージングバッファが
+        /// 消費されないまま際限なくシステム共有メモリに積み上がり、確保失敗から GPU デバイス
+        /// ロスト（DXGI device removed）で Unity ごとクラッシュする。
+        /// 一定フレームごとに AsyncGPUReadback.WaitAllRequests() で描画側を待たせ、未完了の
+        /// 読み戻しリクエストを都度ドレインすることで滞留を上限内に抑える。
+        /// </summary>
+        private void ApplyReadbackBackpressure()
+        {
+            if (!renderingData.enableReadbackBackpressure)
+                return;
+
+            framesSinceReadbackDrain++;
+
+            int interval = Mathf.Max(1, renderingData.readbackDrainIntervalFrames);
+            if (framesSinceReadbackDrain < interval)
+                return;
+
+            framesSinceReadbackDrain = 0;
+            AsyncGPUReadback.WaitAllRequests();
+        }
+
         private void OnRenderingComplete()
         {
             if (!isRendering)
