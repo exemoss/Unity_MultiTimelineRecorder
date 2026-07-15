@@ -232,7 +232,11 @@ namespace Unity.MultiTimelineRecorder
         public int preRollFrames = 0; // Pre-roll frames for simulation warm-up
         public string cameraTag = "MainCamera";
         public OutputResolution outputResolution = OutputResolution.HD1080p;
-        
+
+        // AsyncGPUReadback backpressure settings (GPU device-removed crash prevention)
+        public bool enableReadbackBackpressure = true;
+        public int readbackDrainIntervalFrames = 1;
+
         // Debug settings
         public bool debugMode = false; // Keep generated assets for debugging
         private string lastGeneratedAssetPath = null; // Track the last generated asset
@@ -1940,7 +1944,9 @@ namespace Unity.MultiTimelineRecorder
                     float duration = EditorPrefs.GetFloat("STR_Duration", 0f);
                     int frameRate = EditorPrefs.GetInt("STR_FrameRate", 24);
                     int preRollFrames = EditorPrefs.GetInt("STR_PreRollFrames", 0);
-                    
+                    bool enableReadbackBackpressure = EditorPrefs.GetBool("STR_EnableReadbackBackpressure", true);
+                    int readbackDrainIntervalFrames = EditorPrefs.GetInt("STR_ReadbackDrainIntervalFrames", 1);
+
                     // 診断情報をログ出力
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Play Mode diagnostic info:");
                     MultiTimelineRecorderLogger.Log($"  - DirectorName: {directorName}");
@@ -1948,6 +1954,8 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.Log($"  - Duration: {duration}");
                     MultiTimelineRecorderLogger.Log($"  - FrameRate: {frameRate}");
                     MultiTimelineRecorderLogger.Log($"  - PreRollFrames: {preRollFrames}");
+                    MultiTimelineRecorderLogger.Log($"  - EnableReadbackBackpressure: {enableReadbackBackpressure}");
+                    MultiTimelineRecorderLogger.Log($"  - ReadbackDrainIntervalFrames: {readbackDrainIntervalFrames}");
                     
                     // Render Timelineをロード
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Attempting to load timeline from: {tempAssetPath}");
@@ -2009,6 +2017,8 @@ namespace Unity.MultiTimelineRecorder
                     renderingData.frameRate = frameRate;
                     renderingData.preRollFrames = preRollFrames;
                     renderingData.recorderType = (RecorderSettingsType)EditorPrefs.GetInt("STR_RecorderType", 0);
+                    renderingData.enableReadbackBackpressure = enableReadbackBackpressure;
+                    renderingData.readbackDrainIntervalFrames = readbackDrainIntervalFrames;
                     
                     // PlayModeTimelineRenderer GameObjectを作成
                     var rendererGO = new GameObject("[PlayModeTimelineRenderer]");
@@ -2524,7 +2534,43 @@ namespace Unity.MultiTimelineRecorder
             Rect separatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
             EditorGUI.DrawRect(separatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
             EditorGUILayout.Space(10);
-            
+
+            // GPU Readback Safety Section (device-removed crash prevention)
+            EditorGUILayout.LabelField("GPU Readback Safety", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "高速GPU x 4K長尺でエンコーダの消費が描画に追いつかないと、AsyncGPUReadback の滞留から\n" +
+                "GPUデバイスロストでUnityごとクラッシュすることがあります。有効にすると一定フレームごとに\n" +
+                "描画側を待たせて滞留を抑えます。",
+                EditorStyles.wordWrappedMiniLabel);
+            EditorGUILayout.Space(3);
+
+            EditorGUI.BeginChangeCheck();
+            enableReadbackBackpressure = EditorGUILayout.Toggle(
+                new GUIContent("Enable Readback Backpressure", "AsyncGPUReadbackの滞留を防ぐため、一定フレームごとに描画側を待たせます（推奨: ON）"),
+                enableReadbackBackpressure);
+            if (EditorGUI.EndChangeCheck())
+            {
+                SaveSettings();
+            }
+
+            using (new EditorGUI.DisabledScope(!enableReadbackBackpressure))
+            {
+                EditorGUI.BeginChangeCheck();
+                readbackDrainIntervalFrames = EditorGUILayout.IntField(
+                    new GUIContent("Drain Interval (frames)", "何フレームごとに読み戻しキューを強制ドレインするか。小さいほど安全（既定: 1 = 毎フレーム）"),
+                    readbackDrainIntervalFrames);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    readbackDrainIntervalFrames = Mathf.Max(1, readbackDrainIntervalFrames);
+                    SaveSettings();
+                }
+            }
+
+            EditorGUILayout.Space(10);
+            Rect readbackSeparatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
+            EditorGUI.DrawRect(readbackSeparatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
+            EditorGUILayout.Space(10);
+
             // Debug Tools Section
             EditorGUILayout.LabelField("Debug Tools", EditorStyles.boldLabel);
             EditorGUILayout.Space(3);
@@ -3157,6 +3203,8 @@ namespace Unity.MultiTimelineRecorder
                 EditorPrefs.SetInt("STR_RecorderType", (int)firstRecorderType);
                 EditorPrefs.SetInt("STR_FrameRate", frameRate);
                 EditorPrefs.SetInt("STR_PreRollFrames", preRollFrames);
+                EditorPrefs.SetBool("STR_EnableReadbackBackpressure", enableReadbackBackpressure);
+                EditorPrefs.SetInt("STR_ReadbackDrainIntervalFrames", readbackDrainIntervalFrames);
                 // exposedNameも保存（CreateRenderTimelineで生成されたもの）
                 if (renderTimeline != null)
                 {
@@ -3709,6 +3757,8 @@ namespace Unity.MultiTimelineRecorder
             preRollFrames = settings.preRollFrames;
             cameraTag = settings.cameraTag;
             outputResolution = settings.outputResolution;
+            enableReadbackBackpressure = settings.enableReadbackBackpressure;
+            readbackDrainIntervalFrames = settings.readbackDrainIntervalFrames;
             
             selectedDirectorIndex = settings.selectedDirectorIndex;
             selectedDirectorIndices = new List<int>(settings.selectedDirectorIndices);
@@ -3867,6 +3917,8 @@ namespace Unity.MultiTimelineRecorder
             settings.preRollFrames = preRollFrames;
             settings.cameraTag = cameraTag;
             settings.outputResolution = outputResolution;
+            settings.enableReadbackBackpressure = enableReadbackBackpressure;
+            settings.readbackDrainIntervalFrames = readbackDrainIntervalFrames;
             
             settings.selectedDirectorIndex = selectedDirectorIndex;
             settings.selectedDirectorIndices = new List<int>(selectedDirectorIndices);

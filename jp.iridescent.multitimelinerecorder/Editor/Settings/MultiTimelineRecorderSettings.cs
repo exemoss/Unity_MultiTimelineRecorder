@@ -22,6 +22,13 @@ namespace Unity.MultiTimelineRecorder
         public int preRollFrames = 0;
         public string cameraTag = "MainCamera";
         public OutputResolution outputResolution = OutputResolution.HD1080p;
+
+        // AsyncGPUReadback 滞留対策（GPU device-removed クラッシュ対策）:
+        // 高速GPU x 4K長尺のようにエンコーダの消費が描画に追いつかない環境では、
+        // 読み戻し要求が無制限に積み上がりクラッシュし得るため、一定フレームごとに
+        // AsyncGPUReadback.WaitAllRequests() で描画側を待たせて滞留を上限内に抑える。
+        public bool enableReadbackBackpressure = true;
+        public int readbackDrainIntervalFrames = 1;
         
         // Image Recorder設定（Single Recorder Mode用）
         public UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat imageOutputFormat = UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat.PNG;
