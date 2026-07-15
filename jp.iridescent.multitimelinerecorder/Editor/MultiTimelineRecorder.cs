@@ -2074,7 +2074,7 @@ namespace Unity.MultiTimelineRecorder
                         foreach (var clip in track.GetClips())
                         {
                             var controlAsset = clip.asset as ControlPlayableAsset;
-                            GameObject root = controlAsset != null ? controlAsset.sourceGameObject.defaultValue : null;
+                            GameObject root = controlAsset != null ? controlAsset.sourceGameObject.defaultValue as GameObject : null;
                             if (root != null && !exclusiveRoots.Contains(root))
                             {
                                 exclusiveRoots.Add(root);
