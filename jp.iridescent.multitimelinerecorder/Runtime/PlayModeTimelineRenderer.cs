@@ -101,12 +101,47 @@ namespace Unity.MultiTimelineRecorder
             EditorPrefs.SetBool("STR_IsRenderingInProgress", true);
             #endif
             
+            // レンダリング開始前に、排他ルート（各セクションの親prefab等）をすべて一時的に
+            // 無効化しておく。ActivationControlPlayable は OnGraphStart（= director.Play()
+            // 呼び出し時）に各ルートの状態を「postPlayback=Revert時に復帰する基準状態」として
+            // 記録するため、ここで確実にOFFにしておかないと、録画開始前に手動でONだった
+            // セクションが「復帰後もON」扱いになり、他セクションの録画窓と重なって写り込む
+            // （症状「全てオンにすると別のシーンのものも出てしまう」の再発防止）。
+            DeactivateExclusiveRootsBeforePlay();
+
             // 手動でPlayを呼ぶ
             director.Play();
-            
+
             Debug.Log($"[PlayModeTimelineRenderer] Called Play() - Director state: {director.state}");
         }
         
+        /// <summary>
+        /// renderingData.exclusiveRoots に列挙された全セクションルートを一時的に無効化する。
+        /// Play Mode内での一時操作にとどまり、シーン資産へ永続書き込みはしない
+        /// （Play Mode終了時にUnityが自動的に破棄する）。
+        /// Refs: mtr-batch-scene-activation 案1
+        /// </summary>
+        private void DeactivateExclusiveRootsBeforePlay()
+        {
+            if (renderingData.exclusiveRoots == null || renderingData.exclusiveRoots.Count == 0)
+            {
+                Debug.Log("[PlayModeTimelineRenderer] No exclusive roots to deactivate before Play()");
+                return;
+            }
+
+            int deactivated = 0;
+            foreach (var root in renderingData.exclusiveRoots)
+            {
+                if (root == null)
+                    continue;
+
+                root.SetActive(false);
+                deactivated++;
+            }
+
+            Debug.Log($"[PlayModeTimelineRenderer] Deactivated {deactivated} exclusive root(s) before Play()");
+        }
+
         void Update()
         {
             if (!isRendering || director == null || renderingData == null)

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Timeline;
 using UnityEngine.Playables;
@@ -12,12 +13,19 @@ namespace Unity.MultiTimelineRecorder
         [Header("Target")]
         public string directorName;
         public TimelineAsset renderTimeline;
-        
+
         [Header("Settings")]
         public float duration;
         public int frameRate = 24;
         public int preRollFrames = 0;
         public RecorderSettingsType recorderType;
+
+        [Header("Exclusive Root Activation")]
+        // 結合レンダーTimelineの「Exclusive Root Activation Track」から収集した、
+        // 各セクションの排他ルート一覧（重複除去済み）。PlayModeTimelineRenderer が
+        // director.Play() を呼ぶ直前に、ここに列挙された全ルートを一時的に無効化する。
+        // Refs: mtr-batch-scene-activation 案1
+        public List<GameObject> exclusiveRoots = new List<GameObject>();
 
         [Header("Readback Backpressure")]
         // 高速GPU環境で描画がエンコーダの消費速度を上回ると、AsyncGPUReadback の
