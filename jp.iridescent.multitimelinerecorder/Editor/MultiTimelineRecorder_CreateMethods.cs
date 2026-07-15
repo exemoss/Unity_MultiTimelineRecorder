@@ -100,19 +100,27 @@ namespace Unity.MultiTimelineRecorder
                 }
                 
                 // Pre-rollは各Timeline毎に適用される
-                
+
+                // セクションルート（既定: 外側プレハブインスタンスルート）の排他アクティベーション窓。
+                // Pre-roll～本クリップを通しで1本の窓として扱い、ループ後にまとめて専用トラックへ書き出す。
+                // Refs: mtr-batch-scene-activation 案1
+                var exclusiveRootWindows = new List<(GameObject root, float start, float duration)>();
+
                 // Create control clips for each timeline
                 for (int i = 0; i < directors.Count; i++)
                 {
                     var director = directors[i];
                     var originalTimeline = director.playableAsset as TimelineAsset;
-                    
+
                     if (originalTimeline == null)
                     {
                         MultiTimelineRecorderLogger.LogWarning($"[MultiTimelineRecorder] Director {director.gameObject.name} has no timeline, skipping");
                         continue;
                     }
-                    
+
+                    // このセクションの排他アクティベーション窓の開始位置（Pre-roll含む）
+                    float sectionWindowStart = currentStartTime;
+
                     // SignalEmitter設定によるRecording範囲を事前に取得
                     RecordingRange? signalEmitterRange = null;
                     if (useSignalEmitterTiming)
@@ -213,12 +221,17 @@ namespace Unity.MultiTimelineRecorder
                     
                     // Set postPlayback to Revert for all recorders (FBX handling is done per-recorder)
                     controlAsset.postPlayback = ActivationControlPlayable.PostPlaybackState.Revert;
-                    
+
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Created ControlClip for {director.gameObject.name}: start={currentStartTime:F2}s, duration={controlClip.duration:F2}s");
-                    
+
+                    // このセクションの排他ルートを解決し、窓（Pre-roll開始～本クリップ終了）を記録する
+                    var exclusiveRoot = ResolveExclusiveRoot(director);
+                    float sectionWindowDuration = (currentStartTime - sectionWindowStart) + (float)controlClip.duration;
+                    exclusiveRootWindows.Add((exclusiveRoot, sectionWindowStart, sectionWindowDuration));
+
                     // Update start time for next timeline
                     currentStartTime += (float)controlClip.duration;
-                    
+
                     // Add margin if not the last timeline
                     if (i < directors.Count - 1 && timelineMarginFrames > 0)
                     {
@@ -226,7 +239,13 @@ namespace Unity.MultiTimelineRecorder
                         MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Added margin: {marginTime:F2}s");
                     }
                 }
-                
+
+                // セクションルートの排他アクティベーション専用トラックを作成する。
+                // 既存の Control Track（Director駆動用、searchHierarchy=false）とは別トラックにすることで、
+                // ルート配下に複数 PlayableDirector（例: S##_Timeline と Character_Timeline）が
+                // ネストしているセクション構成でも、Director駆動の二重化を起こさない。
+                CreateExclusiveRootActivationTrack(timeline, exclusiveRootWindows);
+
                 // Save asset
                 EditorUtility.SetDirty(timeline);
                 AssetDatabase.SaveAssets();
@@ -924,7 +943,17 @@ namespace Unity.MultiTimelineRecorder
                 
                 // Set postPlayback to Revert for all recorders (FBX handling is done per-recorder)
                 controlAsset.postPlayback = ActivationControlPlayable.PostPlaybackState.Revert;
-                
+
+                // セクションルートの排他アクティベーション専用トラックを作成する（Refs: mtr-batch-scene-activation 案1）。
+                // 単体Timelineレンダリングでもバッチと同じ排他制御をかけ、
+                // 「親prefabがOFFだと結果が出ない」症状を単体レンダリングでも解消する。
+                var exclusiveRoot = ResolveExclusiveRoot(originalDirector);
+                float sectionWindowDuration = preRollTime + (float)controlClip.duration;
+                CreateExclusiveRootActivationTrack(timeline, new List<(GameObject root, float start, float duration)>
+                {
+                    (exclusiveRoot, 0f, sectionWindowDuration)
+                });
+
                 // Important: We'll set the bindings on the PlayableDirector after creating it
                 
                 // Always use multi-recorder mode
@@ -1398,6 +1427,100 @@ namespace Unity.MultiTimelineRecorder
             }
             
             return name + " Track";
+        }
+
+        // セクションルートの排他アクティベーション専用トラックの名前。
+        // PlayModeTimelineRenderer 起動前（OnPlayModeStateChanged側）が同じ名前で
+        // トラックを探し、そこに列挙された全ルートを一時的に無効化してから Play() する。
+        // Refs: mtr-batch-scene-activation 案1
+        private const string ExclusiveRootActivationTrackName = "Exclusive Root Activation Track";
+
+        /// <summary>
+        /// このディレクターが属するセクションの「排他ルート」を解決する。
+        /// 設定アセット側に明示上書きがあればそれを優先し、無ければ最も外側のプレハブ
+        /// インスタンスルート（= セクションの親prefab、例: S05_Timeline に対する S05）を
+        /// 既定値として使う。プレハブに属さないDirectorはdirector自身を対象にし、
+        /// 従来どおり「そのオブジェクト単体のON/OFF」に留める（後方互換）。
+        /// </summary>
+        private GameObject ResolveExclusiveRoot(PlayableDirector director)
+        {
+            if (director == null)
+            {
+                return null;
+            }
+
+            int timelineIndex = recordingQueueDirectors.IndexOf(director);
+            if (timelineIndex >= 0 && settings != null)
+            {
+                var overrideRoot = settings.GetTimelineExclusiveRootOverride(timelineIndex);
+                if (overrideRoot != null)
+                {
+                    return overrideRoot;
+                }
+            }
+
+            var prefabRoot = PrefabUtility.GetOutermostPrefabInstanceRoot(director.gameObject);
+            return prefabRoot != null ? prefabRoot : director.gameObject;
+        }
+
+        /// <summary>
+        /// セクションルートを、そのセクションの再生ウィンドウ（Pre-roll～本クリップ）の間だけ
+        /// 有効化する専用の ControlTrack を作成する。
+        ///
+        /// 既存の（Director駆動用）Control Track とはあえて別トラックに分離している。
+        /// セクションルート配下には S##_Timeline と Character_Timeline のように複数の
+        /// PlayableDirector がネストして存在し、後者はS##_Timeline自身のTimeline内部の
+        /// Control Trackで既に正しく駆動されているため、もしこのトラックで
+        /// searchHierarchy=true + updateDirector=true にして両方まとめて掴んでしまうと
+        /// Character_Timeline が二重に駆動されてしまう（ネストしたControl Trackの既知の
+        /// 罠。DirectorControlPlayable.DetectOutOfSyncの「Known to happen with nested
+        /// control tracks」参照）。このトラックは updateDirector/updateParticle/
+        /// updateITimeControl を全てfalseにし、ルート自身のactive状態の切り替えのみを行う。
+        /// </summary>
+        private void CreateExclusiveRootActivationTrack(TimelineAsset timeline, List<(GameObject root, float start, float duration)> windows)
+        {
+            if (windows == null || windows.Count == 0)
+            {
+                return;
+            }
+
+            var track = timeline.CreateTrack<ControlTrack>(null, ExclusiveRootActivationTrackName);
+            if (track == null)
+            {
+                MultiTimelineRecorderLogger.LogError("[MultiTimelineRecorder] Failed to create Exclusive Root Activation Track");
+                return;
+            }
+
+            foreach (var window in windows)
+            {
+                if (window.root == null)
+                {
+                    MultiTimelineRecorderLogger.LogWarning("[MultiTimelineRecorder] Could not resolve an exclusive root for a queued timeline; that section will not be exclusively activated.");
+                    continue;
+                }
+
+                var clip = track.CreateClip<ControlPlayableAsset>();
+                if (clip == null)
+                {
+                    MultiTimelineRecorderLogger.LogError($"[MultiTimelineRecorder] Failed to create exclusive root activation clip for {window.root.name}");
+                    continue;
+                }
+
+                clip.displayName = $"{window.root.name} (Exclusive Root)";
+                clip.start = window.start;
+                clip.duration = window.duration;
+
+                var asset = clip.asset as ControlPlayableAsset;
+                asset.sourceGameObject.defaultValue = window.root;
+                asset.updateDirector = false;
+                asset.updateParticle = false;
+                asset.updateITimeControl = false;
+                asset.searchHierarchy = false;
+                asset.active = true;
+                asset.postPlayback = ActivationControlPlayable.PostPlaybackState.Revert;
+
+                MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Created exclusive root activation clip for {window.root.name}: start={window.start:F2}s, duration={window.duration:F2}s");
+            }
         }
     }
 }
