@@ -34,12 +34,18 @@ namespace Unity.MultiTimelineRecorder
         // 上記の読み戻し背圧は GPU 共有メモリ側の滞留は防ぐが、ドレインされたフレームは
         // 下流のエンコーダ入力キュー（Unity Recorder 内部実装、プロセス RAM）へ引き渡される
         // だけで、そちらの滞留には上限が無い（実測: 約80MB/sで無制限増加、135GB到達を確認）。
-        // レンダリング開始時からのプロセスメモリ増分がPause Watermarkを超えたらPlay Mode
-        // 自体を一時停止し、Resume Watermarkまで下がったら自動的に再開する。
+        // レンダリング開始時からのプロセスメモリ増分が Stall Watermark を超えたら、
+        // このTimelineのDirectorだけを一時停止し（Play Mode全体は動作継続）、
+        // Resume Watermarkまで下がったら自動的に再開する。下がらないまま
+        // Stall Timeout秒を超えたら、ハングさせず録画を安全に中断する
+        // （v1.5.13: EditorApplication.isPaused によるPlay Mode全体停止は、フレーム消費側
+        // まで止めてresume不能な恒久ハングを起こすため廃止。specs/mtr-nvenc-encoder/
+        // investigation.md イテレーション2）。
         public bool enableEncoderMemoryBackpressure = true;
         public int encoderMemoryHighWatermarkMB = 2048;
         public int encoderMemoryResumeWatermarkMB = 1024;
         public int encoderMemoryPollIntervalMs = 500;
+        public int encoderMemoryStallTimeoutSec = 120;
 
         // Image Recorder設定（Single Recorder Mode用）
         public UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat imageOutputFormat = UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat.PNG;
