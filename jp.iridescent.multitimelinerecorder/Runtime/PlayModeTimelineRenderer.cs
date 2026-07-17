@@ -287,8 +287,11 @@ namespace Unity.MultiTimelineRecorder
         /// フレーム発行を同期的に待たせて有界化する v1.5.6/NVENC 方式と同じ手段は取れない。
         /// その代わりの最終安全弁として、録画中の Movie 出力ファイル（
         /// <see cref="RenderingData.expectedOutputFilePath"/>）のサイズを一定間隔で確認し、
-        /// 「エンコーダの消費が完全に停止している」という曖昧さの無い状態（一定時間まったく
-        /// 成長していない）だけを検知する。
+        /// 「エンコーダの消費が完全に停止している」という曖昧さの無い状態（一定時間サイズが
+        /// まったく変化していない）だけを検知する。サイズの変化は増加だけでなく truncate による
+        /// 一時的な減少（同一パスへのリテイクでエンコーダが前テイクの残骸を書き換える場合等）
+        /// も進捗として扱う。増加のみを進捗とみなすと、この truncate 直後を「停滞」と誤判定し、
+        /// 健全な録画を誤って中断し得るため。
         ///
         /// 重要: これは in-flight 有界化ではない。director/Play Mode は一切止めないため、
         /// 「遅いが進んでいる」バックログ（内蔵 CoreEncoder が 4K に追いつかない場合の
@@ -330,14 +333,22 @@ namespace Unity.MultiTimelineRecorder
                 return;
             }
 
-            if (lastKnownOutputFileBytes < 0 || currentBytes > lastKnownOutputFileBytes)
+            // サイズの「変化」（増加だけでなく減少も含む）を進捗とみなす。同一パスへの
+            // リテイク（abort / 手動 Stop は Take を増やさないため、リトライは前回の
+            // 残骸ファイルと同一パスに書く）では、エンコーダ起動直後の truncate によって
+            // サイズが前テイクの残骸より一時的に減少することがある。増加のみを進捗とみなすと
+            // この truncate 後の健全な録画を「成長していない」と誤判定し、前テイクの残骸が
+            // 大きいほど誤 abort しやすくなる。truncate 自体がエンコーダが実際に動いた証拠で
+            // あり、真に停止したエンコーダはサイズが完全に不変のままなので、変化の有無で
+            // 判定しても停止の検知能力は落ちない。
+            if (lastKnownOutputFileBytes < 0 || currentBytes != lastKnownOutputFileBytes)
             {
                 lastKnownOutputFileBytes = currentBytes;
                 lastOutputGrowthRealtime = now;
                 return;
             }
 
-            // 出力ファイルが成長していない。
+            // 出力ファイルのサイズに変化がない（増加も truncate による減少も無い）。
             double stalledSec = now - lastOutputGrowthRealtime;
             int timeoutSec = Mathf.Max(1, renderingData.encoderStallTimeoutSec);
             if (stalledSec >= timeoutSec)
@@ -347,17 +358,17 @@ namespace Unity.MultiTimelineRecorder
         }
 
         /// <summary>
-        /// エンコーダ出力停滞ガードが「一定時間、出力ファイルがまったく成長していない」ことを
-        /// 検知したときに呼ぶ。エンコーダの消費が完全に停止していると判断し、Unity を
-        /// ハングさせる代わりに録画を安全に中断する。
+        /// エンコーダ出力停滞ガードが「一定時間、出力ファイルのサイズがまったく変化していない
+        /// （増加も truncate による減少も無い）」ことを検知したときに呼ぶ。エンコーダの消費が
+        /// 完全に停止していると判断し、Unity をハングさせる代わりに録画を安全に中断する。
         /// </summary>
         private void AbortRenderingDueToEncoderOutputStall(double stalledSec)
         {
             if (!isRendering)
                 return;
 
-            Debug.LogError($"[PlayModeTimelineRenderer] Encoder output stall guard: 出力ファイルが" +
-                $"{stalledSec:F0}秒間まったく成長しませんでした" +
+            Debug.LogError($"[PlayModeTimelineRenderer] Encoder output stall guard: 出力ファイルの" +
+                $"サイズが{stalledSec:F0}秒間まったく変化しませんでした" +
                 $"（{renderingData.expectedOutputFilePath}）。エンコーダの消費が完全に停止していると" +
                 "判断し、これ以上待って Unity をハングさせる代わりに録画を安全に中断します。" +
                 "ffmpegPath・NVENC 対応 GPU ドライバ・出力ディスクの空き容量を確認してください。");
