@@ -6,9 +6,6 @@ using System.Collections;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
-#if UNITY_EDITOR_WIN
-using System.Runtime.InteropServices;
-#endif
 
 namespace Unity.MultiTimelineRecorder
 {
@@ -27,24 +24,54 @@ namespace Unity.MultiTimelineRecorder
         // 直近で強制ドレインしてから経過したフレーム数
         private int framesSinceReadbackDrain = 0;
 
-        // エンコーダ入力キュー滞留対策（RAM/OOM クラッシュ対策）:
-        // レンダリング開始時のプロセスメモリを基準に、増分を監視する。
+        // v1.5.7/v1.5.10/v1.5.13-16 に存在した「エンコーダ入力キュー（プロセス RAM）の
+        // 増分監視 + director 一時停止」方式は v1.5.17 で完全に撤去した。
+        //
+        // 撤去理由（2世代にわたり実証された同型の構造的欠陥）:
+        //   - v1.5.7/v1.5.10: EditorApplication.isPaused で Play Mode 全体を一時停止 →
+        //     フレーム消費（AsyncGPUReadback の完了処理・エンコーダへの引き渡し）まで
+        //     一緒に止まり、resume が永久に来ず +77GB/45分の恒久ハング
+        //     （specs/mtr-nvenc-encoder/investigation.md イテレーション2）。
+        //   - v1.5.13-16: director だけを Pause() する producer stall に作り替えたが、
+        //     Recorder の consumer 経路（フレームのエンコーダ handoff）も同じ
+        //     Timeline/Player Loop 駆動のため、4K + 内蔵 CoreEncoder では録画開始直後
+        //     （director.time≈0）に発火し、drain せず Timeline が 0 秒で恒久的に凍結する
+        //     （specs/mtr-nvenc-encoder/investigation.md イテレーション3）。
+        // どちらも「producer を止めれば consumer も止まる」という誤りを異なる粒度
+        // （Play Mode 全体 / director 単体）で繰り返しただけであり、pause 系レバーは
+        // スコープ・閾値をどう変えても resume/drain が構造的に成立しないことが実証された。
+        //
+        // 後継方針（v1.5.17）: 「何も Pause しない」を大前提に、director/Player Loop は
+        // 常に回したまま、フレーム発行の瞬間に in-flight 数を確認し、上限超過ならその場で
+        // 同期的に処理完了を待ってから発行する方式（v1.5.6 の
+        // AsyncGPUReadback.WaitAllRequests() と同じ思想）に統一する。
+        //   - NVENC/FFmpeg 経路: MtrFFmpegEncoder.AddVideoFrame が呼ぶ
+        //     MtrFFmpegPipe.SyncFrameData() が、実測できる本物のキュー深度
+        //     （_copyQueue.Count / _pipeQueue.Count）を使って呼び出し元スレッド
+        //     （= このフレーム発行そのもの）を同期的に待たせる。待っている間、
+        //     CopyThread/PipeThread という独立した OS スレッドが実際にキューを
+        //     消費し続けるため、producer（このメソッドの呼び出し元）を待たせても
+        //     consumer は止まらず、待ちは必ず解ける（タイムアウトの安全弁つき）。
+        //     これは v1.5.13 以前から存在する、この Timeline レンダラより下位レイヤーの
+        //     真の in-flight 有界化であり、本ファイルからの追加の関与は不要。
+        //   - 内蔵 CoreEncoder 経路: 上記と同型の「本物のキュー深度」に相当する信号を
+        //     Unity Recorder が一切公開していない（IEncoder / CoreEncoder / MediaEncoder /
+        //     PooledBufferAsyncGPUReadback のいずれにも、エンコーダ内部の未処理フレーム数や
+        //     完了進捗を取得できる公開 API が存在しないことを本イテレーションでソース・
+        //     公開ドキュメント双方で確認済み）。Recorder（サードパーティ・改変禁止）を
+        //     改変しない限り、この経路だけを対象にした同等の in-flight 有界化は実装できない。
+        //     既知の残課題として明示的に残す（詳細・調査過程は
+        //     specs/mtr-nvenc-encoder/implementation.md 参照）。長尺 4K レンダリングは
+        //     NVENC 経路を推奨する（plan.md の元々の推奨と同じ）。
+        //   - 上記いずれの経路でも、GPU→CPU 読み戻し側は ApplyReadbackBackpressure()
+        //     （v1.5.6、下記）がそのまま有効に機能し続ける。
+
         #if UNITY_EDITOR
-        // 計測（TryGetPrivateBytes）が有効な値を返し監視が実際に稼働しているかどうか。
-        // 「保護ON設定なのに計測が死んでいて無防備」を二度と起こさないためのフラグ
-        // （investigation.md イテレーション3: Process.PrivateMemorySize64 が Mono 下で
-        // 常に0を返し、監視が生きたまま無害化されていたサイレント no-op が確定原因）。
-        private bool isMemoryBackpressureActive = false;
-        private long baselinePrivateBytes = -1;
-        // true の間、この Timeline の director だけを一時停止して新規フレーム発行を止めている
-        // （EditorApplication.isPaused は一切使わない。Player Loop・エンコーダのバックグラウンド
-        // スレッドは動かし続ける。investigation.md イテレーション2: Play Mode 全体を止める
-        // 旧方式は「背圧を逃がす当の処理（フレーム消費）」まで止めてしまい resume 不能で
-        // 恒久ハングすることが確定したため v1.5.13 で廃止）。
-        private bool isMemoryBackpressureStalling = false;
-        private double lastMemoryPollRealtime = -1;
-        private double stallStartRealtime = -1;
-        private double nextStallLogRealtime = -1;
+        // エンコーダ出力停滞ガード（内蔵 CoreEncoder 向けの最終安全弁。詳細は
+        // ApplyEncoderOutputStallGuard() のコメント参照）。director/Play Mode は止めない。
+        private long lastKnownOutputFileBytes = -1;
+        private double lastOutputGrowthRealtime = -1;
+        private double lastStallCheckRealtime = -1;
         #endif
 
         void Start()
@@ -66,10 +93,6 @@ namespace Unity.MultiTimelineRecorder
             Debug.Log($"[PlayModeTimelineRenderer] Found RenderingData");
             Debug.Log($"[PlayModeTimelineRenderer] Timeline: {renderingData.renderTimeline?.name ?? "NULL"}");
             Debug.Log($"[PlayModeTimelineRenderer] Duration: {renderingData.renderTimeline?.duration ?? 0}");
-
-            #if UNITY_EDITOR
-            StartEncoderMemoryBackpressureMonitoring();
-            #endif
 
             // GameObjectを作成
             var directorGO = new GameObject("RenderingDirector");
@@ -111,8 +134,18 @@ namespace Unity.MultiTimelineRecorder
             EditorPrefs.SetString("STR_Status", "Rendering started...");
             EditorPrefs.SetFloat("STR_Progress", 0f);
             EditorPrefs.SetBool("STR_IsRenderingInProgress", true);
+
+            // エンコーダ出力停滞ガードの状態をリセット
+            lastKnownOutputFileBytes = -1;
+            lastOutputGrowthRealtime = -1;
+            lastStallCheckRealtime = -1;
+            if (renderingData.enableEncoderOutputStallGuard && string.IsNullOrEmpty(renderingData.expectedOutputFilePath))
+            {
+                Debug.Log("[PlayModeTimelineRenderer] Encoder output stall guard: 出力ファイルパスを解決できなかったため、" +
+                    "このレンダリングではガードを無効化します（Movie Recorder Track が無い、または複数出力構成等）。");
+            }
             #endif
-            
+
             // レンダリング開始前に、排他ルート（各セクションの親prefab等）をすべて一時的に
             // 無効化しておく。ActivationControlPlayable は OnGraphStart（= director.Play()
             // 呼び出し時）に各ルートの状態を「postPlayback=Revert時に復帰する基準状態」として
@@ -159,23 +192,23 @@ namespace Unity.MultiTimelineRecorder
             if (!isRendering || director == null || renderingData == null)
                 return;
 
+            // GPU→CPU 読み戻しキューの同期ドレイン（v1.5.6。director/Play Mode は止めない）。
+            // エンコーダ入力キュー側の背圧（旧・director 一時停止方式）は v1.5.17 で撤去済み
+            // （経緯は本ファイル冒頭のコメント、および
+            // specs/mtr-nvenc-encoder/implementation.md 参照）。director を意図的に
+            // 一時停止させる経路が無くなったため、以下は常に director の実際の状態のみで
+            // 進捗・完了・タイムアウトを判定する。
             ApplyReadbackBackpressure();
 
-            // この Timeline の director が「エンコーダメモリ背圧によって意図的に一時停止中」か。
-            // Editor 専用の状態のため、非Editorビルドでは常に false（元の挙動のまま）。
-            bool isStallingForBackpressure = false;
             #if UNITY_EDITOR
-            ApplyEncoderMemoryBackpressure();
+            ApplyEncoderOutputStallGuard();
 
-            // ApplyEncoderMemoryBackpressure() が Stall Timeout に達して
-            // AbortRenderingDueToBackpressureTimeout() を呼んだ場合、isRendering は
-            // 既に false になっている。この場合、以降の進捗計算・EditorPrefs 更新は
-            // 中断時に設定したエラーステータス（STR_Status = "Error: ..."）を
-            // 「Rendering... XX%」で上書きしてしまうため、ここで即座に抜ける。
+            // ApplyEncoderOutputStallGuard() が停滞を検知して
+            // AbortRenderingDueToEncoderOutputStall() を呼んだ場合、isRendering は
+            // 既に false になっている。以降の進捗計算・EditorPrefs 更新が中断時に
+            // 設定したエラーステータスを上書きしないよう、ここで即座に抜ける。
             if (!isRendering)
                 return;
-
-            isStallingForBackpressure = isMemoryBackpressureStalling;
             #endif
 
             // 進捗を計算
@@ -209,18 +242,15 @@ namespace Unity.MultiTimelineRecorder
             #endif
 
             // レンダリング完了チェック
-            // 背圧で director を意図的に一時停止している間は、director.state != Playing に
-            // なるのが「録画完了」ではなく「エンコーダ待ち」であるため、誤って完了扱いに
-            // しないようガードする。
-            if (!isStallingForBackpressure && director.state != PlayState.Playing && progress >= 0.99f)
+            // v1.5.17: director を意図的に一時停止させる背圧経路は撤去済みのため、
+            // director.state は常に実際の再生状態を反映する（このガードは不要になった）。
+            if (director.state != PlayState.Playing && progress >= 0.99f)
             {
                 OnRenderingComplete();
             }
 
             // タイムアウトチェック（安全対策）
-            // 同様に、背圧で一時停止している間は Time.time が進んでも「録画が停滞している」
-            // だけであり異常なタイムアウトではないため、ここでも完了扱いにしない。
-            if (!isStallingForBackpressure && Time.time - renderStartTime > duration + 10f)
+            if (Time.time - renderStartTime > duration + 10f)
             {
                 Debug.LogWarning("[PlayModeTimelineRenderer] Rendering timeout detected");
                 OnRenderingComplete();
@@ -250,285 +280,95 @@ namespace Unity.MultiTimelineRecorder
             AsyncGPUReadback.WaitAllRequests();
         }
 
-        #if UNITY_EDITOR_WIN
-        // psapi.dll 経由でプロセスの Private Bytes（PowerShell Get-Process 等の外部計測と
-        // 同じ意味論の値）を直接取得するための P/Invoke 定義。
-        // System.Diagnostics.Process.PrivateMemorySize64 は Unity の Mono ランタイム下で
-        // 現在プロセスに対して呼ぶと常に0を返す既知の欠陥がある（investigation.md イテレーション3で
-        // クラッシュログ11セッション横断・一時停止ログ0件から確定）ため使用しない。
-        [StructLayout(LayoutKind.Sequential)]
-        private struct PROCESS_MEMORY_COUNTERS_EX
-        {
-            public uint cb;
-            public uint PageFaultCount;
-            public ulong PeakWorkingSetSize;
-            public ulong WorkingSetSize;
-            public ulong QuotaPeakPagedPoolUsage;
-            public ulong QuotaPagedPoolUsage;
-            public ulong QuotaPeakNonPagedPoolUsage;
-            public ulong QuotaNonPagedPoolUsage;
-            public ulong PagefileUsage;
-            public ulong PeakPagefileUsage;
-            public ulong PrivateUsage;
-        }
-
-        [DllImport("kernel32.dll")]
-        private static extern System.IntPtr GetCurrentProcess();
-
-        [DllImport("psapi.dll", SetLastError = true)]
-        private static extern bool GetProcessMemoryInfo(System.IntPtr hProcess, out PROCESS_MEMORY_COUNTERS_EX counters, uint size);
-        #endif
-
         #if UNITY_EDITOR
         /// <summary>
-        /// プロセスの Private Bytes 相当値を取得する（Mono 下で0を返す
-        /// Process.PrivateMemorySize64 の代替）。
-        /// Windows Editor では psapi.dll の GetProcessMemoryInfo（PROCESS_MEMORY_COUNTERS_EX.
-        /// PrivateUsage）を直接 P/Invoke で読む。それ以外（非Windows Editor、または P/Invoke
-        /// 失敗時）は Profiler.GetTotalReservedMemoryLong()（ネイティブ確保を含む予約メモリの
-        /// 近似値）にフォールバックする。取得値が0以下（計測不能）の場合は false を返し、
-        /// 呼び出し側が「サイレント無効化」ではなく明示的にエラーとして扱えるようにする。
+        /// 内蔵 CoreEncoder 経路には、エンコーダ入力キューの「未処理フレーム数」に相当する
+        /// 信号を Unity Recorder が一切公開していない（本ファイル冒頭のコメント参照）ため、
+        /// フレーム発行を同期的に待たせて有界化する v1.5.6/NVENC 方式と同じ手段は取れない。
+        /// その代わりの最終安全弁として、録画中の Movie 出力ファイル（
+        /// <see cref="RenderingData.expectedOutputFilePath"/>）のサイズを一定間隔で確認し、
+        /// 「エンコーダの消費が完全に停止している」という曖昧さの無い状態（一定時間まったく
+        /// 成長していない）だけを検知する。
+        ///
+        /// 重要: これは in-flight 有界化ではない。director/Play Mode は一切止めないため、
+        /// 「遅いが進んでいる」バックログ（内蔵 CoreEncoder が 4K に追いつかない場合の
+        /// 恒常的な RAM 増加）は防げない。あくまで「完全に詰まって進まなくなった」場合に
+        /// Unity をハングさせず安全に中断するための保険であり、恒常的な対処には NVENC 経路
+        /// への切り替えを推奨する（specs/mtr-nvenc-encoder/implementation.md 参照）。
         /// </summary>
-        private static bool TryGetPrivateBytes(out long privateBytes)
+        private void ApplyEncoderOutputStallGuard()
         {
-            #if UNITY_EDITOR_WIN
+            if (!renderingData.enableEncoderOutputStallGuard)
+                return;
+
+            if (string.IsNullOrEmpty(renderingData.expectedOutputFilePath))
+                return; // Start() で無効化済み（Movie Recorder Track が無い等）。
+
+            double now = EditorApplication.timeSinceStartup;
+            double intervalSec = Mathf.Max(0.5f, renderingData.encoderStallCheckIntervalSec);
+            if (lastStallCheckRealtime >= 0 && now - lastStallCheckRealtime < intervalSec)
+                return;
+            lastStallCheckRealtime = now;
+
+            long currentBytes;
             try
             {
-                uint size = (uint)Marshal.SizeOf(typeof(PROCESS_MEMORY_COUNTERS_EX));
-                if (GetProcessMemoryInfo(GetCurrentProcess(), out PROCESS_MEMORY_COUNTERS_EX counters, size))
+                var info = new System.IO.FileInfo(renderingData.expectedOutputFilePath);
+                if (!info.Exists)
                 {
-                    privateBytes = (long)counters.PrivateUsage;
-                    if (privateBytes > 0)
-                        return true;
+                    // まだ書き出し前（プリロール・エンコーダ初期化中等）。次回チェックまで待つ。
+                    return;
                 }
-                else
-                {
-                    Debug.LogWarning($"[PlayModeTimelineRenderer] GetProcessMemoryInfo failed (Win32 error {Marshal.GetLastWin32Error()}). Profiler計測にフォールバックします。");
-                }
+                currentBytes = info.Length;
             }
             catch (System.Exception ex)
             {
-                Debug.LogWarning($"[PlayModeTimelineRenderer] GetProcessMemoryInfo の呼び出しで例外が発生しました。Profiler計測にフォールバックします。{ex.Message}");
-            }
-            #endif
-
-            // フォールバック: Unity管理下（ネイティブ確保含む）の予約メモリ総量。
-            // エンコーダキュー（Recorder内部実装）がUnityのネイティブアロケータ配下に
-            // 無い場合は捕捉漏れの懸念があるが、「常に0」だった旧実装よりは検知できる分安全側。
-            privateBytes = UnityEngine.Profiling.Profiler.GetTotalReservedMemoryLong();
-            return privateBytes > 0;
-        }
-
-        /// <summary>
-        /// エンコーダ入力キュー滞留対策の監視を開始する。レンダリング開始時点の
-        /// プロセスメモリ（Private Bytes）を基準値として記録し、以後の増分監視に使う。
-        /// </summary>
-        private void StartEncoderMemoryBackpressureMonitoring()
-        {
-            if (renderingData == null || !renderingData.enableEncoderMemoryBackpressure)
+                // 書き込み中のファイルへの一時的なアクセス競合等は、停滞とは区別できないため
+                // 誤検知しないよう今回のチェックはスキップする（次回のチェックで再評価する）。
+                Debug.LogWarning($"[PlayModeTimelineRenderer] Encoder output stall guard: 出力ファイルサイズの取得に" +
+                    $"失敗しました（{ex.Message}）。今回のチェックをスキップします。");
                 return;
+            }
 
-            isMemoryBackpressureStalling = false;
-            lastMemoryPollRealtime = -1;
-
-            if (!TryGetPrivateBytes(out baselinePrivateBytes) || baselinePrivateBytes <= 0)
+            if (lastKnownOutputFileBytes < 0 || currentBytes > lastKnownOutputFileBytes)
             {
-                // 計測APIが0/異常値を返した場合、黙って背圧を無効化しない（旧実装の欠陥の再発防止）。
-                // 保護が実効していないことを明示し、長尺レンダリングでのRAM/OOMクラッシュに
-                // 注意を促す。
-                Debug.LogError($"[PlayModeTimelineRenderer] Encoder memory backpressure: プロセスメモリの計測に失敗しました" +
-                    $"（取得値 = {baselinePrivateBytes} bytes）。この環境ではRAM無制限成長を検知できないため、" +
-                    "エンコーダメモリ背圧は無効のまま動作します。長尺レンダリングでのRAM/OOMクラッシュに注意してください。");
-                isMemoryBackpressureActive = false;
-                baselinePrivateBytes = -1;
+                lastKnownOutputFileBytes = currentBytes;
+                lastOutputGrowthRealtime = now;
                 return;
             }
 
-            isMemoryBackpressureActive = true;
-
-            Debug.Log($"[PlayModeTimelineRenderer] Encoder memory backpressure: baseline Private Bytes = {baselinePrivateBytes / (1024 * 1024)}MB, " +
-                $"Stall/Resume watermark = +{renderingData.encoderMemoryHighWatermarkMB}MB/+{renderingData.encoderMemoryResumeWatermarkMB}MB, " +
-                $"Stall timeout = {renderingData.encoderMemoryStallTimeoutSec}s");
-
-            // v1.5.13: EditorApplication.update への購読は廃止した。この監視は
-            // PlayModeTimelineRenderer.Update() から毎フレーム直接呼び出す
-            // （ApplyEncoderMemoryBackpressure）。EditorApplication.isPaused を
-            // 使わなくなったため、Play Mode 中は MonoBehaviour.Update() が
-            // 通常どおり毎フレーム呼ばれ続け、EditorApplication.update に頼る必要がない。
-        }
-
-        /// <summary>
-        /// GPU 側の背圧（ApplyReadbackBackpressure）だけでは、読み戻し完了後のフレームが
-        /// 下流のエンコーダ入力キュー（プロセス RAM、Unity Recorder 内部実装 or MTR 自前の
-        /// FFmpeg pipe）に滞留し得る（実測: 約80MB/sで無制限増加、135GB到達を確認）。
-        /// レンダリング開始時からのプロセスメモリ増分を都度確認し、上限（High Watermark）を
-        /// 超えたら「この Timeline の PlayableDirector だけ」を Pause() して新規フレームの
-        /// 発行（RecorderClip の評価）を止める。Play Mode 全体・Player Loop・エンコーダの
-        /// バックグラウンドスレッド（FFmpeg pipe の copy/pipe スレッド、CoreEncoder 内部の
-        /// エンコードスレッド等）は動かし続けるため、実際にキューがドレインしてから
-        /// 下限（Resume Watermark、ヒステリシス）で自動的に再開できる。
-        ///
-        /// 「待っても永久に下がらない」ケース（真にエンコーダが追いつかない、計測が
-        /// アイドル churn 等のノイズに支配される等）に備え、一時停止の累計時間が
-        /// Stall Timeout を超えたら無限に待たず、録画を安全に中断する
-        /// （旧 EditorApplication.isPaused 方式が resume 不能で35分以上ハングした
-        /// 再発防止。specs/mtr-nvenc-encoder/investigation.md イテレーション2）。
-        /// </summary>
-        private void ApplyEncoderMemoryBackpressure()
-        {
-            if (!isMemoryBackpressureActive || renderingData == null)
-                return;
-
-            if (!renderingData.enableEncoderMemoryBackpressure)
-            {
-                // 実行中にトグルで無効化された場合、一時停止したままにしない
-                if (isMemoryBackpressureStalling)
-                    ResumeFromEncoderMemoryStall("Encoder memory backpressure was disabled mid-render");
-                return;
-            }
-
-            double now = EditorApplication.timeSinceStartup;
-
-            if (!isMemoryBackpressureStalling)
-            {
-                // 一時停止していない間は、計測コストを抑えるため Poll Interval で間引く。
-                double pollIntervalSec = Mathf.Max(0.05f, renderingData.encoderMemoryPollIntervalMs / 1000f);
-                if (lastMemoryPollRealtime >= 0 && now - lastMemoryPollRealtime < pollIntervalSec)
-                    return;
-            }
-            lastMemoryPollRealtime = now;
-
-            if (!TryGetPrivateBytes(out long currentPrivateBytes) || currentPrivateBytes <= 0)
-            {
-                // ここでも0/異常値をサイレントに無視しない。計測が生きている間ずっと正常値を
-                // 返してきた計測が急に死んだケースなので、明示的にエラーとして残す。
-                Debug.LogError($"[PlayModeTimelineRenderer] Encoder memory backpressure: プロセスメモリの計測が異常値" +
-                    $"（{currentPrivateBytes} bytes）を返したため、このレンダリングセッションでは監視を停止します。" +
-                    "以降RAM無制限成長を検知できません。");
-                if (isMemoryBackpressureStalling)
-                    ResumeFromEncoderMemoryStall(null, silent: true);
-                isMemoryBackpressureActive = false;
-                return;
-            }
-
-            long deltaMB = (currentPrivateBytes - baselinePrivateBytes) / (1024 * 1024);
-
-            int highWatermarkMB = Mathf.Max(1, renderingData.encoderMemoryHighWatermarkMB);
-            int resumeWatermarkMB = Mathf.Clamp(renderingData.encoderMemoryResumeWatermarkMB, 0, highWatermarkMB);
-
-            if (!isMemoryBackpressureStalling)
-            {
-                if (deltaMB >= highWatermarkMB)
-                    BeginEncoderMemoryStall(deltaMB, highWatermarkMB);
-                return;
-            }
-
-            // ここに来る時点で isMemoryBackpressureStalling == true。
-            if (deltaMB <= resumeWatermarkMB)
-            {
-                ResumeFromEncoderMemoryStall($"+{deltaMB}MB (<= {resumeWatermarkMB}MB) まで低下");
-                return;
-            }
-
-            double stalledSec = now - stallStartRealtime;
-            int timeoutSec = Mathf.Max(1, renderingData.encoderMemoryStallTimeoutSec);
+            // 出力ファイルが成長していない。
+            double stalledSec = now - lastOutputGrowthRealtime;
+            int timeoutSec = Mathf.Max(1, renderingData.encoderStallTimeoutSec);
             if (stalledSec >= timeoutSec)
             {
-                AbortRenderingDueToBackpressureTimeout(deltaMB, timeoutSec);
-                return;
-            }
-
-            if (now >= nextStallLogRealtime)
-            {
-                nextStallLogRealtime = now + 5.0;
-                Debug.LogWarning($"[PlayModeTimelineRenderer] Encoder memory backpressure: producer stall 継続中" +
-                    $"（+{deltaMB}MB、経過 {stalledSec:F1}秒 / タイムアウト {timeoutSec}秒）。" +
-                    "この Timeline の Director だけを一時停止しています（Play Mode 全体は動作中）。" +
-                    "エンコーダの消費待ちです。");
+                AbortRenderingDueToEncoderOutputStall(stalledSec);
             }
         }
 
         /// <summary>
-        /// プロセスメモリ増分が High Watermark を超えたときに呼ぶ。この Timeline の
-        /// director だけを Pause() し、明示的な GC を一度走らせて回収可能なゴミ
-        /// （フレームコピー用に大量確保された一時バッファ等）を実際に手放す機会を与える。
-        /// プロセス全体の Private Bytes は「解放可能だが OS に未返却のヒープ」を含み得る
-        /// ため、何もしなくても Resume Watermark まで下がるとは限らない
-        /// （investigation.md イテレーション2: 旧方式の一時停止中もアイドル描画churnで
-        /// delta が単調に上昇し続け、resume に一度も届かなかった事象の一因と推定）。
+        /// エンコーダ出力停滞ガードが「一定時間、出力ファイルがまったく成長していない」ことを
+        /// 検知したときに呼ぶ。エンコーダの消費が完全に停止していると判断し、Unity を
+        /// ハングさせる代わりに録画を安全に中断する。
         /// </summary>
-        private void BeginEncoderMemoryStall(long deltaMB, int highWatermarkMB)
-        {
-            isMemoryBackpressureStalling = true;
-            stallStartRealtime = EditorApplication.timeSinceStartup;
-            nextStallLogRealtime = stallStartRealtime + 5.0;
-
-            Debug.LogWarning($"[PlayModeTimelineRenderer] Encoder memory backpressure: 開始時から +{deltaMB}MB " +
-                $"(>= {highWatermarkMB}MB) 増加。エンコーダの消費が描画に追いついていないため、この Timeline の " +
-                "Director だけを一時停止して新規フレームの発行を止めます（Play Mode 全体・Player Loop・" +
-                "エンコーダのバックグラウンドスレッドは動作を継続します）。");
-
-            if (director != null)
-                director.Pause();
-
-            EditorPrefs.SetBool("STR_EncoderBackpressureStalling", true);
-
-            System.GC.Collect();
-            System.GC.WaitForPendingFinalizers();
-        }
-
-        /// <summary>
-        /// 一時停止を解除し、この Timeline の director を再開する。
-        /// </summary>
-        /// <param name="reason">再開理由（ログに残す）。null の場合はログを出さない。</param>
-        /// <param name="silent">true の場合、理由を問わずログを出さない（計測異常での強制解除など）。</param>
-        private void ResumeFromEncoderMemoryStall(string reason, bool silent = false)
-        {
-            double stalledSec = EditorApplication.timeSinceStartup - stallStartRealtime;
-            isMemoryBackpressureStalling = false;
-            EditorPrefs.SetBool("STR_EncoderBackpressureStalling", false);
-
-            if (director != null)
-                director.Play();
-
-            if (!silent && reason != null)
-            {
-                Debug.Log($"[PlayModeTimelineRenderer] Encoder memory backpressure: {reason}。" +
-                    $"producer stall {stalledSec:F1} 秒でこの Timeline の Director を再開します。");
-            }
-        }
-
-        /// <summary>
-        /// Stall Timeout を超えても Resume Watermark まで下がらない場合に呼ぶ。
-        /// エンコーダの消費が構造的に追いついていないと判断し、Unity をハングさせる
-        /// 代わりに録画を安全に中断する（旧 EditorApplication.isPaused 方式が resume
-        /// 不能で35分以上ハングした恒久ハングの再発防止。ユーザーには Console の
-        /// Debug.LogError と MTR ウィンドウのエラーステータスの両方で知らせる）。
-        /// </summary>
-        private void AbortRenderingDueToBackpressureTimeout(long deltaMB, int timeoutSec)
+        private void AbortRenderingDueToEncoderOutputStall(double stalledSec)
         {
             if (!isRendering)
                 return;
 
-            Debug.LogError($"[PlayModeTimelineRenderer] Encoder memory backpressure: producer stall が" +
-                $"タイムアウトしました（{timeoutSec}秒、+{deltaMB}MB のまま Resume Watermark " +
-                $"+{renderingData.encoderMemoryResumeWatermarkMB}MB まで下がりませんでした）。エンコーダの" +
-                "消費が構造的に追いついていないと判断し、これ以上待って Unity をハングさせる代わりに" +
-                "録画を安全に中断します。解像度を下げる/NVENCのプリセットを高速化する/出力ディスクの" +
-                "空き容量と速度を確認してください。");
+            Debug.LogError($"[PlayModeTimelineRenderer] Encoder output stall guard: 出力ファイルが" +
+                $"{stalledSec:F0}秒間まったく成長しませんでした" +
+                $"（{renderingData.expectedOutputFilePath}）。エンコーダの消費が完全に停止していると" +
+                "判断し、これ以上待って Unity をハングさせる代わりに録画を安全に中断します。" +
+                "ffmpegPath・NVENC 対応 GPU ドライバ・出力ディスクの空き容量を確認してください。");
 
             isRendering = false;
             renderingData.isComplete = false;
 
-            // 中断時は再開せず（resumeIfStalling: false）、director を明示的に Stop() する。
-            // 汎用の StopEncoderMemoryBackpressureMonitoring() は「再開してから後始末」だが、
-            // 中断はレンダリングを諦める決定なので、director.Play() で新規フレームを
-            // さらに発行させてから Play Mode を抜けるのは無駄かつ望ましくない。
-            StopEncoderMemoryBackpressureMonitoring(resumeIfStalling: false);
             if (director != null)
                 director.Stop();
 
-            EditorPrefs.SetString("STR_Status", "Error: Encoder memory backpressure timeout");
+            EditorPrefs.SetString("STR_Status", "Error: Encoder output stalled");
             EditorPrefs.SetBool("STR_IsRenderingInProgress", false);
             EditorPrefs.SetBool("STR_IsRenderingFailed", true);
 
@@ -536,29 +376,6 @@ namespace Unity.MultiTimelineRecorder
             // Play Mode を抜ける。Take Number はインクリメントしない
             // （出力が不完全なため、完了扱いにしない）。
             StartCoroutine(ExitPlayModeAfterDelay(1f, incrementTakeNumber: false));
-        }
-
-        /// <summary>
-        /// 監視を停止する。レンダリング完了時・タイムアウト中断時・破棄時いずれからも
-        /// 呼べるよう冪等に実装する。
-        /// </summary>
-        /// <param name="resumeIfStalling">
-        /// true（既定）の場合、一時停止中であればこの Timeline の director を再開してから
-        /// 後始末する（正常完了・破棄時の想定）。false の場合は director に触れず
-        /// フラグだけ後始末する（タイムアウト中断時。呼び出し側が director.Stop() で
-        /// 明示的に停止する想定）。
-        /// </param>
-        private void StopEncoderMemoryBackpressureMonitoring(bool resumeIfStalling = true)
-        {
-            if (isMemoryBackpressureStalling)
-            {
-                isMemoryBackpressureStalling = false;
-                if (resumeIfStalling && director != null)
-                    director.Play();
-            }
-
-            EditorPrefs.SetBool("STR_EncoderBackpressureStalling", false);
-            isMemoryBackpressureActive = false;
         }
         #endif
 
@@ -576,24 +393,20 @@ namespace Unity.MultiTimelineRecorder
             renderingData.progress = 1f;
 
             #if UNITY_EDITOR
-            StopEncoderMemoryBackpressureMonitoring();
-
             // 完了ステータスを設定
             EditorPrefs.SetFloat("STR_Progress", 1f);
             EditorPrefs.SetString("STR_Status", "Rendering completed");
             EditorPrefs.SetBool("STR_IsRenderingInProgress", false);
             EditorPrefs.SetBool("STR_IsRenderingComplete", true);
-            
+
             // 1秒後にPlay Mode終了とTake Numberインクリメントを実行
             StartCoroutine(ExitPlayModeAfterDelay(1f));
             #endif
         }
-        
+
         #if UNITY_EDITOR
         /// <param name="incrementTakeNumber">
         /// Take Number をインクリメントするか。録画が正常完了した場合は true（既定）。
-        /// エンコーダメモリ背圧のタイムアウト等で出力が不完全なまま中断した場合は
-        /// false を渡し、完了扱いにしない（AbortRenderingDueToBackpressureTimeout）。
         /// </param>
         private IEnumerator ExitPlayModeAfterDelay(float delay, bool incrementTakeNumber = true)
         {
@@ -622,10 +435,8 @@ namespace Unity.MultiTimelineRecorder
         void OnDestroy()
         {
             #if UNITY_EDITOR
-            // クリーンアップ（手動でのPlay Mode終了など、レンダリング未完了のまま
-            // 破棄されるケースでも監視の購読解除・一時停止解除を確実に行う）
-            StopEncoderMemoryBackpressureMonitoring();
-
+            // クリーンアップ（手動での Play Mode 終了など、レンダリング未完了のまま
+            // 破棄されるケースでもステータスの後始末を確実に行う）
             if (isRendering)
             {
                 EditorPrefs.SetBool("STR_IsRenderingInProgress", false);

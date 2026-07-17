@@ -945,12 +945,14 @@ namespace DistributedRecorder.Worker
         /// </summary>
         private void HandleHeadlessPlayback()
         {
-            // review.md イテレーション3 Blocker #1: backpressure abort
-            // (PlayModeTimelineRenderer.AbortRenderingDueToBackpressureTimeout) は
-            // STR_IsRenderingComplete を立てずに Play Mode を退出するため、下の
-            // isComplete チェックだけでは検知できない。abort から実際の Play Mode 退出
-            // までは ExitPlayModeAfterDelay の ~1秒の猶予があり、その間もこのメソッドは
-            // 毎フレーム呼ばれ続けるので、ここで真っ先にチェックする。
+            // review.md イテレーション3 Blocker #1: abort 系（v1.5.17 時点では
+            // PlayModeTimelineRenderer.AbortRenderingDueToEncoderOutputStall。旧
+            // AbortRenderingDueToBackpressureTimeout は撤去済みだが、STR_IsRenderingFailed
+            // を設定して Play Mode を退出する構造は同じ）は STR_IsRenderingComplete を
+            // 立てずに Play Mode を退出するため、下の isComplete チェックだけでは検知
+            // できない。abort から実際の Play Mode 退出までは ExitPlayModeAfterDelay の
+            // ~1秒の猶予があり、その間もこのメソッドは毎フレーム呼ばれ続けるので、
+            // ここで真っ先にチェックする。
             if (TryFailJobForBackpressureAbort())
                 return;
 
@@ -1019,9 +1021,11 @@ namespace DistributedRecorder.Worker
         }
 
         /// <summary>
-        /// <c>STR_IsRenderingFailed</c>（<c>PlayModeTimelineRenderer.
-        /// AbortRenderingDueToBackpressureTimeout</c> が中断時に設定するフラグ）が立っていたら
-        /// 消費し、backpressure 由来のメッセージでジョブを Fail させる。
+        /// <c>STR_IsRenderingFailed</c>（PlayModeTimelineRenderer が録画を安全に中断した際に
+        /// 設定するフラグ。v1.5.17 時点では <c>AbortRenderingDueToEncoderOutputStall</c>。
+        /// 旧 <c>AbortRenderingDueToBackpressureTimeout</c> は撤去済みだが、フラグの意味・
+        /// 設定タイミングの構造は同じ）が立っていたら消費し、abort 由来のメッセージで
+        /// ジョブを Fail させる。
         ///
         /// v1.5.15 (f7d22e1) はこのチェックを <see cref="HandleWaitingForEditMode"/> にのみ
         /// 置いていたが、MTR headless パスの完了検知は <c>STR_IsRenderingComplete</c> の
@@ -1248,13 +1252,15 @@ namespace DistributedRecorder.Worker
         // ------------------------------------------------------------------
 
         /// <summary>
-        /// PlayModeTimelineRenderer がエンコーダメモリ背圧のため、この Timeline の
-        /// director を意図的に一時停止中（producer stall）かどうか。
-        /// STR_EncoderBackpressureStalling は BeginEncoderMemoryStall/
-        /// ResumeFromEncoderMemoryStall/StopEncoderMemoryBackpressureMonitoring が
-        /// 更新する EditorPref（PlayModeTimelineRenderer.cs 参照）。
-        /// この状態を汎用の StallTimeoutSeconds 判定から除外し、正常なエンコーダ待ちを
-        /// 「録画が壊れて停滞している」と誤判定して FailJob しないようにする。
+        /// PlayModeTimelineRenderer が「エンコーダメモリ背圧のため、この Timeline の
+        /// director を意図的に一時停止中」かどうか。
+        /// v1.5.17 で PlayModeTimelineRenderer 側の director 一時停止方式（この EditorPref
+        /// を true にしていた BeginEncoderMemoryStall/ResumeFromEncoderMemoryStall/
+        /// StopEncoderMemoryBackpressureMonitoring）は完全に撤去した（何も Pause しない
+        /// 方針への転換。specs/mtr-nvenc-encoder/implementation.md 参照）ため、
+        /// STR_EncoderBackpressureStalling が true になることは今後無い。
+        /// 後方互換のためこのチェック自体は残す（無害な防御。将来また「director を意図的に
+        /// 一時停止する」経路が復活した場合の受け皿として）。
         /// </summary>
         private static bool IsEncoderBackpressureStalling()
         {

@@ -30,22 +30,21 @@ namespace Unity.MultiTimelineRecorder
         public bool enableReadbackBackpressure = true;
         public int readbackDrainIntervalFrames = 1;
 
-        // エンコーダ入力キュー滞留対策（RAM/OOM クラッシュ対策）:
-        // 上記の読み戻し背圧は GPU 共有メモリ側の滞留は防ぐが、ドレインされたフレームは
-        // 下流のエンコーダ入力キュー（Unity Recorder 内部実装、プロセス RAM）へ引き渡される
-        // だけで、そちらの滞留には上限が無い（実測: 約80MB/sで無制限増加、135GB到達を確認）。
-        // レンダリング開始時からのプロセスメモリ増分が Stall Watermark を超えたら、
-        // このTimelineのDirectorだけを一時停止し（Play Mode全体は動作継続）、
-        // Resume Watermarkまで下がったら自動的に再開する。下がらないまま
-        // Stall Timeout秒を超えたら、ハングさせず録画を安全に中断する
-        // （v1.5.13: EditorApplication.isPaused によるPlay Mode全体停止は、フレーム消費側
-        // まで止めてresume不能な恒久ハングを起こすため廃止。specs/mtr-nvenc-encoder/
-        // investigation.md イテレーション2）。
-        public bool enableEncoderMemoryBackpressure = true;
-        public int encoderMemoryHighWatermarkMB = 2048;
-        public int encoderMemoryResumeWatermarkMB = 1024;
-        public int encoderMemoryPollIntervalMs = 500;
-        public int encoderMemoryStallTimeoutSec = 120;
+        // v1.5.7/v1.5.10/v1.5.13-16 に存在した「エンコーダ入力キュー（プロセス RAM）の
+        // 増分監視 + director 一時停止」方式（enableEncoderMemoryBackpressure 等）は
+        // v1.5.17 で完全に撤去した。Play Mode 全体 pause・director 単体 pause のいずれも
+        // 「背圧を逃がす当のフレーム消費処理まで一緒に止めてしまい resume が来ず恒久ハング/
+        // 0秒凍結する」という同型の構造的欠陥を2世代にわたって実証したため
+        // （specs/mtr-nvenc-encoder/investigation.md イテレーション2・3）。
+        //
+        // 後継（Encoder Output Stall Guard）: 内蔵 CoreEncoder には未処理フレーム数に
+        // 相当する信号が公開されていないため、真の in-flight 有界化はできない。代わりに
+        // 録画中の Movie 出力ファイルが一定時間まったく成長していないかだけを監視する
+        // 最終安全弁。director/Play Mode は一切止めない
+        // （詳細は PlayModeTimelineRenderer.cs / specs/mtr-nvenc-encoder/implementation.md）。
+        public bool enableEncoderOutputStallGuard = true;
+        public int encoderStallCheckIntervalSec = 2;
+        public int encoderStallTimeoutSec = 120;
 
         // Image Recorder設定（Single Recorder Mode用）
         public UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat imageOutputFormat = UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat.PNG;

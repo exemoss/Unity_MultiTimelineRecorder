@@ -237,17 +237,21 @@ namespace Unity.MultiTimelineRecorder
         public bool enableReadbackBackpressure = true;
         public int readbackDrainIntervalFrames = 1;
 
-        // Encoder input queue memory backpressure settings (RAM/OOM crash prevention).
-        // v1.5.13: high watermark 到達時に止めるのは Play Mode 全体ではなく、この
-        // Timeline の director だけ（producer stall）。Player Loop・エンコーダの
-        // バックグラウンドスレッドは動作を継続する。stallTimeoutSec は、その一時停止が
-        // resume watermark まで下がらないまま続いた場合に録画を安全に中断するまでの
-        // 秒数（旧 EditorApplication.isPaused 方式の恒久ハング再発防止）。
-        public bool enableEncoderMemoryBackpressure = true;
-        public int encoderMemoryHighWatermarkMB = 2048;
-        public int encoderMemoryResumeWatermarkMB = 1024;
-        public int encoderMemoryPollIntervalMs = 500;
-        public int encoderMemoryStallTimeoutSec = 120;
+        // v1.5.7/v1.5.10/v1.5.13-16 に存在した「エンコーダ入力キュー（プロセス RAM）の
+        // 増分監視 + director 一時停止」方式（enableEncoderMemoryBackpressure 等）は
+        // v1.5.17 で完全に撤去した。Play Mode 全体 pause・director 単体 pause のいずれも
+        // 「背圧を逃がす当のフレーム消費処理まで一緒に止めてしまい resume が来ず恒久ハング/
+        // 0秒凍結する」という同型の構造的欠陥を2世代にわたって実証したため
+        // （specs/mtr-nvenc-encoder/investigation.md イテレーション2・3）。
+        //
+        // 後継（Encoder Output Stall Guard）: 内蔵 CoreEncoder には未処理フレーム数に
+        // 相当する信号が公開されていないため、真の in-flight 有界化はできない。代わりに
+        // 録画中の Movie 出力ファイルが一定時間まったく成長していないかだけを監視する
+        // 最終安全弁。director/Play Mode は一切止めない
+        // （詳細は PlayModeTimelineRenderer.cs / specs/mtr-nvenc-encoder/implementation.md）。
+        public bool enableEncoderOutputStallGuard = true;
+        public int encoderStallCheckIntervalSec = 2;
+        public int encoderStallTimeoutSec = 120;
 
         // Debug settings
         public bool debugMode = false; // Keep generated assets for debugging
@@ -1981,11 +1985,9 @@ namespace Unity.MultiTimelineRecorder
                     int preRollFrames = EditorPrefs.GetInt("STR_PreRollFrames", 0);
                     bool enableReadbackBackpressure = EditorPrefs.GetBool("STR_EnableReadbackBackpressure", true);
                     int readbackDrainIntervalFrames = EditorPrefs.GetInt("STR_ReadbackDrainIntervalFrames", 1);
-                    bool enableEncoderMemoryBackpressure = EditorPrefs.GetBool("STR_EnableEncoderMemoryBackpressure", true);
-                    int encoderMemoryHighWatermarkMB = EditorPrefs.GetInt("STR_EncoderMemoryHighWatermarkMB", 2048);
-                    int encoderMemoryResumeWatermarkMB = EditorPrefs.GetInt("STR_EncoderMemoryResumeWatermarkMB", 1024);
-                    int encoderMemoryPollIntervalMs = EditorPrefs.GetInt("STR_EncoderMemoryPollIntervalMs", 500);
-                    int encoderMemoryStallTimeoutSec = EditorPrefs.GetInt("STR_EncoderMemoryStallTimeoutSec", 120);
+                    bool enableEncoderOutputStallGuard = EditorPrefs.GetBool("STR_EnableEncoderOutputStallGuard", true);
+                    int encoderStallCheckIntervalSec = EditorPrefs.GetInt("STR_EncoderStallCheckIntervalSec", 2);
+                    int encoderStallTimeoutSec = EditorPrefs.GetInt("STR_EncoderStallTimeoutSec", 120);
 
                     // 診断情報をログ出力
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Play Mode diagnostic info:");
@@ -1996,12 +1998,10 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.Log($"  - PreRollFrames: {preRollFrames}");
                     MultiTimelineRecorderLogger.Log($"  - EnableReadbackBackpressure: {enableReadbackBackpressure}");
                     MultiTimelineRecorderLogger.Log($"  - ReadbackDrainIntervalFrames: {readbackDrainIntervalFrames}");
-                    MultiTimelineRecorderLogger.Log($"  - EnableEncoderMemoryBackpressure: {enableEncoderMemoryBackpressure}");
-                    MultiTimelineRecorderLogger.Log($"  - EncoderMemoryHighWatermarkMB: {encoderMemoryHighWatermarkMB}");
-                    MultiTimelineRecorderLogger.Log($"  - EncoderMemoryResumeWatermarkMB: {encoderMemoryResumeWatermarkMB}");
-                    MultiTimelineRecorderLogger.Log($"  - EncoderMemoryPollIntervalMs: {encoderMemoryPollIntervalMs}");
-                    MultiTimelineRecorderLogger.Log($"  - EncoderMemoryStallTimeoutSec: {encoderMemoryStallTimeoutSec}");
-                    
+                    MultiTimelineRecorderLogger.Log($"  - EnableEncoderOutputStallGuard: {enableEncoderOutputStallGuard}");
+                    MultiTimelineRecorderLogger.Log($"  - EncoderStallCheckIntervalSec: {encoderStallCheckIntervalSec}");
+                    MultiTimelineRecorderLogger.Log($"  - EncoderStallTimeoutSec: {encoderStallTimeoutSec}");
+
                     // Render Timelineをロード
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Attempting to load timeline from: {tempAssetPath}");
                     
@@ -2064,11 +2064,12 @@ namespace Unity.MultiTimelineRecorder
                     renderingData.recorderType = (RecorderSettingsType)EditorPrefs.GetInt("STR_RecorderType", 0);
                     renderingData.enableReadbackBackpressure = enableReadbackBackpressure;
                     renderingData.readbackDrainIntervalFrames = readbackDrainIntervalFrames;
-                    renderingData.enableEncoderMemoryBackpressure = enableEncoderMemoryBackpressure;
-                    renderingData.encoderMemoryHighWatermarkMB = encoderMemoryHighWatermarkMB;
-                    renderingData.encoderMemoryResumeWatermarkMB = encoderMemoryResumeWatermarkMB;
-                    renderingData.encoderMemoryPollIntervalMs = encoderMemoryPollIntervalMs;
-                    renderingData.encoderMemoryStallTimeoutSec = encoderMemoryStallTimeoutSec;
+                    renderingData.enableEncoderOutputStallGuard = enableEncoderOutputStallGuard;
+                    renderingData.encoderStallCheckIntervalSec = encoderStallCheckIntervalSec;
+                    renderingData.encoderStallTimeoutSec = encoderStallTimeoutSec;
+                    renderingData.expectedOutputFilePath = TryResolveExpectedMovieOutputPath(renderTimeline);
+                    MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Encoder output stall guard target path: " +
+                        (string.IsNullOrEmpty(renderingData.expectedOutputFilePath) ? "(unresolved — guard disabled for this render)" : renderingData.expectedOutputFilePath));
 
                     // 結合Timelineの「Exclusive Root Activation Track」から、このバッチに
                     // 含まれる全セクションの排他ルートを収集する。PlayModeTimelineRenderer が
@@ -2203,13 +2204,110 @@ namespace Unity.MultiTimelineRecorder
                 }
                 
                 CleanupRendering();
-                
+
                 // EditorPrefsのクリーンアップ
                 EditorPrefs.SetBool("STR_IsRendering", false);
             }
         }
-        
-        
+
+        /// <summary>
+        /// レンダリング対象の結合 Timeline 中から、最初の Movie Recorder Track の出力先絶対パスを
+        /// 解決する。PlayModeTimelineRenderer の Encoder Output Stall Guard（内蔵 CoreEncoder には
+        /// 未処理フレーム数に相当する信号が公開されておらず真の in-flight 有界化ができないため、
+        /// 代わりに出力ファイルの成長だけを監視する最終安全弁。詳細は
+        /// specs/mtr-nvenc-encoder/implementation.md）が使う。
+        ///
+        /// <see cref="UnityEditor.Recorder.RecorderSettings.OutputFile"/> は
+        /// <c>RecordingSession</c> が無くても解決できるワイルドカード（Scene/Recorder/Take/
+        /// Date/Project/Product）だけを自前で解決する。<c>&lt;Time&gt;</c>/<c>&lt;Frame&gt;</c>/
+        /// <c>&lt;Resolution&gt;</c> 等、セッション依存の値が必要なワイルドカードが残った場合は
+        /// 誤検知よりフェイルセーフを優先し、空文字列を返してガードを無効化させる。
+        /// 複数の Movie Recorder Track を含む結合 Timeline では最初の1つだけを対象とする
+        /// （既知の制約）。
+        /// </summary>
+        private static string TryResolveExpectedMovieOutputPath(TimelineAsset timeline)
+        {
+            // このヘルパーは「解決できなければ機能を無効化するだけ」というフェイルセーフ設計
+            // のため、いかなる例外も録画そのものを止めてはならない。想定外の例外はログに
+            // 残した上で空文字列（ガード無効化）にフォールバックする。
+            try
+            {
+                if (timeline == null)
+                    return string.Empty;
+
+                foreach (var track in timeline.GetOutputTracks())
+                {
+                    if (!(track is UnityEditor.Recorder.Timeline.RecorderTrack))
+                        continue;
+
+                    foreach (var clip in track.GetClips())
+                    {
+                        if (!(clip.asset is UnityEditor.Recorder.Timeline.RecorderClip recorderClip))
+                            continue;
+
+                        if (!(recorderClip.settings is MovieRecorderSettings movieSettings))
+                            continue;
+
+                        return ResolveMovieRecorderOutputPath(movieSettings);
+                    }
+                }
+
+                return string.Empty;
+            }
+            catch (System.Exception ex)
+            {
+                MultiTimelineRecorderLogger.LogWarning(
+                    $"[MultiTimelineRecorder] Encoder output stall guard: 出力パスの解決中に例外が発生したため、" +
+                    $"このレンダリングではガードを無効化します。{ex.Message}");
+                return string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// <paramref name="movieSettings"/>.OutputFile（ワイルドカードを含み得るテンプレート。
+        /// 拡張子は含まない）を、セッション非依存で解決できる範囲のワイルドカードだけ解決して
+        /// 拡張子を付与した絶対パスへ変換する。解決できないワイルドカードが残る場合は
+        /// 空文字列を返す。
+        /// </summary>
+        private static string ResolveMovieRecorderOutputPath(MovieRecorderSettings movieSettings)
+        {
+            string template = movieSettings.OutputFile;
+            if (string.IsNullOrEmpty(template))
+                return string.Empty;
+
+            string resolved = template
+                .Replace("<Scene>", SceneManager.GetActiveScene().name)
+                .Replace("<Recorder>", movieSettings.name)
+                .Replace("<Take>", movieSettings.Take.ToString("000"))
+                .Replace("<Date>", System.DateTime.Now.ToString("yyyy-MM-dd"))
+                .Replace("<Project>", PlayerSettings.productName)
+                .Replace("<Product>", PlayerSettings.productName);
+
+            if (resolved.Contains("<"))
+            {
+                // <Time>/<Frame>/<Resolution> 等、セッション依存で自前解決できないワイルドカードが
+                // 残っている。誤検知よりフェイルセーフを優先し、ガードを無効化させる。
+                return string.Empty;
+            }
+
+            string ext = GetMovieOutputExtension(movieSettings.OutputFormat);
+            if (!string.IsNullOrEmpty(ext) && !resolved.EndsWith(ext, System.StringComparison.OrdinalIgnoreCase))
+                resolved += ext;
+
+            return PathUtility.GetAbsolutePath(resolved);
+        }
+
+        private static string GetMovieOutputExtension(MovieRecorderSettings.VideoRecorderOutputFormat format)
+        {
+            switch (format)
+            {
+                case MovieRecorderSettings.VideoRecorderOutputFormat.MP4: return ".mp4";
+                case MovieRecorderSettings.VideoRecorderOutputFormat.WebM: return ".webm";
+                case MovieRecorderSettings.VideoRecorderOutputFormat.MOV: return ".mov";
+                default: return string.Empty;
+            }
+        }
+
         /// <summary>
         /// Creates recorder editor for specific recorder type with given host
         /// </summary>
@@ -2644,55 +2742,49 @@ namespace Unity.MultiTimelineRecorder
             EditorGUI.DrawRect(readbackSeparatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
             EditorGUILayout.Space(10);
 
-            // Encoder Memory Safety Section (RAM/OOM crash prevention)
-            EditorGUILayout.LabelField("Encoder Memory Safety", EditorStyles.boldLabel);
+            // Encoder Output Stall Guard Section
+            // v1.5.7/v1.5.10/v1.5.13-16 の「エンコーダ入力キュー(プロセスRAM)監視 + director
+            // 一時停止」方式は v1.5.17 で完全に撤去した（何もPauseしないという方針への転換。
+            // 詳細は specs/mtr-nvenc-encoder/implementation.md）。
+            EditorGUILayout.LabelField("Encoder Output Stall Guard", EditorStyles.boldLabel);
             EditorGUILayout.LabelField(
-                "上記のGPU側背圧だけでは、読み戻し後のフレームがエンコーダ入力キュー（プロセスRAM）に\n" +
-                "無制限に滞留し、RAM/コミット枯渇でクラッシュすることがあります。有効にすると、開始時からの\n" +
-                "メモリ増分がStall Watermarkを超えた時点で「このTimelineのDirectorだけ」を一時停止し、\n" +
-                "新規フレーム発行を止めます（Play Mode全体・エンコーダのバックグラウンド処理は動作を継続）。\n" +
-                "Resume Watermarkまで下がったら自動的に再開します。下がらないままStall Timeoutを超えたら、\n" +
-                "ハングさせず録画を安全に中断します。",
+                "内蔵CoreEncoderには未処理フレーム数に相当する信号が公開されていないため、真の\n" +
+                "in-flight有界化（発行を待たせて詰まりを解消する）はできません。代わりに、録画中の\n" +
+                "Movie出力ファイルが一定時間まったく成長していないかだけを監視します。director/Play\n" +
+                "Modeは一切止めません。「遅いが進んでいる」バックログの有界化はできないため、内蔵\n" +
+                "CoreEncoder + 4K長尺は引き続きNVENC経路を推奨します。",
                 EditorStyles.wordWrappedMiniLabel);
             EditorGUILayout.Space(3);
 
             EditorGUI.BeginChangeCheck();
-            enableEncoderMemoryBackpressure = EditorGUILayout.Toggle(
-                new GUIContent("Enable Encoder Memory Backpressure", "エンコーダ入力キュー（プロセスRAM）の無制限な滞留を防ぐため、メモリ増分が上限を超えたらこのTimelineのDirectorだけを一時停止します（推奨: ON。Play Mode全体は止めません）"),
-                enableEncoderMemoryBackpressure);
+            enableEncoderOutputStallGuard = EditorGUILayout.Toggle(
+                new GUIContent("Enable Encoder Output Stall Guard", "録画中のMovie出力ファイルが完全に成長を止めていないかを監視し、停止していれば録画を安全に中断します（推奨: ON。director/Play Modeは止めません）"),
+                enableEncoderOutputStallGuard);
             if (EditorGUI.EndChangeCheck())
             {
                 SaveSettings();
             }
 
-            using (new EditorGUI.DisabledScope(!enableEncoderMemoryBackpressure))
+            using (new EditorGUI.DisabledScope(!enableEncoderOutputStallGuard))
             {
                 EditorGUI.BeginChangeCheck();
-                encoderMemoryHighWatermarkMB = EditorGUILayout.IntField(
-                    new GUIContent("Stall Watermark (MB)", "レンダリング開始時からのプロセスメモリ増分がこの値(MB)を超えたら、このTimelineのDirectorだけを一時停止します（既定: 2048）"),
-                    encoderMemoryHighWatermarkMB);
-                encoderMemoryResumeWatermarkMB = EditorGUILayout.IntField(
-                    new GUIContent("Resume Watermark (MB)", "一時停止後、メモリ増分がこの値(MB)まで下がったらDirectorを自動再開します（既定: 1024。Stall Watermark以下にしてください）"),
-                    encoderMemoryResumeWatermarkMB);
-                encoderMemoryPollIntervalMs = EditorGUILayout.IntField(
-                    new GUIContent("Poll Interval (ms)", "メモリ使用量を確認する間隔（ミリ秒、既定: 500）"),
-                    encoderMemoryPollIntervalMs);
-                encoderMemoryStallTimeoutSec = EditorGUILayout.IntField(
-                    new GUIContent("Stall Timeout (sec)", "一時停止がResume Watermarkまで下がらないまま続いた場合に、ハングさせず録画を安全に中断するまでの秒数（既定: 120）"),
-                    encoderMemoryStallTimeoutSec);
+                encoderStallCheckIntervalSec = EditorGUILayout.IntField(
+                    new GUIContent("Check Interval (sec)", "出力ファイルサイズを確認する間隔（秒、既定: 2）"),
+                    encoderStallCheckIntervalSec);
+                encoderStallTimeoutSec = EditorGUILayout.IntField(
+                    new GUIContent("Stall Timeout (sec)", "出力ファイルがこの秒数まったく成長しなかった場合、ハングさせず録画を安全に中断します（既定: 120）"),
+                    encoderStallTimeoutSec);
                 if (EditorGUI.EndChangeCheck())
                 {
-                    encoderMemoryHighWatermarkMB = Mathf.Max(1, encoderMemoryHighWatermarkMB);
-                    encoderMemoryResumeWatermarkMB = Mathf.Clamp(encoderMemoryResumeWatermarkMB, 0, encoderMemoryHighWatermarkMB);
-                    encoderMemoryPollIntervalMs = Mathf.Max(50, encoderMemoryPollIntervalMs);
-                    encoderMemoryStallTimeoutSec = Mathf.Max(1, encoderMemoryStallTimeoutSec);
+                    encoderStallCheckIntervalSec = Mathf.Max(1, encoderStallCheckIntervalSec);
+                    encoderStallTimeoutSec = Mathf.Max(1, encoderStallTimeoutSec);
                     SaveSettings();
                 }
             }
 
             EditorGUILayout.Space(10);
-            Rect encoderMemorySeparatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
-            EditorGUI.DrawRect(encoderMemorySeparatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
+            Rect encoderStallGuardSeparatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
+            EditorGUI.DrawRect(encoderStallGuardSeparatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
             EditorGUILayout.Space(10);
 
             // Debug Tools Section
@@ -2995,11 +3087,12 @@ namespace Unity.MultiTimelineRecorder
                 }
                 else if (EditorPrefs.GetBool("STR_IsRenderingFailed", false))
                 {
-                    // PlayModeTimelineRenderer.AbortRenderingDueToBackpressureTimeout が
-                    // 設定するフラグ。エンコーダメモリ背圧のタイムアウトで録画が不完全なまま
-                    // 中断された場合、Complete扱いにせずエラーとしてユーザーに明示する。
+                    // PlayModeTimelineRenderer が録画を安全に中断した際に設定するフラグ
+                    // （v1.5.17 時点では AbortRenderingDueToEncoderOutputStall。旧
+                    // AbortRenderingDueToBackpressureTimeout は撤去済み）。録画が不完全な
+                    // まま中断された場合、Complete扱いにせずエラーとしてユーザーに明示する。
                     currentState = RecordState.Error;
-                    statusMessage = EditorPrefs.GetString("STR_Status", "Recording failed (encoder backpressure timeout)");
+                    statusMessage = EditorPrefs.GetString("STR_Status", "Recording failed (encoder output stalled)");
                     EditorPrefs.DeleteKey("STR_IsRenderingFailed");
                 }
 
@@ -3344,11 +3437,9 @@ namespace Unity.MultiTimelineRecorder
                 EditorPrefs.SetInt("STR_PreRollFrames", preRollFrames);
                 EditorPrefs.SetBool("STR_EnableReadbackBackpressure", enableReadbackBackpressure);
                 EditorPrefs.SetInt("STR_ReadbackDrainIntervalFrames", readbackDrainIntervalFrames);
-                EditorPrefs.SetBool("STR_EnableEncoderMemoryBackpressure", enableEncoderMemoryBackpressure);
-                EditorPrefs.SetInt("STR_EncoderMemoryHighWatermarkMB", encoderMemoryHighWatermarkMB);
-                EditorPrefs.SetInt("STR_EncoderMemoryResumeWatermarkMB", encoderMemoryResumeWatermarkMB);
-                EditorPrefs.SetInt("STR_EncoderMemoryPollIntervalMs", encoderMemoryPollIntervalMs);
-                EditorPrefs.SetInt("STR_EncoderMemoryStallTimeoutSec", encoderMemoryStallTimeoutSec);
+                EditorPrefs.SetBool("STR_EnableEncoderOutputStallGuard", enableEncoderOutputStallGuard);
+                EditorPrefs.SetInt("STR_EncoderStallCheckIntervalSec", encoderStallCheckIntervalSec);
+                EditorPrefs.SetInt("STR_EncoderStallTimeoutSec", encoderStallTimeoutSec);
                 // exposedNameも保存（CreateRenderTimelineで生成されたもの）
                 if (renderTimeline != null)
                 {
@@ -3941,11 +4032,9 @@ namespace Unity.MultiTimelineRecorder
             outputResolution = settings.outputResolution;
             enableReadbackBackpressure = settings.enableReadbackBackpressure;
             readbackDrainIntervalFrames = settings.readbackDrainIntervalFrames;
-            enableEncoderMemoryBackpressure = settings.enableEncoderMemoryBackpressure;
-            encoderMemoryHighWatermarkMB = settings.encoderMemoryHighWatermarkMB;
-            encoderMemoryResumeWatermarkMB = settings.encoderMemoryResumeWatermarkMB;
-            encoderMemoryPollIntervalMs = settings.encoderMemoryPollIntervalMs;
-            encoderMemoryStallTimeoutSec = settings.encoderMemoryStallTimeoutSec;
+            enableEncoderOutputStallGuard = settings.enableEncoderOutputStallGuard;
+            encoderStallCheckIntervalSec = settings.encoderStallCheckIntervalSec;
+            encoderStallTimeoutSec = settings.encoderStallTimeoutSec;
 
             selectedDirectorIndex = settings.selectedDirectorIndex;
             selectedDirectorIndices = new List<int>(settings.selectedDirectorIndices);
@@ -4106,11 +4195,9 @@ namespace Unity.MultiTimelineRecorder
             settings.outputResolution = outputResolution;
             settings.enableReadbackBackpressure = enableReadbackBackpressure;
             settings.readbackDrainIntervalFrames = readbackDrainIntervalFrames;
-            settings.enableEncoderMemoryBackpressure = enableEncoderMemoryBackpressure;
-            settings.encoderMemoryHighWatermarkMB = encoderMemoryHighWatermarkMB;
-            settings.encoderMemoryResumeWatermarkMB = encoderMemoryResumeWatermarkMB;
-            settings.encoderMemoryPollIntervalMs = encoderMemoryPollIntervalMs;
-            settings.encoderMemoryStallTimeoutSec = encoderMemoryStallTimeoutSec;
+            settings.enableEncoderOutputStallGuard = enableEncoderOutputStallGuard;
+            settings.encoderStallCheckIntervalSec = encoderStallCheckIntervalSec;
+            settings.encoderStallTimeoutSec = encoderStallTimeoutSec;
 
             settings.selectedDirectorIndex = selectedDirectorIndex;
             settings.selectedDirectorIndices = new List<int>(selectedDirectorIndices);
