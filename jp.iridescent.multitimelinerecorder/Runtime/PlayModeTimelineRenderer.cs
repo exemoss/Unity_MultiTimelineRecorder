@@ -166,6 +166,15 @@ namespace Unity.MultiTimelineRecorder
             bool isStallingForBackpressure = false;
             #if UNITY_EDITOR
             ApplyEncoderMemoryBackpressure();
+
+            // ApplyEncoderMemoryBackpressure() が Stall Timeout に達して
+            // AbortRenderingDueToBackpressureTimeout() を呼んだ場合、isRendering は
+            // 既に false になっている。この場合、以降の進捗計算・EditorPrefs 更新は
+            // 中断時に設定したエラーステータス（STR_Status = "Error: ..."）を
+            // 「Rendering... XX%」で上書きしてしまうため、ここで即座に抜ける。
+            if (!isRendering)
+                return;
+
             isStallingForBackpressure = isMemoryBackpressureStalling;
             #endif
 
