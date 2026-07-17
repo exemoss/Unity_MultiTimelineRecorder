@@ -1,7 +1,9 @@
 using System;
+using System.IO;
 using UnityEngine;
 using UnityEditor.Recorder;
 using UnityEditor.Recorder.Input;
+using Unity.MultiTimelineRecorder.Encoders;
 
 namespace Unity.MultiTimelineRecorder
 {
@@ -13,6 +15,19 @@ namespace Unity.MultiTimelineRecorder
         High,
         Custom
     }
+
+    /// <summary>
+    /// Movie 出力のエンコーダ種別。既定は内蔵 CoreEncoder(Media Foundation ソフトウェア H.264)で
+    /// 後方互換を保つ。FFmpeg 系は NVIDIA GPU の NVENC を使ったハードウェアエンコードで、
+    /// 事前に ffmpeg.exe の導入(ffmpegPath の明示指定)が必要(specs/mtr-nvenc-encoder/plan.md 案1)。
+    /// </summary>
+    public enum MovieEncoderType
+    {
+        CoreEncoder,
+        FFmpegNvencH264,
+        FFmpegNvencHevc,
+    }
+
     /// <summary>
     /// Configuration class for MovieRecorderSettings
     /// </summary>
@@ -22,9 +37,22 @@ namespace Unity.MultiTimelineRecorder
         // Video settings
         public MovieRecorderSettings.VideoRecorderOutputFormat outputFormat = MovieRecorderSettings.VideoRecorderOutputFormat.MP4;
         public VideoBitrateMode videoBitrateMode = VideoBitrateMode.High;
-        
+
         // Custom bitrate settings (when using Low mode)
         public int customBitrate = 15000; // in kbps
+
+        [Header("エンコーダ")]
+        [Tooltip("既定は内蔵エンコーダ(Media Foundation, ソフトウェア H.264)。NVENC はNVIDIA GPUのハードウェアエンコードで高速だが、事前に各マシンへ ffmpeg.exe の導入が必要。")]
+        public MovieEncoderType encoderType = MovieEncoderType.CoreEncoder;
+
+        [Tooltip("ffmpeg.exe への絶対パス。FFmpeg NVENC 系エンコーダ選択時のみ使用。リポジトリには同梱しないため、各マシンで導入したパスを明示指定すること。")]
+        public string ffmpegPath = string.Empty;
+
+        [Tooltip("NVENC の固定量子化パラメータ(QP)。値が小さいほど高画質・大容量(目安 0-51、既定24)。目標ビットレートが0より大きい場合はビットレート指定が優先され、この値は無視される。")]
+        public int ffmpegQp = 24;
+
+        [Tooltip("NVENC の目標ビットレート(kbps)。0の場合はQP固定モード(ffmpegQp)を使用する。0より大きい場合は可変ビットレートモードに切り替わる。")]
+        public int ffmpegTargetBitrateKbps = 0;
         
         // Resolution settings
         public int width = 1920;
@@ -111,10 +139,30 @@ namespace Unity.MultiTimelineRecorder
             
             // Alpha channel
             settings.CaptureAlpha = captureAlpha;
-            
+
             // Common settings
             settings.RecordMode = RecordMode.Manual;
             settings.FrameRatePlayback = FrameRatePlayback.Constant;
+
+            // NVENC (FFmpeg) エンコーダの適用。
+            // 重要: 必ず `settings.OutputFormat = outputFormat;` (このメソッド冒頭)より後に行うこと。
+            // MovieRecorderSettings.OutputFormat の setter は「EncoderSettings が
+            // CoreEncoderSettings か既定の ProResEncoderSettings でなければ例外を投げる」という
+            // ガードを持つ(Recorder 5.1.6 の obsolete API 実装)。ここで EncoderSettings に
+            // カスタムエンコーダを代入するのは OutputFormat のガードを経由しない直接代入なので、
+            // 必ず OutputFormat の設定が先、EncoderSettings の上書きが後でなければならない。
+            if (encoderType != MovieEncoderType.CoreEncoder)
+            {
+                settings.EncoderSettings = new MtrFFmpegEncoderSettings
+                {
+                    Format = encoderType == MovieEncoderType.FFmpegNvencHevc
+                        ? MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc
+                        : MtrFFmpegEncoderSettings.OutputFormat.H264Nvenc,
+                    FfmpegPath = ffmpegPath,
+                    Qp = ffmpegQp,
+                    BitrateKbps = ffmpegTargetBitrateKbps,
+                };
+            }
         }
         
         /// <summary>
@@ -180,7 +228,44 @@ namespace Unity.MultiTimelineRecorder
                     return false;
                 }
             }
-            
+
+            // FFmpeg NVENC エンコーダのバリデーション(specs/mtr-nvenc-encoder)。
+            // File.Exists の実チェックはここで早期に行い、MTR 側のログでユーザーに可視化する
+            // (Recorder 自体の IEncoderSettings.ValidateRecording でも録画開始時に同じチェックが
+            // 走るが、こちらは設定編集時点で早期に気付けるようにするためのもの)。
+            if (encoderType != MovieEncoderType.CoreEncoder)
+            {
+                if (outputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
+                {
+                    errorMessage = "FFmpeg NVENC エンコーダは MP4 コンテナのみ対応しています。Video Format を MP4 に設定してください。";
+                    return false;
+                }
+
+                if (string.IsNullOrEmpty(ffmpegPath))
+                {
+                    errorMessage = "FFmpeg NVENC エンコーダを選択した場合は ffmpeg.exe のパスを指定してください。";
+                    return false;
+                }
+
+                if (!File.Exists(ffmpegPath))
+                {
+                    errorMessage = $"ffmpeg.exe が見つかりません: {ffmpegPath}";
+                    return false;
+                }
+
+                if (ffmpegQp < 0 || ffmpegQp > 51)
+                {
+                    errorMessage = "FFmpeg QP は 0〜51 の範囲で指定してください。";
+                    return false;
+                }
+
+                if (ffmpegTargetBitrateKbps < 0)
+                {
+                    errorMessage = "FFmpeg 目標ビットレートは 0 以上を指定してください。";
+                    return false;
+                }
+            }
+
             return true;
         }
         
@@ -263,7 +348,11 @@ namespace Unity.MultiTimelineRecorder
                 captureAlpha = this.captureAlpha,
                 flipVertical = this.flipVertical,
                 sourceType = this.sourceType,
-                renderTexture = this.renderTexture
+                renderTexture = this.renderTexture,
+                encoderType = this.encoderType,
+                ffmpegPath = this.ffmpegPath,
+                ffmpegQp = this.ffmpegQp,
+                ffmpegTargetBitrateKbps = this.ffmpegTargetBitrateKbps
             };
             
             // Camera参照の深いコピー
