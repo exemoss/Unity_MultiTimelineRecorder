@@ -8,9 +8,12 @@
 //     (original sample bug: FFmpegPipe.cs SyncFrameData only checked
 //     _cancellationToken, which is only set by CloseAndGetOutput()).
 //   - The audio PushFrameData(NativeArray<float>) overload no longer uses
-//     `unsafe`/pointer copies; it uses NativeArray<T>.Reinterpret<byte>() +
+//     `unsafe`/pointer copies; it uses the UnityEngine.CoreModule instance
+//     method NativeArray<T>.Reinterpret<byte>(int expectedTypeSize) +
 //     NativeArray<T>.CopyFrom() instead, so this assembly can keep
-//     allowUnsafeCode: false (Unity.MultiTimelineRecorder.Editor.asmdef).
+//     allowUnsafeCode: false (Unity.MultiTimelineRecorder.Editor.asmdef) with
+//     no extra package dependency (Reinterpret<byte>(int) is a CoreModule
+//     API, not the two-type-argument com.unity.collections extension method).
 //#define MTR_FFMPEG_PIPE_TRACE_ENABLED
 
 using System;
@@ -113,9 +116,11 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
             Log("AudioFrame: " + audioFrameCount++);
 
-            // unsafe/GetUnsafePtr+Buffer.MemoryCopy の代わりに、Collections パッケージが
-            // 提供する安全な Reinterpret + CopyFrom を使う(MTR の asmdef は allowUnsafeCode:false)。
-            var byteView = data.Reinterpret<float, byte>();
+            // unsafe/GetUnsafePtr+Buffer.MemoryCopy の代わりに、UnityEngine.CoreModule が
+            // 提供する NativeArray<T>.Reinterpret<U>(int expectedTypeSize) インスタンスメソッド
+            // (追加パッケージ依存なし) + CopyFrom を使う(MTR の asmdef は allowUnsafeCode:false)。
+            // sizeof(float) は組み込み型のサイズ指定であり safe コードで合法。
+            var byteView = data.Reinterpret<byte>(sizeof(float));
             var byteArray = new NativeArray<byte>(byteView.Length, Allocator.Temp);
             byteArray.CopyFrom(byteView);
 

@@ -56,10 +56,14 @@ Ported into this fork (`jp.iridescent.multitimelinerecorder`) as:
   visible instead of the Editor appearing to freeze.
 - The audio `PushFrameData(NativeArray<float>)` overload no longer uses
   `unsafe` code (`GetUnsafePtr()` + `Buffer.MemoryCopy()`). It uses the safe
-  `NativeArray<T>.Reinterpret<byte>()` + `NativeArray<T>.CopyFrom()` APIs from
-  `com.unity.collections` instead, so `Unity.MultiTimelineRecorder.Editor.asmdef`
-  can keep `allowUnsafeCode: false` (MTR's existing project-wide convention;
-  the sample's own asmdef sets `allowUnsafeCode: true`).
+  `NativeArray<T>.Reinterpret<U>(int expectedTypeSize)` instance method
+  (`data.Reinterpret<byte>(sizeof(float))`) + `NativeArray<T>.CopyFrom()`
+  instead. This overload is part of `UnityEngine.CoreModule` (not the
+  two-type-argument `Reinterpret<T, U>()` extension method that
+  `com.unity.collections` provides), so no extra package dependency is
+  required and `Unity.MultiTimelineRecorder.Editor.asmdef` can keep
+  `allowUnsafeCode: false` (MTR's existing project-wide convention; the
+  sample's own asmdef sets `allowUnsafeCode: true`).
 
 No other functional changes were made; the rawvideo/AAC pipe protocol, the
 audio remux-on-close step, and the ffmpeg command-line construction approach
