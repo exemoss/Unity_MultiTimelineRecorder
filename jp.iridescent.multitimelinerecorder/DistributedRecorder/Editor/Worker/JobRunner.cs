@@ -876,6 +876,14 @@ namespace DistributedRecorder.Worker
                 _lastKnownFrame     = currentFrame;
                 _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             }
+            else if (IsEncoderBackpressureStalling())
+            {
+                // PlayModeTimelineRenderer がエンコーダメモリ背圧でこの Timeline の director を
+                // 意図的に一時停止している（producer stall）。これは録画が壊れて停滞している
+                // わけではなく、エンコーダの消費待ちという正常な状態なので、汎用の
+                // StallTimeoutSeconds を消費させない（誤 FailJob 防止）。
+                _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            }
             else
             {
                 // Stall detection: if no frames have advanced for StallTimeoutSeconds
@@ -949,6 +957,12 @@ namespace DistributedRecorder.Worker
             if (currentFrame != _lastKnownFrame)
             {
                 _lastKnownFrame     = currentFrame;
+                _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            }
+            else if (IsEncoderBackpressureStalling())
+            {
+                // 上記 HandleDirectorPlayback と同じ理由で、エンコーダメモリ背圧による
+                // 意図的な producer stall 中は汎用の StallTimeoutSeconds を消費させない。
                 _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             }
             else if (_recordingTotalFrames > 0)
@@ -1170,6 +1184,20 @@ namespace DistributedRecorder.Worker
         // ------------------------------------------------------------------
         // Error helpers
         // ------------------------------------------------------------------
+
+        /// <summary>
+        /// PlayModeTimelineRenderer がエンコーダメモリ背圧のため、この Timeline の
+        /// director を意図的に一時停止中（producer stall）かどうか。
+        /// STR_EncoderBackpressureStalling は BeginEncoderMemoryStall/
+        /// ResumeFromEncoderMemoryStall/StopEncoderMemoryBackpressureMonitoring が
+        /// 更新する EditorPref（PlayModeTimelineRenderer.cs 参照）。
+        /// この状態を汎用の StallTimeoutSeconds 判定から除外し、正常なエンコーダ待ちを
+        /// 「録画が壊れて停滞している」と誤判定して FailJob しないようにする。
+        /// </summary>
+        private static bool IsEncoderBackpressureStalling()
+        {
+            return EditorPrefs.GetBool("STR_EncoderBackpressureStalling", false);
+        }
 
         private void FailJob(string jobId, string error)
         {
