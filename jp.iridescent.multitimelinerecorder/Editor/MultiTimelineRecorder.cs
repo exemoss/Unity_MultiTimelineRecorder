@@ -3124,7 +3124,13 @@ namespace Unity.MultiTimelineRecorder
             EditorPrefs.DeleteKey("STR_Progress");
             EditorPrefs.DeleteKey("STR_Status");
             EditorPrefs.DeleteKey("STR_CurrentTime");
-            
+            // review.md イテレーション3 Minor #2: STR_IsRenderingComplete は削除するのに
+            // これらを削除しない非対称があった。OnRecordingProgressUpdate (:2996-3003) の
+            // 通常フローでは消費済みのはずだが、ウィンドウ閉鎖・Editor クラッシュでその分岐を
+            // 逃した場合の stale キー衛生として、ここでも確実にクリアする。
+            EditorPrefs.DeleteKey("STR_IsRenderingFailed");
+            EditorPrefs.DeleteKey("STR_EncoderBackpressureStalling");
+
             MultiTimelineRecorderLogger.LogVerbose("[MultiTimelineRecorder] CleanupRendering completed");
         }
         
