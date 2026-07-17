@@ -359,6 +359,22 @@ namespace Unity.MultiTimelineRecorder
             if (!string.IsNullOrEmpty(outputFile))
                 settings.OutputFile = outputFile.Replace('\\', '/');
 
+            // --- FFmpeg NVENC encoder: distributed path not supported yet ---------
+            // specs/mtr-nvenc-encoder (案1) only wires the FFmpeg NVENC encoder into the
+            // local recording path (CreateMovieRecorderSettingsFromConfig / ApplyToSettings).
+            // The distributed Worker path (this method) intentionally does NOT set
+            // settings.EncoderSettings, so it silently keeps Recorder's default
+            // CoreEncoderSettings (set by the settings.OutputFormat assignment above).
+            // Warn loudly instead of dropping the user's encoder choice without a trace.
+            if (movieConfig.encoderType != MovieEncoderType.CoreEncoder)
+            {
+                Debug.LogWarning(
+                    $"[RecorderSettingsBuilderShared.BuildMovieSettings] Movie recorder '{item.name}' " +
+                    $"specifies encoderType={movieConfig.encoderType}, but the distributed rendering " +
+                    "(Worker) path does not support the FFmpeg NVENC encoder yet. Falling back to the " +
+                    "built-in CoreEncoder for this job.");
+            }
+
             return settings;
         }
 
