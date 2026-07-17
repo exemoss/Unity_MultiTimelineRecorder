@@ -1021,6 +1021,26 @@ namespace DistributedRecorder.Worker
             // Wait until Edit Mode is fully restored
             if (EditorApplication.isPlaying) return;
 
+            // PlayModeTimelineRenderer.AbortRenderingDueToBackpressureTimeout sets this
+            // and exits Play Mode itself (same STR_AutoExitPlayMode path as a normal
+            // completion), well within the 30s timeout above. Without this check, a
+            // recording that was safely aborted mid-render (encoder memory backpressure
+            // never drained in time) would reach here and be reported as a success by
+            // FinalizeCompletedJob simply because Play Mode exited quickly.
+            bool renderingFailed = EditorPrefs.GetBool("STR_IsRenderingFailed", false);
+            if (renderingFailed)
+            {
+                string failureMsg = EditorPrefs.GetString("STR_Status", "MTR recording was aborted mid-render.");
+                EditorPrefs.DeleteKey("STR_IsRenderingFailed");
+                Debug.LogWarning($"[JobRunner] STR_IsRenderingFailed=true を検出。ジョブを Failed にします: '{_runningJobId}' ({failureMsg})");
+                AppendE2ELog($"[JobRunner] MTR 録画が中断されました（{failureMsg}）。ジョブを Failed にします。");
+                UnityEngine.Time.captureFramerate = 0;
+                UnsubscribeAll();
+                CleanupTempTimeline();
+                FailJob(_runningJobId, $"[A-backpressure] {failureMsg}");
+                return;
+            }
+
             Debug.Log($"[JobRunner] Edit Mode に戻りました。ジョブ完了処理: '{_runningJobId}'");
             AppendE2ELog("[JobRunner] Edit Mode に戻りました。");
             // Reset the sticky capture frame rate so the Editor returns to normal and the next
