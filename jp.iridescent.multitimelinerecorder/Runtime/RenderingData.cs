@@ -41,12 +41,24 @@ namespace Unity.MultiTimelineRecorder
         // へ引き渡されるだけで、そちらの滞留には上限が無い（実測: 約80MB/sで無制限増加、
         // 135GB到達を確認。RAM/コミット枯渇による OOM クラッシュに至る）。
         // レンダリング開始時からのプロセスメモリ増分を監視し、上限（High Watermark）を
-        // 超えたら Play Mode 自体を一時停止して新規フレームの発行（PlayableGraph の評価）
-        // を止め、下限（Resume Watermark）まで下がったら自動的に再開する。
+        // 超えたら「この Timeline の PlayableDirector だけ」を一時停止して新規フレームの
+        // 発行（RecorderClip の評価）を止め、下限（Resume Watermark）まで下がったら
+        // 自動的に再開する。
+        //
+        // v1.5.7/v1.5.10 は EditorApplication.isPaused で Play Mode 全体を一時停止して
+        // いたが、これは新規フレーム発行だけでなくフレーム消費（AsyncGPUReadback の完了
+        // 処理・エンコーダのバックグラウンドスレッドへの引き渡し）まで一緒に止めてしまい、
+        // 「背圧を逃がす当の処理が止まる」という構造的欠陥で resume が永久に来ず恒久ハング
+        // することがライブ実測で確定した（specs/mtr-nvenc-encoder/investigation.md
+        // イテレーション2）。v1.5.13 で Director 単位の一時停止に作り替え、Player Loop・
+        // エンコーダのバックグラウンドスレッドは動かし続けたまま実際にキューをドレイン
+        // させる。それでも Resume Watermark まで下がらない場合に備え、一時停止の累計時間が
+        // Stall Timeout を超えたら「無限待ち」にせず録画を安全に中断する。
         public bool enableEncoderMemoryBackpressure = true;
         public int encoderMemoryHighWatermarkMB = 2048;
         public int encoderMemoryResumeWatermarkMB = 1024;
         public int encoderMemoryPollIntervalMs = 500;
+        public int encoderMemoryStallTimeoutSec = 120;
 
         [Header("Runtime Status")]
         public PlayableDirector renderingDirector;

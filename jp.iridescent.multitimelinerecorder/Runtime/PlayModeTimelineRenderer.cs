@@ -36,9 +36,14 @@ namespace Unity.MultiTimelineRecorder
         // 常に0を返し、監視が生きたまま無害化されていたサイレント no-op が確定原因）。
         private bool isMemoryBackpressureActive = false;
         private long baselinePrivateBytes = -1;
-        private bool isMemoryBackpressurePaused = false;
+        // true の間、この Timeline の director だけを一時停止して新規フレーム発行を止めている
+        // （EditorApplication.isPaused は一切使わない。Player Loop・エンコーダのバックグラウンド
+        // スレッドは動かし続ける。investigation.md イテレーション2: Play Mode 全体を止める
+        // 旧方式は「背圧を逃がす当の処理（フレーム消費）」まで止めてしまい resume 不能で
+        // 恒久ハングすることが確定したため v1.5.13 で廃止）。
+        private bool isMemoryBackpressureStalling = false;
         private double lastMemoryPollRealtime = -1;
-        private double memoryPauseStartRealtime = -1;
+        private double stallStartRealtime = -1;
         private double nextStallLogRealtime = -1;
         #endif
 
@@ -156,28 +161,36 @@ namespace Unity.MultiTimelineRecorder
 
             ApplyReadbackBackpressure();
 
+            // この Timeline の director が「エンコーダメモリ背圧によって意図的に一時停止中」か。
+            // Editor 専用の状態のため、非Editorビルドでは常に false（元の挙動のまま）。
+            bool isStallingForBackpressure = false;
+            #if UNITY_EDITOR
+            ApplyEncoderMemoryBackpressure();
+            isStallingForBackpressure = isMemoryBackpressureStalling;
+            #endif
+
             // 進捗を計算
             double currentTime = director.time;
             double duration = renderingData.renderTimeline.duration;
             float progress = duration > 0 ? (float)(currentTime / duration) : 0f;
             progress = Mathf.Clamp01(progress);
-            
+
             // RenderingDataを更新
             renderingData.currentTime = (float)currentTime;
             renderingData.progress = progress;
             renderingData.isPlaying = director.state == PlayState.Playing;
-            
+
             #if UNITY_EDITOR
             // 進捗が変化した場合のみ更新（頻繁な更新を避ける）
             if (Mathf.Abs(progress - lastReportedProgress) > 0.01f || progress >= 0.99f)
             {
                 lastReportedProgress = progress;
-                
+
                 // EditorPrefsで進捗を共有
                 EditorPrefs.SetFloat("STR_Progress", progress);
                 EditorPrefs.SetFloat("STR_CurrentTime", (float)currentTime);
                 EditorPrefs.SetString("STR_Status", $"Rendering... {(progress * 100f):F1}%");
-                
+
                 // デバッグ情報
                 if (EditorPrefs.GetBool("STR_DebugMode", false))
                 {
@@ -185,15 +198,20 @@ namespace Unity.MultiTimelineRecorder
                 }
             }
             #endif
-            
+
             // レンダリング完了チェック
-            if (director.state != PlayState.Playing && progress >= 0.99f)
+            // 背圧で director を意図的に一時停止している間は、director.state != Playing に
+            // なるのが「録画完了」ではなく「エンコーダ待ち」であるため、誤って完了扱いに
+            // しないようガードする。
+            if (!isStallingForBackpressure && director.state != PlayState.Playing && progress >= 0.99f)
             {
                 OnRenderingComplete();
             }
-            
+
             // タイムアウトチェック（安全対策）
-            if (Time.time - renderStartTime > duration + 10f)
+            // 同様に、背圧で一時停止している間は Time.time が進んでも「録画が停滞している」
+            // だけであり異常なタイムアウトではないため、ここでも完了扱いにしない。
+            if (!isStallingForBackpressure && Time.time - renderStartTime > duration + 10f)
             {
                 Debug.LogWarning("[PlayModeTimelineRenderer] Rendering timeout detected");
                 OnRenderingComplete();
@@ -301,7 +319,7 @@ namespace Unity.MultiTimelineRecorder
             if (renderingData == null || !renderingData.enableEncoderMemoryBackpressure)
                 return;
 
-            isMemoryBackpressurePaused = false;
+            isMemoryBackpressureStalling = false;
             lastMemoryPollRealtime = -1;
 
             if (!TryGetPrivateBytes(out baselinePrivateBytes) || baselinePrivateBytes <= 0)
@@ -320,44 +338,55 @@ namespace Unity.MultiTimelineRecorder
             isMemoryBackpressureActive = true;
 
             Debug.Log($"[PlayModeTimelineRenderer] Encoder memory backpressure: baseline Private Bytes = {baselinePrivateBytes / (1024 * 1024)}MB, " +
-                $"Pause/Resume watermark = +{renderingData.encoderMemoryHighWatermarkMB}MB/+{renderingData.encoderMemoryResumeWatermarkMB}MB");
+                $"Stall/Resume watermark = +{renderingData.encoderMemoryHighWatermarkMB}MB/+{renderingData.encoderMemoryResumeWatermarkMB}MB, " +
+                $"Stall timeout = {renderingData.encoderMemoryStallTimeoutSec}s");
 
-            // EditorApplication.update は Play Mode の一時停止中（EditorApplication.isPaused）
-            // でも呼ばれ続けるため、一時停止からの復帰判定にはこちらを使う
-            // （MonoBehaviour.Update は一時停止中呼ばれないため復帰判定に使えない）。
-            EditorApplication.update += PollEncoderMemoryBackpressure;
+            // v1.5.13: EditorApplication.update への購読は廃止した。この監視は
+            // PlayModeTimelineRenderer.Update() から毎フレーム直接呼び出す
+            // （ApplyEncoderMemoryBackpressure）。EditorApplication.isPaused を
+            // 使わなくなったため、Play Mode 中は MonoBehaviour.Update() が
+            // 通常どおり毎フレーム呼ばれ続け、EditorApplication.update に頼る必要がない。
         }
 
         /// <summary>
         /// GPU 側の背圧（ApplyReadbackBackpressure）だけでは、読み戻し完了後のフレームが
-        /// 下流のエンコーダ入力キュー（プロセス RAM、Unity Recorder 内部実装）に無制限に
-        /// 滞留し得る（実測: 約80MB/sで無制限増加、135GB到達を確認。RAM/コミット枯渇による
-        /// OOM クラッシュに至る）。レンダリング開始時からのプロセスメモリ増分を都度確認し、
-        /// 上限（High Watermark）を超えたら Play Mode 自体を一時停止して PlayableGraph の
-        /// 評価（＝RecorderClip による新規フレーム発行と読み戻し要求の発生源）を止める。
-        /// 下限（Resume Watermark、ヒステリシス）まで下がったら自動的に再開する。
+        /// 下流のエンコーダ入力キュー（プロセス RAM、Unity Recorder 内部実装 or MTR 自前の
+        /// FFmpeg pipe）に滞留し得る（実測: 約80MB/sで無制限増加、135GB到達を確認）。
+        /// レンダリング開始時からのプロセスメモリ増分を都度確認し、上限（High Watermark）を
+        /// 超えたら「この Timeline の PlayableDirector だけ」を Pause() して新規フレームの
+        /// 発行（RecorderClip の評価）を止める。Play Mode 全体・Player Loop・エンコーダの
+        /// バックグラウンドスレッド（FFmpeg pipe の copy/pipe スレッド、CoreEncoder 内部の
+        /// エンコードスレッド等）は動かし続けるため、実際にキューがドレインしてから
+        /// 下限（Resume Watermark、ヒステリシス）で自動的に再開できる。
+        ///
+        /// 「待っても永久に下がらない」ケース（真にエンコーダが追いつかない、計測が
+        /// アイドル churn 等のノイズに支配される等）に備え、一時停止の累計時間が
+        /// Stall Timeout を超えたら無限に待たず、録画を安全に中断する
+        /// （旧 EditorApplication.isPaused 方式が resume 不能で35分以上ハングした
+        /// 再発防止。specs/mtr-nvenc-encoder/investigation.md イテレーション2）。
         /// </summary>
-        private void PollEncoderMemoryBackpressure()
+        private void ApplyEncoderMemoryBackpressure()
         {
-            if (!isRendering || renderingData == null || !isMemoryBackpressureActive)
+            if (!isMemoryBackpressureActive || renderingData == null)
                 return;
 
             if (!renderingData.enableEncoderMemoryBackpressure)
             {
                 // 実行中にトグルで無効化された場合、一時停止したままにしない
-                if (isMemoryBackpressurePaused)
-                {
-                    isMemoryBackpressurePaused = false;
-                    EditorApplication.isPaused = false;
-                    Debug.Log("[PlayModeTimelineRenderer] Encoder memory backpressure was disabled mid-render; resuming Play Mode.");
-                }
+                if (isMemoryBackpressureStalling)
+                    ResumeFromEncoderMemoryStall("Encoder memory backpressure was disabled mid-render");
                 return;
             }
 
             double now = EditorApplication.timeSinceStartup;
-            double pollIntervalSec = Mathf.Max(0.05f, renderingData.encoderMemoryPollIntervalMs / 1000f);
-            if (lastMemoryPollRealtime >= 0 && now - lastMemoryPollRealtime < pollIntervalSec)
-                return;
+
+            if (!isMemoryBackpressureStalling)
+            {
+                // 一時停止していない間は、計測コストを抑えるため Poll Interval で間引く。
+                double pollIntervalSec = Mathf.Max(0.05f, renderingData.encoderMemoryPollIntervalMs / 1000f);
+                if (lastMemoryPollRealtime >= 0 && now - lastMemoryPollRealtime < pollIntervalSec)
+                    return;
+            }
             lastMemoryPollRealtime = now;
 
             if (!TryGetPrivateBytes(out long currentPrivateBytes) || currentPrivateBytes <= 0)
@@ -367,12 +396,8 @@ namespace Unity.MultiTimelineRecorder
                 Debug.LogError($"[PlayModeTimelineRenderer] Encoder memory backpressure: プロセスメモリの計測が異常値" +
                     $"（{currentPrivateBytes} bytes）を返したため、このレンダリングセッションでは監視を停止します。" +
                     "以降RAM無制限成長を検知できません。");
-                if (isMemoryBackpressurePaused)
-                {
-                    isMemoryBackpressurePaused = false;
-                    EditorApplication.isPaused = false;
-                }
-                EditorApplication.update -= PollEncoderMemoryBackpressure;
+                if (isMemoryBackpressureStalling)
+                    ResumeFromEncoderMemoryStall(null, silent: true);
                 isMemoryBackpressureActive = false;
                 return;
             }
@@ -382,46 +407,148 @@ namespace Unity.MultiTimelineRecorder
             int highWatermarkMB = Mathf.Max(1, renderingData.encoderMemoryHighWatermarkMB);
             int resumeWatermarkMB = Mathf.Clamp(renderingData.encoderMemoryResumeWatermarkMB, 0, highWatermarkMB);
 
-            if (!isMemoryBackpressurePaused && deltaMB >= highWatermarkMB)
+            if (!isMemoryBackpressureStalling)
             {
-                isMemoryBackpressurePaused = true;
-                memoryPauseStartRealtime = now;
-                nextStallLogRealtime = now + 5.0;
-                Debug.LogWarning($"[PlayModeTimelineRenderer] Encoder memory backpressure: 開始時から +{deltaMB}MB (>= {highWatermarkMB}MB) 増加。" +
-                    "エンコーダの消費が描画に追いついていないため Play Mode を一時停止し、新規フレームの発行を止めます。");
-                EditorApplication.isPaused = true;
+                if (deltaMB >= highWatermarkMB)
+                    BeginEncoderMemoryStall(deltaMB, highWatermarkMB);
+                return;
             }
-            else if (isMemoryBackpressurePaused)
+
+            // ここに来る時点で isMemoryBackpressureStalling == true。
+            if (deltaMB <= resumeWatermarkMB)
             {
-                if (deltaMB <= resumeWatermarkMB)
-                {
-                    isMemoryBackpressurePaused = false;
-                    Debug.Log($"[PlayModeTimelineRenderer] Encoder memory backpressure: +{deltaMB}MB (<= {resumeWatermarkMB}MB) まで低下。" +
-                        $"一時停止 {now - memoryPauseStartRealtime:F1} 秒で Play Mode を再開します。");
-                    EditorApplication.isPaused = false;
-                }
-                else if (now >= nextStallLogRealtime)
-                {
-                    nextStallLogRealtime = now + 5.0;
-                    Debug.LogWarning($"[PlayModeTimelineRenderer] Encoder memory backpressure: 一時停止継続中（+{deltaMB}MB、経過 {now - memoryPauseStartRealtime:F1} 秒）。エンコーダの消費待ち。");
-                }
+                ResumeFromEncoderMemoryStall($"+{deltaMB}MB (<= {resumeWatermarkMB}MB) まで低下");
+                return;
+            }
+
+            double stalledSec = now - stallStartRealtime;
+            int timeoutSec = Mathf.Max(1, renderingData.encoderMemoryStallTimeoutSec);
+            if (stalledSec >= timeoutSec)
+            {
+                AbortRenderingDueToBackpressureTimeout(deltaMB, timeoutSec);
+                return;
+            }
+
+            if (now >= nextStallLogRealtime)
+            {
+                nextStallLogRealtime = now + 5.0;
+                Debug.LogWarning($"[PlayModeTimelineRenderer] Encoder memory backpressure: producer stall 継続中" +
+                    $"（+{deltaMB}MB、経過 {stalledSec:F1}秒 / タイムアウト {timeoutSec}秒）。" +
+                    "この Timeline の Director だけを一時停止しています（Play Mode 全体は動作中）。" +
+                    "エンコーダの消費待ちです。");
             }
         }
 
         /// <summary>
-        /// 監視を停止し、一時停止中であれば Play Mode を再開してから後始末する。
-        /// レンダリング完了時・破棄時いずれからも呼べるよう冪等に実装する。
+        /// プロセスメモリ増分が High Watermark を超えたときに呼ぶ。この Timeline の
+        /// director だけを Pause() し、明示的な GC を一度走らせて回収可能なゴミ
+        /// （フレームコピー用に大量確保された一時バッファ等）を実際に手放す機会を与える。
+        /// プロセス全体の Private Bytes は「解放可能だが OS に未返却のヒープ」を含み得る
+        /// ため、何もしなくても Resume Watermark まで下がるとは限らない
+        /// （investigation.md イテレーション2: 旧方式の一時停止中もアイドル描画churnで
+        /// delta が単調に上昇し続け、resume に一度も届かなかった事象の一因と推定）。
         /// </summary>
-        private void StopEncoderMemoryBackpressureMonitoring()
+        private void BeginEncoderMemoryStall(long deltaMB, int highWatermarkMB)
         {
-            EditorApplication.update -= PollEncoderMemoryBackpressure;
+            isMemoryBackpressureStalling = true;
+            stallStartRealtime = EditorApplication.timeSinceStartup;
+            nextStallLogRealtime = stallStartRealtime + 5.0;
 
-            if (isMemoryBackpressurePaused)
+            Debug.LogWarning($"[PlayModeTimelineRenderer] Encoder memory backpressure: 開始時から +{deltaMB}MB " +
+                $"(>= {highWatermarkMB}MB) 増加。エンコーダの消費が描画に追いついていないため、この Timeline の " +
+                "Director だけを一時停止して新規フレームの発行を止めます（Play Mode 全体・Player Loop・" +
+                "エンコーダのバックグラウンドスレッドは動作を継続します）。");
+
+            if (director != null)
+                director.Pause();
+
+            EditorPrefs.SetBool("STR_EncoderBackpressureStalling", true);
+
+            System.GC.Collect();
+            System.GC.WaitForPendingFinalizers();
+        }
+
+        /// <summary>
+        /// 一時停止を解除し、この Timeline の director を再開する。
+        /// </summary>
+        /// <param name="reason">再開理由（ログに残す）。null の場合はログを出さない。</param>
+        /// <param name="silent">true の場合、理由を問わずログを出さない（計測異常での強制解除など）。</param>
+        private void ResumeFromEncoderMemoryStall(string reason, bool silent = false)
+        {
+            double stalledSec = EditorApplication.timeSinceStartup - stallStartRealtime;
+            isMemoryBackpressureStalling = false;
+            EditorPrefs.SetBool("STR_EncoderBackpressureStalling", false);
+
+            if (director != null)
+                director.Play();
+
+            if (!silent && reason != null)
             {
-                isMemoryBackpressurePaused = false;
-                EditorApplication.isPaused = false;
+                Debug.Log($"[PlayModeTimelineRenderer] Encoder memory backpressure: {reason}。" +
+                    $"producer stall {stalledSec:F1} 秒でこの Timeline の Director を再開します。");
+            }
+        }
+
+        /// <summary>
+        /// Stall Timeout を超えても Resume Watermark まで下がらない場合に呼ぶ。
+        /// エンコーダの消費が構造的に追いついていないと判断し、Unity をハングさせる
+        /// 代わりに録画を安全に中断する（旧 EditorApplication.isPaused 方式が resume
+        /// 不能で35分以上ハングした恒久ハングの再発防止。ユーザーには Console の
+        /// Debug.LogError と MTR ウィンドウのエラーステータスの両方で知らせる）。
+        /// </summary>
+        private void AbortRenderingDueToBackpressureTimeout(long deltaMB, int timeoutSec)
+        {
+            if (!isRendering)
+                return;
+
+            Debug.LogError($"[PlayModeTimelineRenderer] Encoder memory backpressure: producer stall が" +
+                $"タイムアウトしました（{timeoutSec}秒、+{deltaMB}MB のまま Resume Watermark " +
+                $"+{renderingData.encoderMemoryResumeWatermarkMB}MB まで下がりませんでした）。エンコーダの" +
+                "消費が構造的に追いついていないと判断し、これ以上待って Unity をハングさせる代わりに" +
+                "録画を安全に中断します。解像度を下げる/NVENCのプリセットを高速化する/出力ディスクの" +
+                "空き容量と速度を確認してください。");
+
+            isRendering = false;
+            renderingData.isComplete = false;
+
+            // 中断時は再開せず（resumeIfStalling: false）、director を明示的に Stop() する。
+            // 汎用の StopEncoderMemoryBackpressureMonitoring() は「再開してから後始末」だが、
+            // 中断はレンダリングを諦める決定なので、director.Play() で新規フレームを
+            // さらに発行させてから Play Mode を抜けるのは無駄かつ望ましくない。
+            StopEncoderMemoryBackpressureMonitoring(resumeIfStalling: false);
+            if (director != null)
+                director.Stop();
+
+            EditorPrefs.SetString("STR_Status", "Error: Encoder memory backpressure timeout");
+            EditorPrefs.SetBool("STR_IsRenderingInProgress", false);
+            EditorPrefs.SetBool("STR_IsRenderingFailed", true);
+
+            // 正常完了時 (OnRenderingComplete) と同じ 1 秒猶予 + delayCall パターンで
+            // Play Mode を抜ける。Take Number はインクリメントしない
+            // （出力が不完全なため、完了扱いにしない）。
+            StartCoroutine(ExitPlayModeAfterDelay(1f, incrementTakeNumber: false));
+        }
+
+        /// <summary>
+        /// 監視を停止する。レンダリング完了時・タイムアウト中断時・破棄時いずれからも
+        /// 呼べるよう冪等に実装する。
+        /// </summary>
+        /// <param name="resumeIfStalling">
+        /// true（既定）の場合、一時停止中であればこの Timeline の director を再開してから
+        /// 後始末する（正常完了・破棄時の想定）。false の場合は director に触れず
+        /// フラグだけ後始末する（タイムアウト中断時。呼び出し側が director.Stop() で
+        /// 明示的に停止する想定）。
+        /// </param>
+        private void StopEncoderMemoryBackpressureMonitoring(bool resumeIfStalling = true)
+        {
+            if (isMemoryBackpressureStalling)
+            {
+                isMemoryBackpressureStalling = false;
+                if (resumeIfStalling && director != null)
+                    director.Play();
             }
 
+            EditorPrefs.SetBool("STR_EncoderBackpressureStalling", false);
             isMemoryBackpressureActive = false;
         }
         #endif
@@ -454,15 +581,23 @@ namespace Unity.MultiTimelineRecorder
         }
         
         #if UNITY_EDITOR
-        private IEnumerator ExitPlayModeAfterDelay(float delay)
+        /// <param name="incrementTakeNumber">
+        /// Take Number をインクリメントするか。録画が正常完了した場合は true（既定）。
+        /// エンコーダメモリ背圧のタイムアウト等で出力が不完全なまま中断した場合は
+        /// false を渡し、完了扱いにしない（AbortRenderingDueToBackpressureTimeout）。
+        /// </param>
+        private IEnumerator ExitPlayModeAfterDelay(float delay, bool incrementTakeNumber = true)
         {
             Debug.Log($"[PlayModeTimelineRenderer] Waiting {delay} seconds before exiting Play Mode...");
-            
+
             yield return new WaitForSeconds(delay);
-            
-            // Take Numberインクリメントのフラグを設定
-            EditorPrefs.SetBool("STR_IncrementTakeNumber", true);
-            
+
+            if (incrementTakeNumber)
+            {
+                // Take Numberインクリメントのフラグを設定
+                EditorPrefs.SetBool("STR_IncrementTakeNumber", true);
+            }
+
             // Play Mode終了を予約
             EditorApplication.delayCall += () =>
             {
