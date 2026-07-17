@@ -6,6 +6,9 @@ using System.Collections;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
+#if UNITY_EDITOR_WIN
+using System.Runtime.InteropServices;
+#endif
 
 namespace Unity.MultiTimelineRecorder
 {
@@ -27,7 +30,11 @@ namespace Unity.MultiTimelineRecorder
         // エンコーダ入力キュー滞留対策（RAM/OOM クラッシュ対策）:
         // レンダリング開始時のプロセスメモリを基準に、増分を監視する。
         #if UNITY_EDITOR
-        private System.Diagnostics.Process trackedProcess;
+        // 計測（TryGetPrivateBytes）が有効な値を返し監視が実際に稼働しているかどうか。
+        // 「保護ON設定なのに計測が死んでいて無防備」を二度と起こさないためのフラグ
+        // （investigation.md イテレーション3: Process.PrivateMemorySize64 が Mono 下で
+        // 常に0を返し、監視が生きたまま無害化されていたサイレント no-op が確定原因）。
+        private bool isMemoryBackpressureActive = false;
         private long baselinePrivateBytes = -1;
         private bool isMemoryBackpressurePaused = false;
         private double lastMemoryPollRealtime = -1;
@@ -216,7 +223,75 @@ namespace Unity.MultiTimelineRecorder
             AsyncGPUReadback.WaitAllRequests();
         }
 
+        #if UNITY_EDITOR_WIN
+        // psapi.dll 経由でプロセスの Private Bytes（PowerShell Get-Process 等の外部計測と
+        // 同じ意味論の値）を直接取得するための P/Invoke 定義。
+        // System.Diagnostics.Process.PrivateMemorySize64 は Unity の Mono ランタイム下で
+        // 現在プロセスに対して呼ぶと常に0を返す既知の欠陥がある（investigation.md イテレーション3で
+        // クラッシュログ11セッション横断・一時停止ログ0件から確定）ため使用しない。
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_MEMORY_COUNTERS_EX
+        {
+            public uint cb;
+            public uint PageFaultCount;
+            public ulong PeakWorkingSetSize;
+            public ulong WorkingSetSize;
+            public ulong QuotaPeakPagedPoolUsage;
+            public ulong QuotaPagedPoolUsage;
+            public ulong QuotaPeakNonPagedPoolUsage;
+            public ulong QuotaNonPagedPoolUsage;
+            public ulong PagefileUsage;
+            public ulong PeakPagefileUsage;
+            public ulong PrivateUsage;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern System.IntPtr GetCurrentProcess();
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool GetProcessMemoryInfo(System.IntPtr hProcess, out PROCESS_MEMORY_COUNTERS_EX counters, uint size);
+        #endif
+
         #if UNITY_EDITOR
+        /// <summary>
+        /// プロセスの Private Bytes 相当値を取得する（Mono 下で0を返す
+        /// Process.PrivateMemorySize64 の代替）。
+        /// Windows Editor では psapi.dll の GetProcessMemoryInfo（PROCESS_MEMORY_COUNTERS_EX.
+        /// PrivateUsage）を直接 P/Invoke で読む。それ以外（非Windows Editor、または P/Invoke
+        /// 失敗時）は Profiler.GetTotalReservedMemoryLong()（ネイティブ確保を含む予約メモリの
+        /// 近似値）にフォールバックする。取得値が0以下（計測不能）の場合は false を返し、
+        /// 呼び出し側が「サイレント無効化」ではなく明示的にエラーとして扱えるようにする。
+        /// </summary>
+        private static bool TryGetPrivateBytes(out long privateBytes)
+        {
+            #if UNITY_EDITOR_WIN
+            try
+            {
+                uint size = (uint)Marshal.SizeOf(typeof(PROCESS_MEMORY_COUNTERS_EX));
+                if (GetProcessMemoryInfo(GetCurrentProcess(), out PROCESS_MEMORY_COUNTERS_EX counters, size))
+                {
+                    privateBytes = (long)counters.PrivateUsage;
+                    if (privateBytes > 0)
+                        return true;
+                }
+                else
+                {
+                    Debug.LogWarning($"[PlayModeTimelineRenderer] GetProcessMemoryInfo failed (Win32 error {Marshal.GetLastWin32Error()}). Profiler計測にフォールバックします。");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"[PlayModeTimelineRenderer] GetProcessMemoryInfo の呼び出しで例外が発生しました。Profiler計測にフォールバックします。{ex.Message}");
+            }
+            #endif
+
+            // フォールバック: Unity管理下（ネイティブ確保含む）の予約メモリ総量。
+            // エンコーダキュー（Recorder内部実装）がUnityのネイティブアロケータ配下に
+            // 無い場合は捕捉漏れの懸念があるが、「常に0」だった旧実装よりは検知できる分安全側。
+            privateBytes = UnityEngine.Profiling.Profiler.GetTotalReservedMemoryLong();
+            return privateBytes > 0;
+        }
+
         /// <summary>
         /// エンコーダ入力キュー滞留対策の監視を開始する。レンダリング開始時点の
         /// プロセスメモリ（Private Bytes）を基準値として記録し、以後の増分監視に使う。
@@ -226,11 +301,23 @@ namespace Unity.MultiTimelineRecorder
             if (renderingData == null || !renderingData.enableEncoderMemoryBackpressure)
                 return;
 
-            trackedProcess = System.Diagnostics.Process.GetCurrentProcess();
-            trackedProcess.Refresh();
-            baselinePrivateBytes = trackedProcess.PrivateMemorySize64;
             isMemoryBackpressurePaused = false;
             lastMemoryPollRealtime = -1;
+
+            if (!TryGetPrivateBytes(out baselinePrivateBytes) || baselinePrivateBytes <= 0)
+            {
+                // 計測APIが0/異常値を返した場合、黙って背圧を無効化しない（旧実装の欠陥の再発防止）。
+                // 保護が実効していないことを明示し、長尺レンダリングでのRAM/OOMクラッシュに
+                // 注意を促す。
+                Debug.LogError($"[PlayModeTimelineRenderer] Encoder memory backpressure: プロセスメモリの計測に失敗しました" +
+                    $"（取得値 = {baselinePrivateBytes} bytes）。この環境ではRAM無制限成長を検知できないため、" +
+                    "エンコーダメモリ背圧は無効のまま動作します。長尺レンダリングでのRAM/OOMクラッシュに注意してください。");
+                isMemoryBackpressureActive = false;
+                baselinePrivateBytes = -1;
+                return;
+            }
+
+            isMemoryBackpressureActive = true;
 
             Debug.Log($"[PlayModeTimelineRenderer] Encoder memory backpressure: baseline Private Bytes = {baselinePrivateBytes / (1024 * 1024)}MB, " +
                 $"Pause/Resume watermark = +{renderingData.encoderMemoryHighWatermarkMB}MB/+{renderingData.encoderMemoryResumeWatermarkMB}MB");
@@ -252,7 +339,7 @@ namespace Unity.MultiTimelineRecorder
         /// </summary>
         private void PollEncoderMemoryBackpressure()
         {
-            if (!isRendering || renderingData == null || trackedProcess == null)
+            if (!isRendering || renderingData == null || !isMemoryBackpressureActive)
                 return;
 
             if (!renderingData.enableEncoderMemoryBackpressure)
@@ -273,24 +360,24 @@ namespace Unity.MultiTimelineRecorder
                 return;
             lastMemoryPollRealtime = now;
 
-            long deltaMB;
-            try
+            if (!TryGetPrivateBytes(out long currentPrivateBytes) || currentPrivateBytes <= 0)
             {
-                trackedProcess.Refresh();
-                deltaMB = (trackedProcess.PrivateMemorySize64 - baselinePrivateBytes) / (1024 * 1024);
-            }
-            catch (System.Exception ex)
-            {
-                Debug.LogWarning($"[PlayModeTimelineRenderer] Encoder memory backpressure: failed to read process memory, disabling monitor for this session. {ex.Message}");
+                // ここでも0/異常値をサイレントに無視しない。計測が生きている間ずっと正常値を
+                // 返してきた計測が急に死んだケースなので、明示的にエラーとして残す。
+                Debug.LogError($"[PlayModeTimelineRenderer] Encoder memory backpressure: プロセスメモリの計測が異常値" +
+                    $"（{currentPrivateBytes} bytes）を返したため、このレンダリングセッションでは監視を停止します。" +
+                    "以降RAM無制限成長を検知できません。");
                 if (isMemoryBackpressurePaused)
                 {
                     isMemoryBackpressurePaused = false;
                     EditorApplication.isPaused = false;
                 }
                 EditorApplication.update -= PollEncoderMemoryBackpressure;
-                trackedProcess = null;
+                isMemoryBackpressureActive = false;
                 return;
             }
+
+            long deltaMB = (currentPrivateBytes - baselinePrivateBytes) / (1024 * 1024);
 
             int highWatermarkMB = Mathf.Max(1, renderingData.encoderMemoryHighWatermarkMB);
             int resumeWatermarkMB = Mathf.Clamp(renderingData.encoderMemoryResumeWatermarkMB, 0, highWatermarkMB);
@@ -335,7 +422,7 @@ namespace Unity.MultiTimelineRecorder
                 EditorApplication.isPaused = false;
             }
 
-            trackedProcess = null;
+            isMemoryBackpressureActive = false;
         }
         #endif
 
