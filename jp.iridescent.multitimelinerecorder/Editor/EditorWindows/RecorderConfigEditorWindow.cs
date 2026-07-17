@@ -222,13 +222,36 @@ namespace Unity.MultiTimelineRecorder.RecorderConfigEditors
             }
             
             movieConfig.captureAlpha = EditorGUILayout.Toggle("Capture Alpha", movieConfig.captureAlpha);
-            
+
             // Audio settings
             EditorGUILayout.Space();
             movieConfig.captureAudio = EditorGUILayout.Toggle("Capture Audio", movieConfig.captureAudio);
             if (movieConfig.captureAudio)
             {
                 movieConfig.audioBitrate = (AudioBitRateMode)EditorGUILayout.EnumPopup("Audio Quality", movieConfig.audioBitrate);
+            }
+
+            // Encoder settings (NVENC, specs/mtr-nvenc-encoder)
+            EditorGUILayout.Space();
+            EditorGUILayout.LabelField("Encoder", EditorStyles.miniLabel);
+            movieConfig.encoderType = (MovieEncoderType)EditorGUILayout.EnumPopup("Encoder", movieConfig.encoderType);
+            if (movieConfig.encoderType != MovieEncoderType.CoreEncoder)
+            {
+                EditorGUILayout.BeginHorizontal();
+                movieConfig.ffmpegPath = EditorGUILayout.TextField("FFmpeg Path", movieConfig.ffmpegPath);
+                if (GUILayout.Button("...", GUILayout.Width(28)))
+                {
+                    var selected = EditorUtility.OpenFilePanel("ffmpeg.exe を選択", "", "exe");
+                    if (!string.IsNullOrEmpty(selected))
+                        movieConfig.ffmpegPath = selected;
+                }
+                EditorGUILayout.EndHorizontal();
+
+                movieConfig.ffmpegTargetBitrateKbps = EditorGUILayout.IntField("Target Bitrate (kbps)", movieConfig.ffmpegTargetBitrateKbps);
+                using (new EditorGUI.DisabledScope(movieConfig.ffmpegTargetBitrateKbps > 0))
+                {
+                    movieConfig.ffmpegQp = EditorGUILayout.IntSlider("QP", movieConfig.ffmpegQp, 0, 51);
+                }
             }
         }
         

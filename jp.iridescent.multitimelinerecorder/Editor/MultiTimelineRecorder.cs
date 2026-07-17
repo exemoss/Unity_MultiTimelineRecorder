@@ -3629,7 +3629,45 @@ namespace Unity.MultiTimelineRecorder
             }
             public MovieRecorderPreset moviePreset { get => MovieRecorderPreset.Custom; set { } }
             public bool useMoviePreset { get => false; set { } }
-            
+
+            // Movie encoder settings (NVENC, specs/mtr-nvenc-encoder)
+            public MovieEncoderType movieEncoderType
+            {
+                get => item.movieConfig?.encoderType ?? MovieEncoderType.CoreEncoder;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.encoderType = value;
+                }
+            }
+            public string movieFfmpegPath
+            {
+                get => item.movieConfig?.ffmpegPath ?? string.Empty;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.ffmpegPath = value;
+                }
+            }
+            public int movieFfmpegQp
+            {
+                get => item.movieConfig?.ffmpegQp ?? 24;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.ffmpegQp = value;
+                }
+            }
+            public int movieFfmpegBitrateKbps
+            {
+                get => item.movieConfig?.ffmpegTargetBitrateKbps ?? 0;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.ffmpegTargetBitrateKbps = value;
+                }
+            }
+
             // AOV settings
             public AOVType selectedAOVTypes 
             { 

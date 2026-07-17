@@ -108,7 +108,9 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                 EditorGUILayout.HelpBox("MOV format with ProRes is only available on macOS", MessageType.Warning);
                 #endif
             }
-            
+
+            DrawEncoderSettings();
+
             // Quality settings
             EditorGUILayout.Space(5);
             host.movieQuality = (VideoBitrateMode)EditorGUILayout.EnumPopup("Quality", host.movieQuality);
@@ -144,6 +146,67 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             }
         }
         
+        /// <summary>
+        /// エンコーダ選択(内蔵 / FFmpeg NVENC)と、選択に応じた ffmpeg.exe パス・品質設定を描画する。
+        /// specs/mtr-nvenc-encoder: 内蔵エンコーダが既定・後方互換、FFmpeg NVENC は明示的に
+        /// 選んだ場合のみ使用される。
+        /// </summary>
+        void DrawEncoderSettings()
+        {
+            EditorGUILayout.Space(5);
+            DrawSubsectionHeader("Encoder");
+
+            host.movieEncoderType = (MovieEncoderType)EditorGUILayout.EnumPopup(
+                new GUIContent("Encoder", "既定は内蔵エンコーダ(Media Foundation, ソフトウェア H.264)。NVENC はNVIDIA GPUのハードウェアエンコードで高速だが、事前に各マシンへ ffmpeg.exe の導入が必要。"),
+                host.movieEncoderType);
+
+            if (host.movieEncoderType == MovieEncoderType.CoreEncoder)
+                return;
+
+            EditorGUI.indentLevel++;
+
+            if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
+            {
+                EditorGUILayout.HelpBox("FFmpeg NVENC エンコーダは MP4 コンテナのみ対応しています。上の Format を MP4 に設定してください。", MessageType.Error);
+            }
+
+            EditorGUILayout.BeginHorizontal();
+            host.movieFfmpegPath = EditorGUILayout.TextField(
+                new GUIContent("FFmpeg Path", "ffmpeg.exe への絶対パス。リポジトリには同梱しないため、各マシンで導入したパスを明示指定すること。"),
+                host.movieFfmpegPath);
+            if (GUILayout.Button("...", GUILayout.Width(28)))
+            {
+                var selected = EditorUtility.OpenFilePanel("ffmpeg.exe を選択", "", "exe");
+                if (!string.IsNullOrEmpty(selected))
+                    host.movieFfmpegPath = selected;
+            }
+            EditorGUILayout.EndHorizontal();
+
+            if (string.IsNullOrEmpty(host.movieFfmpegPath))
+            {
+                EditorGUILayout.HelpBox("ffmpeg.exe のパスが未指定です。録画開始時にエラーになります。", MessageType.Warning);
+            }
+            else if (!System.IO.File.Exists(host.movieFfmpegPath))
+            {
+                EditorGUILayout.HelpBox($"ffmpeg.exe が見つかりません: {host.movieFfmpegPath}", MessageType.Warning);
+            }
+
+            host.movieFfmpegBitrateKbps = EditorGUILayout.IntField(
+                new GUIContent("Target Bitrate (kbps)", "目標ビットレート(kbps)。0の場合はQP固定モードを使用する。0より大きい場合は可変ビットレートモードに切り替わる。"),
+                host.movieFfmpegBitrateKbps);
+
+            using (new EditorGUI.DisabledScope(host.movieFfmpegBitrateKbps > 0))
+            {
+                host.movieFfmpegQp = EditorGUILayout.IntSlider(
+                    new GUIContent("QP", "固定量子化パラメータ。値が小さいほど高画質・大容量(目安 0-51、既定24)。目標ビットレートが0より大きい場合は無視される。"),
+                    host.movieFfmpegQp, 0, 51);
+            }
+
+            EditorGUILayout.HelpBox("FFmpeg NVENC を選択した場合、上の Quality / Bitrate (Mbps) は使用されません(内蔵エンコーダ専用の設定です)。", MessageType.Info);
+
+            EditorGUI.indentLevel--;
+        }
+
         protected override string GetFileExtension()
         {
             return host.movieOutputFormat switch
@@ -185,14 +248,36 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             {
                 bool alphaSupported = host.movieOutputFormat == MovieRecorderSettings.VideoRecorderOutputFormat.MOV ||
                                     host.movieOutputFormat == MovieRecorderSettings.VideoRecorderOutputFormat.WebM;
-                
+
                 if (!alphaSupported)
                 {
                     errorMessage = "Alpha channel is not supported with the selected format";
                     return false;
                 }
             }
-            
+
+            // FFmpeg NVENC エンコーダのチェック(specs/mtr-nvenc-encoder)
+            if (host.movieEncoderType != MovieEncoderType.CoreEncoder)
+            {
+                if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
+                {
+                    errorMessage = "FFmpeg NVENC encoder requires the MP4 format";
+                    return false;
+                }
+
+                if (string.IsNullOrEmpty(host.movieFfmpegPath))
+                {
+                    errorMessage = "FFmpeg NVENC encoder requires ffmpeg path to be set";
+                    return false;
+                }
+
+                if (!System.IO.File.Exists(host.movieFfmpegPath))
+                {
+                    errorMessage = $"ffmpeg.exe not found at: {host.movieFfmpegPath}";
+                    return false;
+                }
+            }
+
             errorMessage = null;
             return true;
         }
