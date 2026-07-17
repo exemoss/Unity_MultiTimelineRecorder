@@ -65,6 +65,25 @@ Ported into this fork (`jp.iridescent.multitimelinerecorder`) as:
   `allowUnsafeCode: false` (MTR's existing project-wide convention; the
   sample's own asmdef sets `allowUnsafeCode: true`).
 
+Two other functional differences from the original sample:
+
+- `MtrFFmpegEncoder.OpenStream()`'s `catch` clause fixes a sample bug: the
+  original sample's catch block calls `_ffmpegVideoPipe.Dispose()` without
+  nulling the field afterward, so if `_ffmpegAudioPipe`'s constructor also
+  throws, the `finally`-less cleanup path could `Dispose()` the same
+  `_ffmpegVideoPipe` instance twice. The MTR port sets each pipe field to
+  `null` immediately after disposing it, so a second `Dispose()` call can
+  never happen.
+- `MtrFFmpegEncoderSettings.GetOptions()` applies the rate-control arguments
+  (`-rc constqp -qmin/-qmax -qp`, or `-rc vbr -b:v/-maxrate/-bufsize`) to
+  **both** `h264_nvenc` and `hevc_nvenc`. The original sample's `HevcNvidia`
+  codec entry only set `-preset p7 -tune hq -rc-lookahead 4` with no rate
+  control at all (relying on the codec's internal default), which would have
+  made HEVC's QP/bitrate UI fields in this fork no-ops for HEVC. The port
+  applies the same rate-control construction to both codecs so the
+  UI-adjustable `Qp`/`BitrateKbps` fields behave consistently regardless of
+  which NVENC codec is selected.
+
 No other functional changes were made; the rawvideo/AAC pipe protocol, the
 audio remux-on-close step, and the ffmpeg command-line construction approach
 are otherwise unchanged from the original sample.

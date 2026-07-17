@@ -87,7 +87,9 @@ namespace Unity.MultiTimelineRecorder.Encoders
         {
             string codec = Format == OutputFormat.HevcNvenc ? "hevc_nvenc" : "h264_nvenc";
 
-            // qmin/qmax は h264_nvenc の constqp モードでのみ意味を持つ (サンプルの H264Nvidia 既定値を踏襲)。
+            // レート制御引数(constqp の qmin/qmax、または vbr の b:v/maxrate/bufsize)は
+            // h264_nvenc / hevc_nvenc の両方に適用する(サンプルの HevcNvidia はプリセット指定
+            // のみでレート制御を欠いていたため、移植時に H.264 と揃えた。NOTICE.md 参照)。
             // profile:v high は HEVC では無効な値のため H.264 のときのみ付与する。
             string rateControl = bitrateKbps > 0
                 ? $"-rc vbr -b:v {bitrateKbps}k -maxrate {bitrateKbps * 3 / 2}k -bufsize {bitrateKbps * 2}k"
