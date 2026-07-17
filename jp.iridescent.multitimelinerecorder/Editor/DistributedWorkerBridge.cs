@@ -557,6 +557,11 @@ namespace Unity.MultiTimelineRecorder
             EditorPrefs.DeleteKey("STR_Progress");
             EditorPrefs.DeleteKey("STR_Status");
             EditorPrefs.DeleteKey("STR_CurrentTime");
+            // Encoder memory backpressure state (v1.5.13+): guard against a previous job
+            // leaving these set if the Editor was closed/crashed mid-abort, which would
+            // otherwise make JobRunner misread this brand-new job as already failed/stalling.
+            EditorPrefs.DeleteKey("STR_IsRenderingFailed");
+            EditorPrefs.DeleteKey("STR_EncoderBackpressureStalling");
 
             // ── 6. Inject RenderingData + PlayModeTimelineRenderer (same as MTR local) ─
             // (mirrors MultiTimelineRecorder.cs :1975-1987)
