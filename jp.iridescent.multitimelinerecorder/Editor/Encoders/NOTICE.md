@@ -64,6 +64,20 @@ Ported into this fork (`jp.iridescent.multitimelinerecorder`) as:
   required and `Unity.MultiTimelineRecorder.Editor.asmdef` can keep
   `allowUnsafeCode: false` (MTR's existing project-wide convention; the
   sample's own asmdef sets `allowUnsafeCode: true`).
+- `MtrFFmpegPipe.SyncFrameData()` now bounds the *total* time it will wait
+  per call with a `Stopwatch` (`_syncStallTimeoutMs`, 60 seconds), in
+  addition to the existing `_terminate` check. The `_terminate` check (see
+  above) only covers a dead ffmpeg subprocess; if ffmpeg is alive but has
+  stalled (hung encoder/driver, GPU issue, etc.), the original loop — and
+  the MTR port's own `_terminate`-aware loop — would still wait on
+  `_copyPong`/`_pipePong` indefinitely. Exceeding the timeout now force-sets
+  `_terminate` (via a new `LogSyncStallTimeoutAndTerminate()` helper) so the
+  recording session fails safely with a clear `Debug.LogError` instead of
+  hanging the Unity main thread (`specs/mtr-nvenc-encoder`, iteration 3 —
+  this complements the producer-side stall/timeout added to
+  `PlayModeTimelineRenderer` in the same iteration, replacing the
+  `EditorApplication.isPaused`-based backpressure that could hang
+  indefinitely because it also stopped the frame-consuming side).
 
 Two other functional differences from the original sample:
 

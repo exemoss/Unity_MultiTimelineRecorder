@@ -14,6 +14,13 @@
 //     allowUnsafeCode: false (Unity.MultiTimelineRecorder.Editor.asmdef) with
 //     no extra package dependency (Reinterpret<byte>(int) is a CoreModule
 //     API, not the two-type-argument com.unity.collections extension method).
+//   - SyncFrameData() now also bounds the *total* wait time per call with a
+//     Stopwatch (_syncStallTimeoutMs, 60s). The _terminate check above only
+//     covers a dead ffmpeg subprocess; if ffmpeg is alive but has stalled
+//     (e.g. a hung encoder/driver), the original loop would still wait on
+//     _copyPong/_pipePong forever. Exceeding the timeout now force-sets
+//     _terminate so this recording session fails safely instead of hanging
+//     the Unity main thread (specs/mtr-nvenc-encoder, iteration 3).
 //#define MTR_FFMPEG_PIPE_TRACE_ENABLED
 
 using System;
@@ -131,6 +138,18 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
         internal void SyncFrameData()
         {
+            // mtr-nvenc-encoder イテレーション3 で追加: 上記の _terminate チェックは
+            // 「ffmpegが死んだ」場合の無限待ちは防ぐが、「ffmpegは生きているが異常に遅い/
+            // 詰まっている」場合は _terminate が立たないため、このメソッドはキューが
+            // 減るまで際限なく待ち続けられる。この待ち自体は本来「エンコーダの消費速度に
+            // 描画側を同期させる」正しい背圧だが、無限にはしない
+            // （specs/mtr-nvenc-encoder/investigation.md: Play Mode全体を止める背圧が
+            // resume不能で恒久ハングした事象を踏まえ、フォーク内の同期待ちにも
+            // 明示的な上限を設ける方針）。累計待ち時間が _syncStallTimeoutMs を超えたら
+            // ffmpegが実質ハングしていると判断して _terminate させ、以降のフレームは
+            // 破棄する（Unity 側はハングせず、録画は不完全なまま安全に打ち切られる）。
+            var stopwatch = Stopwatch.StartNew();
+
             // Wait for the copy queue to get emptied using pong
             // notification signals sent from the copy thread.
             while (_copyQueue.Count > 0)
@@ -143,6 +162,11 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 if (_terminate)
                 {
                     LogTerminationOnce();
+                    return;
+                }
+                if (stopwatch.ElapsedMilliseconds >= _syncStallTimeoutMs)
+                {
+                    LogSyncStallTimeoutAndTerminate("_copyQueue.Count = " + _copyQueue.Count);
                     return;
                 }
                 if (!_copyPong.WaitOne(_timeoutValue))
@@ -167,6 +191,11 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 if (_terminate)
                 {
                     LogTerminationOnce();
+                    return;
+                }
+                if (stopwatch.ElapsedMilliseconds >= _syncStallTimeoutMs)
+                {
+                    LogSyncStallTimeoutAndTerminate("_pipeQueue.Count = " + _pipeQueue.Count);
                     return;
                 }
                 Log("Sync WaitOne pipe " + _name);
@@ -258,6 +287,9 @@ namespace Unity.MultiTimelineRecorder.Encoders
         Queue<byte[]> _pipeQueue = new Queue<byte[]>();
         Queue<byte[]> _freeBuffer = new Queue<byte[]>();
         int _timeoutValue = 500; // .5 sec
+        // SyncFrameData() 1回あたりの累計待ち時間の上限（ffmpegが生きたまま異常に遅い/
+        // 詰まっているケースの恒久ハング防止。mtr-nvenc-encoder イテレーション3で追加）。
+        int _syncStallTimeoutMs = 60000; // 60 sec
         string _arguments;
 
         internal static string ExecutablePath => _executablePath;
@@ -278,6 +310,21 @@ namespace Unity.MultiTimelineRecorder.Encoders
             Debug.LogError(
                 $"[MtrFFmpegPipe:{_name}] ffmpeg プロセスが停止したため、これ以降のフレームは破棄されます。" +
                 "ffmpegPath の指定・NVENC 対応 GPU ドライバ・ディスク空き容量を確認してください。");
+        }
+
+        // ffmpeg プロセス自体は生きているが、_syncStallTimeoutMs を超えてもキューが
+        // 減らない（＝実質ハングしている）場合に呼ぶ。_terminate を立てて以降の
+        // PushFrameData/SyncFrameData を即座に抜けさせ、Unity 側の無限待ちを防ぐ。
+        void LogSyncStallTimeoutAndTerminate(string queueDetail)
+        {
+            _terminate = true;
+            Debug.LogError(
+                $"[MtrFFmpegPipe:{_name}] キューのドレイン待ちが{_syncStallTimeoutMs / 1000}秒を超えました" +
+                $"（{queueDetail}）。ffmpeg プロセスは生存していますが、消費が構造的に追いついていない" +
+                "か実質的にハングしていると判断し、これ以降のフレームを破棄して録画を安全に打ち切ります。" +
+                "ffmpegPath・エンコードプリセット（QP/ビットレート）・出力ディスクの空き容量と速度を" +
+                "確認してください。");
+            LogTerminationOnce();
         }
 
         #endregion
