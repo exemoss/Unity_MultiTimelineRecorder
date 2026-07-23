@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 using DistributedRecorder.Master;
@@ -25,6 +26,17 @@ namespace DistributedRecorder.Tests.Master
     ///
     /// No Unity scene, no real network, no EditorWindow instantiation — all types under test
     /// are pure logic / static helpers.
+    ///
+    /// Exception: <c>DispatchAsync_WithEmptyCommitOverride_RealGitProjectRootDoesNotLeakLocalHead</c>
+    /// spawns a real, throwaway git repository via the git CLI (see
+    /// <see cref="CreateTempGitRepoWithOneCommit"/>). <see cref="GitInfoTests"/> normally
+    /// delegates real-git-process coverage to the Tester, but the bug this test guards against
+    /// (test-report.md iteration 1, E6/B3) is only observable when <c>GitInfo.TryGetHeadCommit</c>
+    /// would otherwise SUCCEED against the project root — a plain non-git temp directory cannot
+    /// exercise that path, which is exactly how the original bug went undetected by the
+    /// then-existing hermetic test. git is already a hard runtime dependency of this whole
+    /// feature (GitInfo, worker-git-sync), so this is a deliberate, narrow deviation rather than
+    /// a general precedent.
     /// </summary>
     [TestFixture]
     public class JobManifestTests
@@ -523,8 +535,17 @@ namespace DistributedRecorder.Tests.Master
         }
 
         [Test]
-        public async Task DispatchAsync_WithEmptyCommitOverride_FallsBackToLegacyBehavior()
+        public async Task DispatchAsync_WithEmptyCommitOverride_SendsEmptyGitCommitWithoutComputingHash()
         {
+            // Renamed from "...FallsBackToLegacyBehavior" (test-report.md iteration 1, E6/B3):
+            // an explicitly-empty commitOverride is NOT "no override" — it means "manifest mode,
+            // sourceGitCommit is empty because the exported content project has no git" (plan.md
+            // B3/E6), and must never fall back to computing THIS project root's local HEAD or
+            // whole-Assets hash. _tempProjectRoot happens not to be a git repo here, which is why
+            // the pre-fix bug's misleading name ("falls back to legacy behaviour") went unnoticed:
+            // the local-HEAD lookup would have failed anyway, coincidentally producing the same
+            // empty gitCommit. See DispatchAsync_WithEmptyCommitOverride_RealGitProjectRoot_
+            // DoesNotLeakLocalHead below for the actual bug repro (project root IS a real repo).
             var transport  = new CapturingTransport(MakeHealthJson());
             var dispatcher = new JobDispatcher(transport, _tempProjectRoot, commitOverride: string.Empty);
 
@@ -532,8 +553,52 @@ namespace DistributedRecorder.Tests.Master
                 MakeWorker(), MakeRequest("job-empty-override"), skipVersionCheck: true);
 
             Assert.IsTrue(result.Success, result.ErrorMessage);
-            // Not a git repo -> gitCommit falls back to empty (legacy behaviour unchanged).
             StringAssert.Contains("\"gitCommit\":\"\"", transport.LastPostedJson);
+            // projectHash must also stay empty — computing it from _tempProjectRoot would be
+            // pointless busywork even when that root is not a git repo, since the override
+            // (however empty) is the single source of truth in manifest mode (plan.md 論点4).
+            StringAssert.Contains("\"projectHash\":\"\"", transport.LastPostedJson);
+        }
+
+        [Test]
+        public async Task DispatchAsync_WithEmptyCommitOverride_RealGitProjectRootDoesNotLeakLocalHead()
+        {
+            // Permanent regression test for test-report.md iteration 1 (E6/B3 FAIL).
+            //
+            // Bug: a lightweight master's own project root is often a REAL, content-unrelated
+            // git repository (an ordinary Unity project the user happens to have `git init`-ed).
+            // Before the fix, JobDispatcher checked `string.IsNullOrEmpty(_commitOverride)`, which
+            // cannot distinguish "no override supplied" (null, legacy full-project dispatch) from
+            // "override explicitly supplied but empty" (manifest mode, non-git CONTENT export —
+            // plan.md B3/E6). Both looked identical to IsNullOrEmpty, so the empty-override case
+            // fell through to GitInfo.TryGetHeadCommit(_projectRoot) and leaked this unrelated
+            // repo's HEAD into request.gitCommit instead of sending "" as the manifest's
+            // sourceGitCommit demands. The Tester reproduced this dynamically with a real git repo
+            // (test-report.md "失敗詳細"); this test makes that reproduction permanent.
+            string realGitRoot = CreateTempGitRepoWithOneCommit();
+            try
+            {
+                var transport  = new CapturingTransport(MakeHealthJson());
+                var dispatcher = new JobDispatcher(transport, realGitRoot, commitOverride: string.Empty);
+
+                var result = await dispatcher.DispatchAsync(
+                    MakeWorker(), MakeRequest("job-empty-override-real-git-root"), skipVersionCheck: true);
+
+                Assert.IsTrue(result.Success, result.ErrorMessage);
+                StringAssert.Contains("\"gitCommit\":\"\"", transport.LastPostedJson,
+                    "An explicitly-empty commitOverride (manifest mode, non-git content export) " +
+                    "must be sent to the Worker as gitCommit=\"\" even when the lightweight " +
+                    "master's OWN project root happens to be a real git repository with commits.");
+                StringAssert.Contains("\"projectHash\":\"\"", transport.LastPostedJson,
+                    "The projectHash fallback must also be skipped in override mode — computing " +
+                    "it from the lightweight master's own (content-unrelated) project root would " +
+                    "be meaningless.");
+            }
+            finally
+            {
+                if (Directory.Exists(realGitRoot))
+                    Directory.Delete(realGitRoot, recursive: true);
+            }
         }
 
         [Test]
@@ -581,6 +646,76 @@ namespace DistributedRecorder.Tests.Master
             masterUnityVersion        = Application.unityVersion,
             masterRecorderVersion     = VersionChecker.RecorderVersion,
         };
+
+        /// <summary>
+        /// Creates a real, throwaway git repository (via the actual git CLI, mirroring
+        /// <see cref="GitInfo"/>'s own Process.Start usage) with a single commit, so tests can
+        /// prove that <see cref="JobDispatcher"/> never consults it when a commit override was
+        /// explicitly supplied. This is intentionally a real repo rather than a fake/mock: the
+        /// bug this guards against (test-report.md iteration 1) only manifests when
+        /// GitInfo.TryGetHeadCommit would otherwise SUCCEED against the project root, which a
+        /// non-git temp directory cannot exercise.
+        /// </summary>
+        private static string CreateTempGitRepoWithOneCommit()
+        {
+            string root = Path.Combine(
+                Path.GetTempPath(), "JobManifestTests_RealGitRoot_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            File.WriteAllText(Path.Combine(root, "readme.txt"), "content-unrelated repo");
+
+            RunGit(root, "init");
+            RunGit(root, "config", "user.email", "jobmanifesttests@example.invalid");
+            RunGit(root, "config", "user.name", "JobManifestTests");
+            RunGit(root, "add", "-A");
+            RunGit(root, "commit", "-m", "initial commit (unrelated to any MTR content project)");
+            return root;
+        }
+
+        private static void RunGit(string workingDirectory, params string[] args)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName               = "git",
+                WorkingDirectory       = workingDirectory,
+                UseShellExecute        = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                CreateNoWindow         = true,
+            };
+            // ArgumentList: each element is a separate argument – no shell quoting/injection,
+            // consistent with GitInfo.RunGit's security posture.
+            foreach (string arg in args)
+                psi.ArgumentList.Add(arg);
+
+            Process process;
+            try
+            {
+                process = Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                // git CLI unavailable on this machine — inconclusive (not a test failure), same
+                // graceful-degradation policy production GitInfo.RunGit applies at runtime. This
+                // whole feature already hard-depends on git being installed, so this branch is
+                // not expected to trigger in practice.
+                Assert.Inconclusive($"git CLI unavailable, cannot run 'git {string.Join(" ", args)}': {ex.Message}");
+                return;
+            }
+
+            using (process)
+            {
+                if (!process.WaitForExit(10000))
+                {
+                    try { process.Kill(); } catch { /* best-effort */ }
+                    Assert.Fail($"git {string.Join(" ", args)} timed out in {workingDirectory}");
+                }
+                if (process.ExitCode != 0)
+                {
+                    string stderr = process.StandardError.ReadToEnd();
+                    Assert.Fail($"git {string.Join(" ", args)} failed in {workingDirectory}: {stderr}");
+                }
+            }
+        }
 
         private sealed class CapturingTransport : ITransport
         {
