@@ -189,8 +189,14 @@ namespace DistributedRecorder.Master
             var validJobs = new List<JobManifestEntry>(loaded.jobs.Count);
             for (int i = 0; i < loaded.jobs.Count; i++)
             {
-                var entry = loaded.jobs[i];
-                if (entry != null && ValidateEntry(entry, loaded.sourceGitCommit, out string reason))
+                var entry  = loaded.jobs[i];
+                // Initialized up front (not just via the `out` param below): when entry is
+                // null the ValidateEntry call short-circuits and never runs, which would
+                // otherwise leave `reason` definitely-unassigned on that path.
+                string reason = string.Empty;
+                bool isValid = entry != null && ValidateEntry(entry, loaded.sourceGitCommit, out reason);
+
+                if (isValid)
                 {
                     validJobs.Add(entry);
                 }
