@@ -596,8 +596,7 @@ namespace DistributedRecorder.Tests.Master
             }
             finally
             {
-                if (Directory.Exists(realGitRoot))
-                    Directory.Delete(realGitRoot, recursive: true);
+                ForceDeleteDirectory(realGitRoot);
             }
         }
 
@@ -669,6 +668,23 @@ namespace DistributedRecorder.Tests.Master
             RunGit(root, "add", "-A");
             RunGit(root, "commit", "-m", "initial commit (unrelated to any MTR content project)");
             return root;
+        }
+
+        /// <summary>
+        /// Recursively deletes <paramref name="path"/>, clearing the read-only attribute on
+        /// every file first. Plain <c>Directory.Delete(path, recursive: true)</c> throws
+        /// <see cref="UnauthorizedAccessException"/> on Windows for a real git repository
+        /// (<c>git init</c>/<c>commit</c> can leave files under <c>.git/</c> read-only).
+        /// </summary>
+        private static void ForceDeleteDirectory(string path)
+        {
+            if (!Directory.Exists(path))
+                return;
+
+            foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+                File.SetAttributes(file, FileAttributes.Normal);
+
+            Directory.Delete(path, recursive: true);
         }
 
         private static void RunGit(string workingDirectory, params string[] args)
