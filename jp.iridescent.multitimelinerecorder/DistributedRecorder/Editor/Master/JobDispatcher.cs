@@ -20,6 +20,7 @@ namespace DistributedRecorder.Master
     {
         private readonly ITransport    _transport;
         private readonly string        _projectRoot;
+        private readonly string        _commitOverride;
 
         // dispatch-progress-feedback: shortened from 10s → 3s so a dead/filtered Worker
         // is detected quickly during DispatchAsync liveness check and failsafe health.
@@ -32,10 +33,30 @@ namespace DistributedRecorder.Master
         private static readonly TimeSpan AlignHealthPollInterval = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan AlignHealthPollTimeout  = TimeSpan.FromSeconds(120);
 
-        public JobDispatcher(ITransport transport, string projectRoot)
+        /// <param name="transport">HMAC-authenticated transport used for all Worker calls.</param>
+        /// <param name="projectRoot">
+        /// Absolute path of the Master's own Unity project (used for local HEAD / project-hash
+        /// computation when <paramref name="commitOverride"/> is not supplied).
+        /// </param>
+        /// <param name="commitOverride">
+        /// Optional git commit SHA to inject into every dispatched <see cref="JobRequest.gitCommit"/>
+        /// instead of computing <paramref name="projectRoot"/>'s local HEAD.
+        ///
+        /// Added for lightweight-master-manifest (plan.md 論点4 機構A): a lightweight master's
+        /// <paramref name="projectRoot"/> is the MTR-only project, not the content repository,
+        /// so <c>GitInfo.TryGetHeadCommit(_projectRoot)</c> would compute the WRONG commit (or
+        /// none at all). The override is the <c>sourceGitCommit</c> recorded in the job manifest
+        /// at export time on the heavyweight machine that actually owns the content repo.
+        ///
+        /// When null or empty (the default), behaviour is completely unchanged from before this
+        /// parameter existed: <see cref="DispatchAsync"/> computes the local HEAD via
+        /// <see cref="GitInfo.TryGetHeadCommit"/> exactly as it always has.
+        /// </param>
+        public JobDispatcher(ITransport transport, string projectRoot, string commitOverride = null)
         {
-            _transport   = transport ?? throw new ArgumentNullException(nameof(transport));
-            _projectRoot = projectRoot;
+            _transport      = transport ?? throw new ArgumentNullException(nameof(transport));
+            _projectRoot    = projectRoot;
+            _commitOverride = commitOverride;
         }
 
         /// <summary>
@@ -487,10 +508,18 @@ namespace DistributedRecorder.Master
             request.masterRecorderVersion = VersionChecker.RecorderVersion;
             request.skipHashCheck         = skipHashCheck;
 
-            // Inject HEAD git commit (commit-based-project-verification).
+            // Inject HEAD git commit (commit-based-project-verification), unless a commit
+            // override was supplied at construction time (lightweight-master-manifest,
+            // plan.md 論点4 機構A). When overridden, skip the local HEAD computation entirely —
+            // see the constructor's <paramref name="commitOverride"/> doc for why a lightweight
+            // master's own project root must never be consulted here.
             // On failure (not a git repo, git not installed) we proceed with empty gitCommit
             // so the Worker falls back to hash-based verification.
-            if (GitInfo.TryGetHeadCommit(_projectRoot, out string headCommit, out string gitError))
+            if (!string.IsNullOrEmpty(_commitOverride))
+            {
+                request.gitCommit = _commitOverride;
+            }
+            else if (GitInfo.TryGetHeadCommit(_projectRoot, out string headCommit, out string gitError))
             {
                 request.gitCommit = headCommit;
             }
