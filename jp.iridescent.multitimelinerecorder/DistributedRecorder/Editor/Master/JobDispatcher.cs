@@ -21,6 +21,16 @@ namespace DistributedRecorder.Master
         private readonly ITransport    _transport;
         private readonly string        _projectRoot;
         private readonly string        _commitOverride;
+        // Distinguishes "no override supplied" (null — legacy full-project dispatch,
+        // constructor's default) from "override explicitly supplied, possibly empty"
+        // (lightweight-master-manifest dispatch, non-git content export → sourceGitCommit
+        // is ""). string.IsNullOrEmpty(_commitOverride) cannot tell these apart, which was
+        // the root cause of a bug (test-report.md iteration 1, E6/B3): an empty-but-supplied
+        // override was treated the same as "not supplied", so DispatchAsync fell back to
+        // GitInfo.TryGetHeadCommit(_projectRoot) — the lightweight master's OWN, content-
+        // unrelated project root — and leaked its HEAD into request.gitCommit instead of
+        // leaving it empty.
+        private readonly bool          _hasCommitOverride;
 
         // dispatch-progress-feedback: shortened from 10s → 3s so a dead/filtered Worker
         // is detected quickly during DispatchAsync liveness check and failsafe health.
@@ -39,7 +49,7 @@ namespace DistributedRecorder.Master
         /// computation when <paramref name="commitOverride"/> is not supplied).
         /// </param>
         /// <param name="commitOverride">
-        /// Optional git commit SHA to inject into every dispatched <see cref="JobRequest.gitCommit"/>
+        /// Git commit SHA to inject into every dispatched <see cref="JobRequest.gitCommit"/>
         /// instead of computing <paramref name="projectRoot"/>'s local HEAD.
         ///
         /// Added for lightweight-master-manifest (plan.md 論点4 機構A): a lightweight master's
@@ -48,15 +58,28 @@ namespace DistributedRecorder.Master
         /// none at all). The override is the <c>sourceGitCommit</c> recorded in the job manifest
         /// at export time on the heavyweight machine that actually owns the content repo.
         ///
-        /// When null or empty (the default), behaviour is completely unchanged from before this
-        /// parameter existed: <see cref="DispatchAsync"/> computes the local HEAD via
-        /// <see cref="GitInfo.TryGetHeadCommit"/> exactly as it always has.
+        /// <b>Null vs. empty string are NOT equivalent here</b> — this is the whole point of the
+        /// parameter:
+        /// <list type="bullet">
+        /// <item><description><c>null</c> (the default) means "no override supplied" (legacy
+        /// full-project dispatch). Behaviour is completely unchanged from before this parameter
+        /// existed: <see cref="DispatchAsync"/> computes the local HEAD via
+        /// <see cref="GitInfo.TryGetHeadCommit"/> exactly as it always has.</description></item>
+        /// <item><description><c>""</c> (empty string) means "manifest mode, but the exported
+        /// content project has no git commit" (plan.md B3/E6: non-git content export). In this
+        /// case <see cref="DispatchAsync"/> must send <c>gitCommit = ""</c> as-is and must NOT
+        /// fall back to computing <paramref name="projectRoot"/>'s local HEAD or whole-Assets
+        /// hash — that project root belongs to the lightweight master, not the content repo, so
+        /// both would be meaningless / wrong.</description></item>
+        /// <item><description>Any non-empty string is injected verbatim as <c>gitCommit</c>.</description></item>
+        /// </list>
         /// </param>
         public JobDispatcher(ITransport transport, string projectRoot, string commitOverride = null)
         {
-            _transport      = transport ?? throw new ArgumentNullException(nameof(transport));
-            _projectRoot    = projectRoot;
-            _commitOverride = commitOverride;
+            _transport         = transport ?? throw new ArgumentNullException(nameof(transport));
+            _projectRoot       = projectRoot;
+            _commitOverride    = commitOverride;
+            _hasCommitOverride = commitOverride != null;
         }
 
         /// <summary>
@@ -510,31 +533,35 @@ namespace DistributedRecorder.Master
 
             // Inject HEAD git commit (commit-based-project-verification), unless a commit
             // override was supplied at construction time (lightweight-master-manifest,
-            // plan.md 論点4 機構A). When overridden, skip the local HEAD computation entirely —
-            // see the constructor's <paramref name="commitOverride"/> doc for why a lightweight
-            // master's own project root must never be consulted here.
-            // On failure (not a git repo, git not installed) we proceed with empty gitCommit
-            // so the Worker falls back to hash-based verification.
-            if (!string.IsNullOrEmpty(_commitOverride))
+            // plan.md 論点4 機構A). When overridden, skip the local HEAD computation AND the
+            // projectHash fallback entirely — see the constructor's <paramref name="commitOverride"/>
+            // doc for why a lightweight master's own project root must never be consulted here.
+            //
+            // _hasCommitOverride (not string.IsNullOrEmpty(_commitOverride)!) is the branch
+            // condition: an empty-but-supplied override (non-git content export, plan.md B3/E6)
+            // must be sent to the Worker as gitCommit="" verbatim, NOT treated as "no override"
+            // and fall back to this (lightweight) master's own, content-unrelated HEAD/hash
+            // (test-report.md iteration 1 bug — see field comment on _hasCommitOverride).
+            //
+            // On local-HEAD failure in the no-override path (not a git repo, git not installed)
+            // we proceed with empty gitCommit so the Worker falls back to hash-based verification.
+            if (_hasCommitOverride)
             {
-                request.gitCommit = _commitOverride;
+                request.gitCommit   = _commitOverride;
+                request.projectHash = string.Empty;
             }
             else if (GitInfo.TryGetHeadCommit(_projectRoot, out string headCommit, out string gitError))
             {
-                request.gitCommit = headCommit;
+                // git commit obtained – the Worker verifies by commit, so skip the expensive
+                // whole-Assets hash (a major contributor to the dispatch-time Editor freeze).
+                request.gitCommit   = headCommit;
+                request.projectHash = string.Empty;
             }
             else
             {
                 request.gitCommit = string.Empty;
                 Debug.LogWarning(
                     $"[JobDispatcher] git rev-parse HEAD failed – falling back to content-hash: {gitError}");
-            }
-
-            // projectHash is only the fallback for non-git projects. When a git commit was
-            // obtained above, the Worker verifies by commit, so skip the expensive
-            // whole-Assets hash (a major contributor to the dispatch-time Editor freeze).
-            if (string.IsNullOrEmpty(request.gitCommit))
-            {
                 try
                 {
                     request.projectHash = ProjectHasher.Compute(_projectRoot);
@@ -544,10 +571,6 @@ namespace DistributedRecorder.Master
                     return DispatchResult.Fail(request.jobId, DispatchFailReason.HashError,
                         $"Failed to compute project hash: {ex.Message}");
                 }
-            }
-            else
-            {
-                request.projectHash = string.Empty;
             }
 
             // 4. POST the job
