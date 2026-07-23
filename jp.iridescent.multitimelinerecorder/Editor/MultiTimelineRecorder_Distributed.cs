@@ -454,6 +454,12 @@ namespace Unity.MultiTimelineRecorder
                     DrawWorkerVersionBadges(_distWorkerRegistry.workers);
                 }
 
+                // ── lightweight-master-manifest: export/import buttons ──────────────
+                // Import works with zero selected Timelines (the lightweight-master
+                // scenario), so it is drawn unconditionally here rather than gated behind
+                // imageTimelineCount below.
+                DrawManifestSection();
+
                 // ── Lightweight target count (no CollectRenderTargets / AssetDatabase) ──
                 // CollectRenderTargets() is called only at dispatch time (button click in
                 // DrawRecordControls). Here we just show a cheap count so the UI can
@@ -2366,14 +2372,15 @@ namespace Unity.MultiTimelineRecorder
         // Dispatch entry point
         // -----------------------------------------------------------------------
 
-        private async void StartDistributedRecordingAsync(List<DistributedTimelineJob> targets)
+        private async void StartDistributedRecordingAsync(
+            List<DistributedTimelineJob> targets, ManifestDispatchContext manifestCtx = null)
         {
             // async void: wrap entire body so any synchronous or async exception is logged
             // rather than silently crashing the Editor (uncaught exception in async void
             // propagates to the synchronization context and can destabilize the Editor).
             try
             {
-                await StartDistributedRecordingInternalAsync(targets);
+                await StartDistributedRecordingInternalAsync(targets, manifestCtx);
             }
             catch (Exception ex)
             {
@@ -2397,14 +2404,28 @@ namespace Unity.MultiTimelineRecorder
         /// Unreachable and the batch is finalized without entering the event loop.
         /// The reactive failover path (DispatchOneWithOverrideAsync) covers the case
         /// where a Worker that passed the probe becomes unreachable later.
+        ///
+        /// lightweight-master-manifest: when <paramref name="manifestCtx"/> is non-null, this
+        /// batch originated from an imported job manifest rather than a live scene/Timeline
+        /// selection (plan.md 案A). Three steps are skipped because they assume a full content
+        /// project that the lightweight master does not have — F10 scene-open, F5 dirty-warn,
+        /// and the sync-before-dispatch git gate (its ahead-count / branch check reads the
+        /// lightweight master's OWN project root, which is not the content repo) — and the
+        /// batch's <see cref="JobDispatcher"/> is constructed with a commit override
+        /// (<see cref="ManifestDispatchContext.SourceGitCommit"/>) instead of computing local
+        /// HEAD. Freshness is instead guaranteed entirely by the existing Worker-side
+        /// CommitMismatch check (plan.md 論点4/6), unchanged for both code paths.
         /// </summary>
-        private async Task StartDistributedRecordingInternalAsync(List<DistributedTimelineJob> targets)
+        private async Task StartDistributedRecordingInternalAsync(
+            List<DistributedTimelineJob> targets, ManifestDispatchContext manifestCtx = null)
         {
             if (targets == null || targets.Count == 0)
             {
                 Debug.LogWarning("[DistributedRecorder] 投入ジョブが 0 件です。中断します。");
                 return;
             }
+
+            bool isManifestMode = manifestCtx != null;
 
             // ── dispatch-progress-feedback A: progress bar for pre-flight phase ──
             // The bar is shown from OpenScene through the initial job seed.
@@ -2431,6 +2452,13 @@ namespace Unity.MultiTimelineRecorder
             // returns the existing scene without reloading.
             // Main-thread call: this method is called from StartDistributedRecordingAsync (async void
             // on the Unity synchronization context) so Unity API calls are safe here.
+            //
+            // lightweight-master-manifest: skipped entirely in manifest mode. A lightweight
+            // master has no content project open (and typically no scene/Timeline assets on
+            // disk at all) — ScenePath values in a manifest job describe the EXPORTING
+            // machine's scene, not anything that exists locally to open.
+            if (!isManifestMode)
+            {
             var scenePaths = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var job in targets)
             {
@@ -2481,6 +2509,7 @@ namespace Unity.MultiTimelineRecorder
                 return;
             }
             WarnIfTargetAssetsDirty(targets);
+            } // end !isManifestMode (F10 scene-open + F5 dirty-warn)
 
             if (_distWorkerRegistry == null)
             {
@@ -2509,7 +2538,12 @@ namespace Unity.MultiTimelineRecorder
             // Set up batch-scoped shared services (disposed in FinalizeBatchIfDone)
             _batchAuth       = new HmacAuthenticator(keyBytes);
             _batchTransport  = new HttpTransport(_batchAuth);
-            _batchDispatcher = new JobDispatcher(_batchTransport, ProjectPaths.ProjectRoot);
+            // lightweight-master-manifest (plan.md 論点4 機構A): in manifest mode, inject the
+            // manifest's sourceGitCommit as a commit override so DispatchAsync does not compute
+            // HEAD from this (lightweight) project's own root — see ManifestDispatchContext.
+            _batchDispatcher = isManifestMode
+                ? new JobDispatcher(_batchTransport, ProjectPaths.ProjectRoot, manifestCtx.SourceGitCommit)
+                : new JobDispatcher(_batchTransport, ProjectPaths.ProjectRoot);
 
             // ── Pre-flight liveness probe (dispatch-worker-liveness §A) ─────────
             // Probe all registered Workers in parallel (HMAC transport, 3 s timeout).
@@ -2605,7 +2639,13 @@ namespace Unity.MultiTimelineRecorder
             // All awaits here are WITHOUT ConfigureAwait(false) so continuations stay on
             // the Unity main thread (required for EditorUtility.DisplayDialog, Repaint).
             // ProbeWithCommitAsync also must not ConfigureAwait(false) for the same reason.
-            if (onlineWorkers.Count > 0)
+            //
+            // lightweight-master-manifest: skipped in manifest mode (plan.md 論点4 point 4).
+            // RunPreFlightSyncGateAsync reads THIS project's own branch/ahead-count via
+            // ProjectPaths.ProjectRoot, but a lightweight master's project root is not the
+            // content repository, so that check is meaningless here. Freshness is instead
+            // guaranteed entirely by the per-job Worker-side CommitMismatch check (unchanged).
+            if (onlineWorkers.Count > 0 && !isManifestMode)
             {
                 cancelled = await RunPreFlightSyncGateAsync(onlineWorkers, k_BarTitle);
                 if (cancelled)
