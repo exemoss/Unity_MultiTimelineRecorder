@@ -300,8 +300,17 @@ namespace Unity.MultiTimelineRecorder
                 throw new NotSupportedException(
                     $"RecorderSettingsBuilderShared.BuildMovieSettings only supports RecorderSettingsType.Movie. Got: {item.recorderType}");
 
-            // Validate via the shared config validator (checks resolution ≤4096, frameRate,
-            // platform support for MOV/ProRes, alpha channel restrictions).
+            // Validate via the shared config validator (checks encoder-dependent resolution
+            // limits, frameRate, platform support for MOV/ProRes, alpha channel restrictions).
+            // RenderTexture ソースでは Recorder が RT の実寸を出力サイズに使うため、
+            // 検証も RT 実寸で行う(effectiveWidth/Height は Camera/GameView ソース用)。
+            int validationWidth  = effectiveWidth;
+            int validationHeight = effectiveHeight;
+            if (item.imageSourceType == ImageRecorderSourceType.RenderTexture && resolvedRenderTexture != null)
+            {
+                validationWidth  = resolvedRenderTexture.width;
+                validationHeight = resolvedRenderTexture.height;
+            }
             string validationError;
             // Clone a temp config for validation only — the caller owns movieConfig.
             var validationConfig = new MovieRecorderSettingsConfig
@@ -309,8 +318,8 @@ namespace Unity.MultiTimelineRecorder
                 outputFormat    = movieConfig.outputFormat,
                 videoBitrateMode = movieConfig.videoBitrateMode,
                 customBitrate   = movieConfig.customBitrate,
-                width           = effectiveWidth,
-                height          = effectiveHeight,
+                width           = validationWidth,
+                height          = validationHeight,
                 frameRate       = (int)Math.Max(1.0, effectiveFrameRate),
                 capFrameRate    = true,
                 captureAudio    = movieConfig.captureAudio,

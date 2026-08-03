@@ -151,6 +151,24 @@ namespace Unity.MultiTimelineRecorder
             }
             
             /// <summary>
+            /// Movie/Image 出力の実効解像度を返す。
+            /// RenderTexture ソースでは Recorder(RenderTextureInputSettings)が
+            /// 常に RT の実寸を出力サイズとして使うため、width/height 設定値ではなく
+            /// RT 実寸が実際の出力解像度になる。検証・プリフライトはこちらを使うこと。
+            /// </summary>
+            public void GetEffectiveOutputResolution(out int effectiveWidth, out int effectiveHeight)
+            {
+                if (imageSourceType == ImageRecorderSourceType.RenderTexture && imageRenderTexture != null)
+                {
+                    effectiveWidth = imageRenderTexture.width;
+                    effectiveHeight = imageRenderTexture.height;
+                    return;
+                }
+                effectiveWidth = width;
+                effectiveHeight = height;
+            }
+
+            /// <summary>
             /// 設定の検証
             /// </summary>
             public bool Validate(out string errorMessage)
@@ -183,7 +201,9 @@ namespace Unity.MultiTimelineRecorder
                 switch (recorderType)
                 {
                     case RecorderSettingsType.Movie:
-                        return movieConfig.Validate(out errorMessage);
+                        // 録画時(CreateMovieRecorderSettingsFromConfig)と同じ実効解像度で検証する
+                        GetEffectiveOutputResolution(out int effectiveWidth, out int effectiveHeight);
+                        return movieConfig.Validate(effectiveWidth, effectiveHeight, out errorMessage);
                         
                     case RecorderSettingsType.AOV:
                         return aovConfig.Validate(out errorMessage);

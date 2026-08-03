@@ -305,11 +305,21 @@ namespace Unity.MultiTimelineRecorder
                     errorMessage = "Invalid output resolution";
                     return false;
                 }
-                
-                // Check if resolution is too high
-                if (inputSettings.OutputWidth > 4096 || inputSettings.OutputHeight > 4096)
+
+                // エンコーダ / コンテナ別の上限で判定する(一律 4096 だと WebM/ProRes の
+                // 正当な高解像度出力まで弾いてしまう)。エンコーダ種別は EncoderSettings から復元する。
+                var encoderType = MovieEncoderType.CoreEncoder;
+                if (settings.EncoderSettings is Encoders.MtrFFmpegEncoderSettings ffmpegEncoder)
                 {
-                    errorMessage = "Output resolution exceeds maximum supported (4096x4096)";
+                    encoderType = ffmpegEncoder.Format == Encoders.MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc
+                        ? MovieEncoderType.FFmpegNvencHevc
+                        : MovieEncoderType.FFmpegNvencH264;
+                }
+
+                int maxDimension = MovieRecorderSettingsConfig.GetMaxDimension(settings.OutputFormat, encoderType);
+                if (inputSettings.OutputWidth > maxDimension || inputSettings.OutputHeight > maxDimension)
+                {
+                    errorMessage = $"Output resolution exceeds maximum supported for {settings.OutputFormat}/{encoderType} ({maxDimension}px)";
                     return false;
                 }
             }

@@ -166,25 +166,89 @@ namespace Unity.MultiTimelineRecorder
         }
         
         /// <summary>
+        /// エンコーダ / コンテナ別の最大解像度(幅・高さそれぞれの上限 px)。
+        /// H.264 はコーデック仕様上 4096 が上限(内蔵 Media Foundation / NVENC とも)。
+        /// NVENC HEVC と ProRes(MOV) は 8192、WebM(VP8) は libvpx の 14bit 制限で 16383。
+        /// 一律 4096 で弾いていた旧実装は、LED プレビュー等の横長 RenderTexture
+        /// (例: 7488x1344)を WebM で書き出す正当なケースまで黙って落としていた。
+        /// </summary>
+        public const int MaxDimensionH264 = 4096;
+        public const int MaxDimensionHevc = 8192;
+        public const int MaxDimensionProRes = 8192;
+        public const int MaxDimensionWebM = 16383;
+
+        /// <summary>
+        /// この outputFormat / encoderType の組み合わせが H.264 でエンコードされるか。
+        /// 内蔵 CoreEncoder は MP4 選択時に H.264(Media Foundation)を使う。
+        /// </summary>
+        public static bool IsH264(MovieRecorderSettings.VideoRecorderOutputFormat outputFormat, MovieEncoderType encoderType)
+        {
+            return encoderType == MovieEncoderType.FFmpegNvencH264
+                || (encoderType == MovieEncoderType.CoreEncoder
+                    && outputFormat == MovieRecorderSettings.VideoRecorderOutputFormat.MP4);
+        }
+
+        /// <summary>
+        /// outputFormat / encoderType の組み合わせで実際にエンコード可能な最大解像度
+        /// (幅・高さそれぞれの上限 px)を返す。
+        /// </summary>
+        public static int GetMaxDimension(MovieRecorderSettings.VideoRecorderOutputFormat outputFormat, MovieEncoderType encoderType)
+        {
+            if (IsH264(outputFormat, encoderType))
+                return MaxDimensionH264;
+            if (encoderType == MovieEncoderType.FFmpegNvencHevc)
+                return MaxDimensionHevc;
+
+            switch (outputFormat)
+            {
+                case MovieRecorderSettings.VideoRecorderOutputFormat.WebM:
+                    return MaxDimensionWebM;
+                case MovieRecorderSettings.VideoRecorderOutputFormat.MOV:
+                    return MaxDimensionProRes;
+                default:
+                    return MaxDimensionH264;
+            }
+        }
+
+        /// <summary>
         /// Validate configuration
         /// </summary>
         public bool Validate(out string errorMessage)
         {
+            return Validate(width, height, out errorMessage);
+        }
+
+        /// <summary>
+        /// 実効解像度を明示して検証するオーバーロード。
+        /// RenderTexture ソースでは出力解像度が設定値ではなく RT の実寸になるため、
+        /// 呼び出し側(録画前チェック等)が実効値を渡して検証できるようにする。
+        /// </summary>
+        public bool Validate(int effectiveWidth, int effectiveHeight, out string errorMessage)
+        {
             errorMessage = string.Empty;
-            
+
             // Validate resolution
-            if (width <= 0 || height <= 0)
+            if (effectiveWidth <= 0 || effectiveHeight <= 0)
             {
                 errorMessage = "Invalid resolution: width and height must be positive";
                 return false;
             }
-            
-            if (width > 4096 || height > 4096)
+
+            int maxDimension = GetMaxDimension(outputFormat, encoderType);
+            if (effectiveWidth > maxDimension || effectiveHeight > maxDimension)
             {
-                errorMessage = "Resolution exceeds maximum supported (4096x4096)";
+                if (IsH264(outputFormat, encoderType))
+                {
+                    errorMessage = $"解像度 {effectiveWidth}x{effectiveHeight} は H.264 の上限 ({MaxDimensionH264}px) を超えています。" +
+                                   "Video Format を WebM または ProRes (MOV)、もしくはエンコーダを NVENC HEVC に変更してください。";
+                }
+                else
+                {
+                    errorMessage = $"解像度 {effectiveWidth}x{effectiveHeight} は {outputFormat}/{encoderType} の上限 ({maxDimension}px) を超えています。";
+                }
                 return false;
             }
-            
+
             // Validate frame rate
             if (frameRate <= 0 || frameRate > 120)
             {
