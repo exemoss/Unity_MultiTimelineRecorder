@@ -92,6 +92,25 @@ namespace Unity.MultiTimelineRecorder
         public static IReadOnlyList<RenderHistoryEntry> Entries => Load().entries;
 
         /// <summary>
+        /// 現在の実行に対応する未終了（Running）エントリ。無ければ null。
+        /// ウォッチドッグ（取りこぼし監視）の判定に使う。
+        /// </summary>
+        public static RenderHistoryEntry CurrentRunningEntry
+        {
+            get
+            {
+                string currentId = EditorPrefs.GetString(CurrentIdPrefKey, string.Empty);
+                if (string.IsNullOrEmpty(currentId))
+                    return null;
+                var entry = Load().entries.Find(e => e.id == currentId);
+                return entry != null && entry.Status == RenderHistoryStatus.Running ? entry : null;
+            }
+        }
+
+        /// <summary>未終了の実行エントリが残っているか。</summary>
+        public static bool HasUnfinishedCurrentRun => CurrentRunningEntry != null;
+
+        /// <summary>
         /// 録画実行の開始を記録する。前回の Running エントリが残っていれば
         /// （終了検知の取り逃し = Editor クラッシュ / ウィンドウ閉鎖等）Interrupted に確定させる。
         /// </summary>

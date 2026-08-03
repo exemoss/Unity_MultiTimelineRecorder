@@ -12,6 +12,11 @@ namespace Unity.MultiTimelineRecorder
     public interface IRecorderSettingsHost
     {
         // Common properties
+        /// <summary>
+        /// レコーダーアイテムの表示名（&lt;RecorderName&gt; ワイルドカードの解決・
+        /// 出力パスプレビューに使用）。表示名を持たないホストは null を返す。
+        /// </summary>
+        string recorderItemName { get; }
         int frameRate { get; set; }
         int width { get; set; }
         int height { get; set; }
