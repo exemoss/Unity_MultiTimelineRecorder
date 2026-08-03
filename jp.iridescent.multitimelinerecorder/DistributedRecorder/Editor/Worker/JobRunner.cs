@@ -273,6 +273,18 @@ namespace DistributedRecorder.Worker
         private void StartJobInternal(JobRequest request)
         {
 #if UNITY_RECORDER
+            // ----- stale encoder-backpressure state guard (review.md イテレーション3 Blocker #1) -----
+            // DistributedWorkerBridge.StartHeadlessRenderBridge (a1cc718) already clears these
+            // keys immediately before a *headless* job enters Play Mode. That clear does not run
+            // for the legacy fallback path (isMtrPath == false / OnStartHeadlessRender 未登録)
+            // below, so a stale STR_IsRenderingFailed / STR_EncoderBackpressureStalling left by a
+            // previous headless job (e.g. the Editor was closed before JobRunner could consume
+            // the flag — see TryFailJobForBackpressureAbort) would otherwise make this brand-new
+            // legacy job misread itself as already failed/stalling. Clearing here, at the top of
+            // every job start regardless of path, closes that gap.
+            EditorPrefs.DeleteKey("STR_IsRenderingFailed");
+            EditorPrefs.DeleteKey("STR_EncoderBackpressureStalling");
+
             // ----- batchmode guard ----------------------------------------
             // Recorder 5.1 Known Issue: batchmode does not initialise the
             // graphics pipeline, so GameView capture never produces frames.
@@ -876,6 +888,14 @@ namespace DistributedRecorder.Worker
                 _lastKnownFrame     = currentFrame;
                 _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             }
+            else if (IsEncoderBackpressureStalling())
+            {
+                // PlayModeTimelineRenderer がエンコーダメモリ背圧でこの Timeline の director を
+                // 意図的に一時停止している（producer stall）。これは録画が壊れて停滞している
+                // わけではなく、エンコーダの消費待ちという正常な状態なので、汎用の
+                // StallTimeoutSeconds を消費させない（誤 FailJob 防止）。
+                _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            }
             else
             {
                 // Stall detection: if no frames have advanced for StallTimeoutSeconds
@@ -925,6 +945,17 @@ namespace DistributedRecorder.Worker
         /// </summary>
         private void HandleHeadlessPlayback()
         {
+            // review.md イテレーション3 Blocker #1: abort 系（v1.5.17 時点では
+            // PlayModeTimelineRenderer.AbortRenderingDueToEncoderOutputStall。旧
+            // AbortRenderingDueToBackpressureTimeout は撤去済みだが、STR_IsRenderingFailed
+            // を設定して Play Mode を退出する構造は同じ）は STR_IsRenderingComplete を
+            // 立てずに Play Mode を退出するため、下の isComplete チェックだけでは検知
+            // できない。abort から実際の Play Mode 退出までは ExitPlayModeAfterDelay の
+            // ~1秒の猶予があり、その間もこのメソッドは毎フレーム呼ばれ続けるので、
+            // ここで真っ先にチェックする。
+            if (TryFailJobForBackpressureAbort())
+                return;
+
             // Check for completion signal written by PlayModeTimelineRenderer
             bool isComplete = EditorPrefs.GetBool("STR_IsRenderingComplete", false);
             if (isComplete)
@@ -949,6 +980,12 @@ namespace DistributedRecorder.Worker
             if (currentFrame != _lastKnownFrame)
             {
                 _lastKnownFrame     = currentFrame;
+                _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            }
+            else if (IsEncoderBackpressureStalling())
+            {
+                // 上記 HandleDirectorPlayback と同じ理由で、エンコーダメモリ背圧による
+                // 意図的な producer stall 中は汎用の StallTimeoutSeconds を消費させない。
                 _stallCheckStartUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             }
             else if (_recordingTotalFrames > 0)
@@ -983,6 +1020,42 @@ namespace DistributedRecorder.Worker
             });
         }
 
+        /// <summary>
+        /// <c>STR_IsRenderingFailed</c>（PlayModeTimelineRenderer が録画を安全に中断した際に
+        /// 設定するフラグ。v1.5.17 時点では <c>AbortRenderingDueToEncoderOutputStall</c>。
+        /// 旧 <c>AbortRenderingDueToBackpressureTimeout</c> は撤去済みだが、フラグの意味・
+        /// 設定タイミングの構造は同じ）が立っていたら消費し、abort 由来のメッセージで
+        /// ジョブを Fail させる。
+        ///
+        /// v1.5.15 (f7d22e1) はこのチェックを <see cref="HandleWaitingForEditMode"/> にのみ
+        /// 置いていたが、MTR headless パスの完了検知は <c>STR_IsRenderingComplete</c> の
+        /// ポーリングのみで、abort はこれを true にしないため <c>_phase</c> が
+        /// <see cref="RecordingPhase.DirectorPlayback"/> のまま
+        /// <see cref="RecordingPhase.WaitingForEditMode"/> に到達せず、このチェックが
+        /// 実行されなかった（review.md イテレーション3 Blocker #1）。
+        /// <see cref="HandleHeadlessPlayback"/> から毎フレーム呼ぶことで、abort 発生から
+        /// Play Mode 退出まで（<c>ExitPlayModeAfterDelay</c> の ~1秒の猶予）の間に確実に
+        /// 検知できる。<see cref="HandleWaitingForEditMode"/> 側の呼び出しは、万一その経路を
+        /// 通らなかった場合の防御として残す。
+        /// </summary>
+        /// <returns>フラグを検出して FailJob した場合 true。何もしなかった場合 false。</returns>
+        private bool TryFailJobForBackpressureAbort()
+        {
+            bool renderingFailed = EditorPrefs.GetBool("STR_IsRenderingFailed", false);
+            if (!renderingFailed)
+                return false;
+
+            string failureMsg = EditorPrefs.GetString("STR_Status", "MTR recording was aborted mid-render.");
+            EditorPrefs.DeleteKey("STR_IsRenderingFailed");
+            Debug.LogWarning($"[JobRunner] STR_IsRenderingFailed=true を検出。ジョブを Failed にします: '{_runningJobId}' ({failureMsg})");
+            AppendE2ELog($"[JobRunner] MTR 録画が中断されました（{failureMsg}）。ジョブを Failed にします。");
+            UnityEngine.Time.captureFramerate = 0;
+            UnsubscribeAll();
+            CleanupTempTimeline();
+            FailJob(_runningJobId, $"[A-backpressure] {failureMsg}");
+            return true;
+        }
+
         private void HandleWaitingForEditMode()
         {
             // Timeout guard for ExitPlaymode.
@@ -1006,6 +1079,13 @@ namespace DistributedRecorder.Worker
 
             // Wait until Edit Mode is fully restored
             if (EditorApplication.isPlaying) return;
+
+            // 防御的チェック（本来は HandleHeadlessPlayback() が Play Mode 中に検知して
+            // 消費している。review.md イテレーション3 Blocker #1参照）。何らかの理由で
+            // その経路を通らずここまで来た場合に、中断された録画を成功扱いにしない
+            // 最後の砦として残す。
+            if (TryFailJobForBackpressureAbort())
+                return;
 
             Debug.Log($"[JobRunner] Edit Mode に戻りました。ジョブ完了処理: '{_runningJobId}'");
             AppendE2ELog("[JobRunner] Edit Mode に戻りました。");
@@ -1170,6 +1250,22 @@ namespace DistributedRecorder.Worker
         // ------------------------------------------------------------------
         // Error helpers
         // ------------------------------------------------------------------
+
+        /// <summary>
+        /// PlayModeTimelineRenderer が「エンコーダメモリ背圧のため、この Timeline の
+        /// director を意図的に一時停止中」かどうか。
+        /// v1.5.17 で PlayModeTimelineRenderer 側の director 一時停止方式（この EditorPref
+        /// を true にしていた BeginEncoderMemoryStall/ResumeFromEncoderMemoryStall/
+        /// StopEncoderMemoryBackpressureMonitoring）は完全に撤去した（何も Pause しない
+        /// 方針への転換。specs/mtr-nvenc-encoder/implementation.md 参照）ため、
+        /// STR_EncoderBackpressureStalling が true になることは今後無い。
+        /// 後方互換のためこのチェック自体は残す（無害な防御。将来また「director を意図的に
+        /// 一時停止する」経路が復活した場合の受け皿として）。
+        /// </summary>
+        private static bool IsEncoderBackpressureStalling()
+        {
+            return EditorPrefs.GetBool("STR_EncoderBackpressureStalling", false);
+        }
 
         private void FailJob(string jobId, string error)
         {

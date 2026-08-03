@@ -332,18 +332,21 @@ namespace Unity.MultiTimelineRecorder
         private RecorderSettings CreateMovieRecorderSettingsFromConfig(string outputPath, string outputFileName, MultiRecorderConfig.RecorderConfigItem config)
         {
             var settingsConfig = config.movieConfig;
-            settingsConfig.width = config.width;
-            settingsConfig.height = config.height;
+            // RenderTexture ソースでは実際の出力解像度が RT の実寸になるため、
+            // 検証も実効解像度で行う(設定値 width/height は RT と不一致でも出力に影響しない)
+            config.GetEffectiveOutputResolution(out int effectiveWidth, out int effectiveHeight);
+            settingsConfig.width = effectiveWidth;
+            settingsConfig.height = effectiveHeight;
             settingsConfig.frameRate = frameRate;
             settingsConfig.capFrameRate = true;
             
             string errorMessage;
             if (!settingsConfig.Validate(out errorMessage))
             {
-                MultiTimelineRecorderLogger.LogError($"[MultiTimelineRecorder] Invalid movie configuration: {errorMessage}");
+                MultiTimelineRecorderLogger.LogError($"[MultiTimelineRecorder] Invalid movie configuration for recorder '{config.name}': {errorMessage}");
                 return null;
             }
-            
+
             var settings = RecorderSettingsFactory.CreateMovieRecorderSettings("MovieRecorder", settingsConfig);
             
             if (settings != null)

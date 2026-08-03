@@ -232,7 +232,27 @@ namespace Unity.MultiTimelineRecorder
         public int preRollFrames = 0; // Pre-roll frames for simulation warm-up
         public string cameraTag = "MainCamera";
         public OutputResolution outputResolution = OutputResolution.HD1080p;
-        
+
+        // AsyncGPUReadback backpressure settings (GPU device-removed crash prevention)
+        public bool enableReadbackBackpressure = true;
+        public int readbackDrainIntervalFrames = 1;
+
+        // v1.5.7/v1.5.10/v1.5.13-16 に存在した「エンコーダ入力キュー（プロセス RAM）の
+        // 増分監視 + director 一時停止」方式（enableEncoderMemoryBackpressure 等）は
+        // v1.5.17 で完全に撤去した。Play Mode 全体 pause・director 単体 pause のいずれも
+        // 「背圧を逃がす当のフレーム消費処理まで一緒に止めてしまい resume が来ず恒久ハング/
+        // 0秒凍結する」という同型の構造的欠陥を2世代にわたって実証したため
+        // （specs/mtr-nvenc-encoder/investigation.md イテレーション2・3）。
+        //
+        // 後継（Encoder Output Stall Guard）: 内蔵 CoreEncoder には未処理フレーム数に
+        // 相当する信号が公開されていないため、真の in-flight 有界化はできない。代わりに
+        // 録画中の Movie 出力ファイルが一定時間まったく成長していないかだけを監視する
+        // 最終安全弁。director/Play Mode は一切止めない
+        // （詳細は PlayModeTimelineRenderer.cs / specs/mtr-nvenc-encoder/implementation.md）。
+        public bool enableEncoderOutputStallGuard = true;
+        public int encoderStallCheckIntervalSec = 2;
+        public int encoderStallTimeoutSec = 120;
+
         // Debug settings
         public bool debugMode = false; // Keep generated assets for debugging
         private string lastGeneratedAssetPath = null; // Track the last generated asset
@@ -447,7 +467,11 @@ namespace Unity.MultiTimelineRecorder
             // Status section
             DrawStatusSection();
             EditorGUILayout.Space(Styles.SectionSpacing);
-            
+
+            // Render history section
+            DrawRenderHistorySection();
+            EditorGUILayout.Space(Styles.SectionSpacing);
+
             // Debug settings
             DrawDebugSettings();
             
@@ -1140,6 +1164,29 @@ namespace Unity.MultiTimelineRecorder
                     
                     EditorGUILayout.LabelField("", GUILayout.ExpandWidth(true)); // スペーサー
                     EditorGUILayout.EndHorizontal();
+
+                    // Exclusive root override (Refs: mtr-batch-scene-activation 案1)
+                    // 空欄の場合は外側プレハブインスタンスルートを自動推定して使用する。
+                    EditorGUILayout.BeginHorizontal();
+                    EditorGUILayout.LabelField("Exclusive Root", EditorStyles.miniBoldLabel, GUILayout.Width(110));
+
+                    var currentRootOverride = settings.GetTimelineExclusiveRootOverride(currentTimelineIndexForRecorder);
+                    EditorGUI.BeginChangeCheck();
+                    var newRootOverride = EditorGUILayout.ObjectField(currentRootOverride, typeof(GameObject), true) as GameObject;
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        settings.SetTimelineExclusiveRootOverride(currentTimelineIndexForRecorder, newRootOverride);
+                        Repaint();
+                        SaveSettings();
+                    }
+                    EditorGUILayout.EndHorizontal();
+
+                    // Show what will actually be used, so an empty override is not mistaken for "no exclusion".
+                    var resolvedRoot = newRootOverride != null
+                        ? newRootOverride
+                        : PrefabUtility.GetOutermostPrefabInstanceRoot(currentDirector.gameObject);
+                    string resolvedRootLabel = resolvedRoot != null ? resolvedRoot.name : currentDirector.gameObject.name;
+                    EditorGUILayout.LabelField($"(default: {resolvedRootLabel})", EditorStyles.miniLabel);
                 }
             }
             else
@@ -1940,7 +1987,12 @@ namespace Unity.MultiTimelineRecorder
                     float duration = EditorPrefs.GetFloat("STR_Duration", 0f);
                     int frameRate = EditorPrefs.GetInt("STR_FrameRate", 24);
                     int preRollFrames = EditorPrefs.GetInt("STR_PreRollFrames", 0);
-                    
+                    bool enableReadbackBackpressure = EditorPrefs.GetBool("STR_EnableReadbackBackpressure", true);
+                    int readbackDrainIntervalFrames = EditorPrefs.GetInt("STR_ReadbackDrainIntervalFrames", 1);
+                    bool enableEncoderOutputStallGuard = EditorPrefs.GetBool("STR_EnableEncoderOutputStallGuard", true);
+                    int encoderStallCheckIntervalSec = EditorPrefs.GetInt("STR_EncoderStallCheckIntervalSec", 2);
+                    int encoderStallTimeoutSec = EditorPrefs.GetInt("STR_EncoderStallTimeoutSec", 120);
+
                     // 診断情報をログ出力
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Play Mode diagnostic info:");
                     MultiTimelineRecorderLogger.Log($"  - DirectorName: {directorName}");
@@ -1948,7 +2000,12 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.Log($"  - Duration: {duration}");
                     MultiTimelineRecorderLogger.Log($"  - FrameRate: {frameRate}");
                     MultiTimelineRecorderLogger.Log($"  - PreRollFrames: {preRollFrames}");
-                    
+                    MultiTimelineRecorderLogger.Log($"  - EnableReadbackBackpressure: {enableReadbackBackpressure}");
+                    MultiTimelineRecorderLogger.Log($"  - ReadbackDrainIntervalFrames: {readbackDrainIntervalFrames}");
+                    MultiTimelineRecorderLogger.Log($"  - EnableEncoderOutputStallGuard: {enableEncoderOutputStallGuard}");
+                    MultiTimelineRecorderLogger.Log($"  - EncoderStallCheckIntervalSec: {encoderStallCheckIntervalSec}");
+                    MultiTimelineRecorderLogger.Log($"  - EncoderStallTimeoutSec: {encoderStallTimeoutSec}");
+
                     // Render Timelineをロード
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Attempting to load timeline from: {tempAssetPath}");
                     
@@ -1972,6 +2029,7 @@ namespace Unity.MultiTimelineRecorder
                         
                         currentState = RecordState.Error;
                         statusMessage = "Failed to load recording timeline";
+                        RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, 0f, statusMessage);
                         
                         // Clear rendering flag
                         EditorPrefs.SetBool("STR_IsRendering", false);
@@ -2009,7 +2067,38 @@ namespace Unity.MultiTimelineRecorder
                     renderingData.frameRate = frameRate;
                     renderingData.preRollFrames = preRollFrames;
                     renderingData.recorderType = (RecorderSettingsType)EditorPrefs.GetInt("STR_RecorderType", 0);
-                    
+                    renderingData.enableReadbackBackpressure = enableReadbackBackpressure;
+                    renderingData.readbackDrainIntervalFrames = readbackDrainIntervalFrames;
+                    renderingData.enableEncoderOutputStallGuard = enableEncoderOutputStallGuard;
+                    renderingData.encoderStallCheckIntervalSec = encoderStallCheckIntervalSec;
+                    renderingData.encoderStallTimeoutSec = encoderStallTimeoutSec;
+                    renderingData.expectedOutputFilePath = TryResolveExpectedMovieOutputPath(renderTimeline);
+                    MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Encoder output stall guard target path: " +
+                        (string.IsNullOrEmpty(renderingData.expectedOutputFilePath) ? "(unresolved — guard disabled for this render)" : renderingData.expectedOutputFilePath));
+
+                    // 結合Timelineの「Exclusive Root Activation Track」から、このバッチに
+                    // 含まれる全セクションの排他ルートを収集する。PlayModeTimelineRenderer が
+                    // director.Play() 呼び出し前にこれらを一時的に無効化する。
+                    // Refs: mtr-batch-scene-activation 案1
+                    var exclusiveRoots = new List<GameObject>();
+                    foreach (var track in renderTimeline.GetOutputTracks())
+                    {
+                        if (track == null || track.name != ExclusiveRootActivationTrackName)
+                            continue;
+
+                        foreach (var clip in track.GetClips())
+                        {
+                            var controlAsset = clip.asset as ControlPlayableAsset;
+                            GameObject root = controlAsset != null ? controlAsset.sourceGameObject.defaultValue as GameObject : null;
+                            if (root != null && !exclusiveRoots.Contains(root))
+                            {
+                                exclusiveRoots.Add(root);
+                            }
+                        }
+                    }
+                    renderingData.exclusiveRoots = exclusiveRoots;
+                    MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Collected {exclusiveRoots.Count} exclusive root(s) for this batch: {string.Join(", ", exclusiveRoots.ConvertAll(r => r.name))}");
+
                     // PlayModeTimelineRenderer GameObjectを作成
                     var rendererGO = new GameObject("[PlayModeTimelineRenderer]");
                     var renderer = rendererGO.AddComponent<PlayModeTimelineRenderer>();
@@ -2046,6 +2135,7 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] Recording completed successfully");
                     currentState = RecordState.Idle;
                     statusMessage = "Recording completed";
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
                     renderProgress = 0f;
                     
                     // Clear all rendering flags
@@ -2065,6 +2155,7 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] Recording was interrupted by user stopping Play Mode");
                     currentState = RecordState.Idle;
                     statusMessage = "Recording stopped by user";
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Interrupted, renderProgress, "PlayMode が停止されました");
                     renderProgress = 0f;
                     
                     // Clear rendering flags
@@ -2120,13 +2211,110 @@ namespace Unity.MultiTimelineRecorder
                 }
                 
                 CleanupRendering();
-                
+
                 // EditorPrefsのクリーンアップ
                 EditorPrefs.SetBool("STR_IsRendering", false);
             }
         }
-        
-        
+
+        /// <summary>
+        /// レンダリング対象の結合 Timeline 中から、最初の Movie Recorder Track の出力先絶対パスを
+        /// 解決する。PlayModeTimelineRenderer の Encoder Output Stall Guard（内蔵 CoreEncoder には
+        /// 未処理フレーム数に相当する信号が公開されておらず真の in-flight 有界化ができないため、
+        /// 代わりに出力ファイルの成長だけを監視する最終安全弁。詳細は
+        /// specs/mtr-nvenc-encoder/implementation.md）が使う。
+        ///
+        /// <see cref="UnityEditor.Recorder.RecorderSettings.OutputFile"/> は
+        /// <c>RecordingSession</c> が無くても解決できるワイルドカード（Scene/Recorder/Take/
+        /// Date/Project/Product）だけを自前で解決する。<c>&lt;Time&gt;</c>/<c>&lt;Frame&gt;</c>/
+        /// <c>&lt;Resolution&gt;</c> 等、セッション依存の値が必要なワイルドカードが残った場合は
+        /// 誤検知よりフェイルセーフを優先し、空文字列を返してガードを無効化させる。
+        /// 複数の Movie Recorder Track を含む結合 Timeline では最初の1つだけを対象とする
+        /// （既知の制約）。
+        /// </summary>
+        private static string TryResolveExpectedMovieOutputPath(TimelineAsset timeline)
+        {
+            // このヘルパーは「解決できなければ機能を無効化するだけ」というフェイルセーフ設計
+            // のため、いかなる例外も録画そのものを止めてはならない。想定外の例外はログに
+            // 残した上で空文字列（ガード無効化）にフォールバックする。
+            try
+            {
+                if (timeline == null)
+                    return string.Empty;
+
+                foreach (var track in timeline.GetOutputTracks())
+                {
+                    if (!(track is UnityEditor.Recorder.Timeline.RecorderTrack))
+                        continue;
+
+                    foreach (var clip in track.GetClips())
+                    {
+                        if (!(clip.asset is UnityEditor.Recorder.Timeline.RecorderClip recorderClip))
+                            continue;
+
+                        if (!(recorderClip.settings is MovieRecorderSettings movieSettings))
+                            continue;
+
+                        return ResolveMovieRecorderOutputPath(movieSettings);
+                    }
+                }
+
+                return string.Empty;
+            }
+            catch (System.Exception ex)
+            {
+                MultiTimelineRecorderLogger.LogWarning(
+                    $"[MultiTimelineRecorder] Encoder output stall guard: 出力パスの解決中に例外が発生したため、" +
+                    $"このレンダリングではガードを無効化します。{ex.Message}");
+                return string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// <paramref name="movieSettings"/>.OutputFile（ワイルドカードを含み得るテンプレート。
+        /// 拡張子は含まない）を、セッション非依存で解決できる範囲のワイルドカードだけ解決して
+        /// 拡張子を付与した絶対パスへ変換する。解決できないワイルドカードが残る場合は
+        /// 空文字列を返す。
+        /// </summary>
+        private static string ResolveMovieRecorderOutputPath(MovieRecorderSettings movieSettings)
+        {
+            string template = movieSettings.OutputFile;
+            if (string.IsNullOrEmpty(template))
+                return string.Empty;
+
+            string resolved = template
+                .Replace("<Scene>", SceneManager.GetActiveScene().name)
+                .Replace("<Recorder>", movieSettings.name)
+                .Replace("<Take>", movieSettings.Take.ToString("000"))
+                .Replace("<Date>", System.DateTime.Now.ToString("yyyy-MM-dd"))
+                .Replace("<Project>", PlayerSettings.productName)
+                .Replace("<Product>", PlayerSettings.productName);
+
+            if (resolved.Contains("<"))
+            {
+                // <Time>/<Frame>/<Resolution> 等、セッション依存で自前解決できないワイルドカードが
+                // 残っている。誤検知よりフェイルセーフを優先し、ガードを無効化させる。
+                return string.Empty;
+            }
+
+            string ext = GetMovieOutputExtension(movieSettings.OutputFormat);
+            if (!string.IsNullOrEmpty(ext) && !resolved.EndsWith(ext, System.StringComparison.OrdinalIgnoreCase))
+                resolved += ext;
+
+            return PathUtility.GetAbsolutePath(resolved);
+        }
+
+        private static string GetMovieOutputExtension(MovieRecorderSettings.VideoRecorderOutputFormat format)
+        {
+            switch (format)
+            {
+                case MovieRecorderSettings.VideoRecorderOutputFormat.MP4: return ".mp4";
+                case MovieRecorderSettings.VideoRecorderOutputFormat.WebM: return ".webm";
+                case MovieRecorderSettings.VideoRecorderOutputFormat.MOV: return ".mov";
+                default: return string.Empty;
+            }
+        }
+
         /// <summary>
         /// Creates recorder editor for specific recorder type with given host
         /// </summary>
@@ -2369,10 +2557,101 @@ namespace Unity.MultiTimelineRecorder
                     EditorGUILayout.EndHorizontal();
                 }
             }
-            
+
             EditorGUILayout.EndVertical();
         }
-        
+
+        private bool showRenderHistory = true;
+        private Vector2 renderHistoryScroll;
+
+        /// <summary>
+        /// レンダリング履歴セクション。過去の実行の開始日時・所要時間・
+        /// 終了状態（完了 / 中断 / 停止 / エラー）を新しい順に表示する。
+        /// 記録の実体は <see cref="RenderHistory"/>（UserSettings/ の JSON、マシンローカル）。
+        /// </summary>
+        private void DrawRenderHistorySection()
+        {
+            var entries = RenderHistory.Entries;
+            showRenderHistory = EditorGUILayout.Foldout(showRenderHistory, $"Render History ({entries.Count})", true);
+            if (!showRenderHistory) return;
+
+            if (entries.Count == 0)
+            {
+                EditorGUILayout.LabelField("履歴はまだありません（録画を実行すると記録されます）", EditorStyles.miniLabel);
+                return;
+            }
+
+            float rowHeight = EditorGUIUtility.singleLineHeight + 2f;
+            float viewHeight = Mathf.Min(entries.Count, 8) * rowHeight + 8f;
+            renderHistoryScroll = EditorGUILayout.BeginScrollView(renderHistoryScroll, GUILayout.Height(viewHeight));
+
+            // 新しい順に表示
+            for (int i = entries.Count - 1; i >= 0; i--)
+            {
+                var entry = entries[i];
+                EditorGUILayout.BeginHorizontal();
+
+                Color originalColor = GUI.color;
+                GUI.color = GetHistoryStatusColor(entry.Status);
+                EditorGUILayout.LabelField(GetHistoryStatusLabel(entry.Status), EditorStyles.miniBoldLabel, GUILayout.Width(56));
+                GUI.color = originalColor;
+
+                EditorGUILayout.LabelField(entry.StartedLocal.ToString("MM/dd HH:mm"), EditorStyles.miniLabel, GUILayout.Width(76));
+                EditorGUILayout.LabelField(RenderHistory.FormatDuration(entry.Duration), EditorStyles.miniLabel, GUILayout.Width(60));
+
+                // 完了以外は終了時点の進捗も出す（「どこまで進んで中断されたか」が分かるように）
+                string progressText = entry.Status == RenderHistoryStatus.Completed || entry.Status == RenderHistoryStatus.Running
+                    ? string.Empty
+                    : $"{(int)(entry.progress * 100)}%";
+                EditorGUILayout.LabelField(progressText, EditorStyles.miniLabel, GUILayout.Width(34));
+
+                string tooltip = string.IsNullOrEmpty(entry.note) ? entry.timelines : $"{entry.timelines}\n{entry.note}";
+                EditorGUILayout.LabelField(new GUIContent(entry.timelines, tooltip), EditorStyles.miniLabel);
+
+                EditorGUILayout.EndHorizontal();
+            }
+
+            EditorGUILayout.EndScrollView();
+
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Clear History", GUILayout.Width(100)))
+            {
+                if (EditorUtility.DisplayDialog("Render History",
+                    "レンダリング履歴をすべて削除しますか？", "削除", "キャンセル"))
+                {
+                    RenderHistory.Clear();
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private static string GetHistoryStatusLabel(RenderHistoryStatus status)
+        {
+            switch (status)
+            {
+                case RenderHistoryStatus.Running:     return "記録中";
+                case RenderHistoryStatus.Completed:   return "完了";
+                case RenderHistoryStatus.Interrupted: return "中断";
+                case RenderHistoryStatus.Cancelled:   return "停止";
+                case RenderHistoryStatus.Error:       return "エラー";
+                default:                              return status.ToString();
+            }
+        }
+
+        private static Color GetHistoryStatusColor(RenderHistoryStatus status)
+        {
+            switch (status)
+            {
+                case RenderHistoryStatus.Running:     return new Color(1f, 0.4f, 0.4f);
+                case RenderHistoryStatus.Completed:   return Color.green;
+                case RenderHistoryStatus.Interrupted: return new Color(1f, 0.7f, 0.2f);
+                case RenderHistoryStatus.Cancelled:   return new Color(1f, 0.7f, 0.2f);
+                case RenderHistoryStatus.Error:       return new Color(1f, 0.35f, 0.35f);
+                default:                              return Color.white;
+            }
+        }
+
         /// <summary>
         /// SignalEmitter設定のUI描画 (TODO-282)
         /// </summary>
@@ -2524,7 +2803,88 @@ namespace Unity.MultiTimelineRecorder
             Rect separatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
             EditorGUI.DrawRect(separatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
             EditorGUILayout.Space(10);
-            
+
+            // GPU Readback Safety Section (device-removed crash prevention)
+            EditorGUILayout.LabelField("GPU Readback Safety", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "高速GPU x 4K長尺でエンコーダの消費が描画に追いつかないと、AsyncGPUReadback の滞留から\n" +
+                "GPUデバイスロストでUnityごとクラッシュすることがあります。有効にすると一定フレームごとに\n" +
+                "描画側を待たせて滞留を抑えます。",
+                EditorStyles.wordWrappedMiniLabel);
+            EditorGUILayout.Space(3);
+
+            EditorGUI.BeginChangeCheck();
+            enableReadbackBackpressure = EditorGUILayout.Toggle(
+                new GUIContent("Enable Readback Backpressure", "AsyncGPUReadbackの滞留を防ぐため、一定フレームごとに描画側を待たせます（推奨: ON）"),
+                enableReadbackBackpressure);
+            if (EditorGUI.EndChangeCheck())
+            {
+                SaveSettings();
+            }
+
+            using (new EditorGUI.DisabledScope(!enableReadbackBackpressure))
+            {
+                EditorGUI.BeginChangeCheck();
+                readbackDrainIntervalFrames = EditorGUILayout.IntField(
+                    new GUIContent("Drain Interval (frames)", "何フレームごとに読み戻しキューを強制ドレインするか。小さいほど安全（既定: 1 = 毎フレーム）"),
+                    readbackDrainIntervalFrames);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    readbackDrainIntervalFrames = Mathf.Max(1, readbackDrainIntervalFrames);
+                    SaveSettings();
+                }
+            }
+
+            EditorGUILayout.Space(10);
+            Rect readbackSeparatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
+            EditorGUI.DrawRect(readbackSeparatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
+            EditorGUILayout.Space(10);
+
+            // Encoder Output Stall Guard Section
+            // v1.5.7/v1.5.10/v1.5.13-16 の「エンコーダ入力キュー(プロセスRAM)監視 + director
+            // 一時停止」方式は v1.5.17 で完全に撤去した（何もPauseしないという方針への転換。
+            // 詳細は specs/mtr-nvenc-encoder/implementation.md）。
+            EditorGUILayout.LabelField("Encoder Output Stall Guard", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "内蔵CoreEncoderには未処理フレーム数に相当する信号が公開されていないため、真の\n" +
+                "in-flight有界化（発行を待たせて詰まりを解消する）はできません。代わりに、録画中の\n" +
+                "Movie出力ファイルが一定時間まったく成長していないかだけを監視します。director/Play\n" +
+                "Modeは一切止めません。「遅いが進んでいる」バックログの有界化はできないため、内蔵\n" +
+                "CoreEncoder + 4K長尺は引き続きNVENC経路を推奨します。",
+                EditorStyles.wordWrappedMiniLabel);
+            EditorGUILayout.Space(3);
+
+            EditorGUI.BeginChangeCheck();
+            enableEncoderOutputStallGuard = EditorGUILayout.Toggle(
+                new GUIContent("Enable Encoder Output Stall Guard", "録画中のMovie出力ファイルが完全に成長を止めていないかを監視し、停止していれば録画を安全に中断します（推奨: ON。director/Play Modeは止めません）"),
+                enableEncoderOutputStallGuard);
+            if (EditorGUI.EndChangeCheck())
+            {
+                SaveSettings();
+            }
+
+            using (new EditorGUI.DisabledScope(!enableEncoderOutputStallGuard))
+            {
+                EditorGUI.BeginChangeCheck();
+                encoderStallCheckIntervalSec = EditorGUILayout.IntField(
+                    new GUIContent("Check Interval (sec)", "出力ファイルサイズを確認する間隔（秒、既定: 2）"),
+                    encoderStallCheckIntervalSec);
+                encoderStallTimeoutSec = EditorGUILayout.IntField(
+                    new GUIContent("Stall Timeout (sec)", "出力ファイルがこの秒数まったく成長しなかった場合、ハングさせず録画を安全に中断します（既定: 120）"),
+                    encoderStallTimeoutSec);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    encoderStallCheckIntervalSec = Mathf.Max(1, encoderStallCheckIntervalSec);
+                    encoderStallTimeoutSec = Mathf.Max(1, encoderStallTimeoutSec);
+                    SaveSettings();
+                }
+            }
+
+            EditorGUILayout.Space(10);
+            Rect encoderStallGuardSeparatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
+            EditorGUI.DrawRect(encoderStallGuardSeparatorRect, new Color(0.5f, 0.5f, 0.5f, 0.2f));
+            EditorGUILayout.Space(10);
+
             // Debug Tools Section
             EditorGUILayout.LabelField("Debug Tools", EditorStyles.boldLabel);
             EditorGUILayout.Space(3);
@@ -2704,6 +3064,17 @@ namespace Unity.MultiTimelineRecorder
             MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Selected directors: {recordingQueueDirectors.Count}");
             MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Selected index: {selectedDirectorIndex}");
             MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Is Playing: {EditorApplication.isPlaying}");
+
+            // Movie 解像度のプリフライトチェック(H.264 上限超過はダイアログでフォーマット切替を促す)。
+            // ここで弾かないと CreateMovieRecorderSettingsFromConfig が録画開始後に該当アイテムを
+            // 黙ってスキップし、「録画は完走したのにファイルが無い」状態になる。
+            if (!ConfirmMovieResolutionBeforeRecording())
+            {
+                currentState = RecordState.Idle;
+                statusMessage = "Recording cancelled (movie resolution check)";
+                MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] Recording cancelled by movie resolution preflight check");
+                return;
+            }
             
             // SignalEmitter設定の情報を表示 (TODO-282)
             if (useSignalEmitterTiming)
@@ -2758,7 +3129,114 @@ namespace Unity.MultiTimelineRecorder
             MultiTimelineRecorderLogger.LogVerbose("[MultiTimelineRecorder] Starting new coroutine");
             renderCoroutine = EditorCoroutineUtility.StartCoroutine(RenderTimelineCoroutine(), this);
         }
-        
+
+        /// <summary>
+        /// 録画開始前の Movie 解像度プリフライトチェック。
+        /// 対象は録画キュー(recordingQueueDirectors)の各 Timeline に紐づく有効な Movie アイテムで、
+        /// 実効解像度(RenderTexture ソース時は RT 実寸)で判定する。
+        /// - H.264(内蔵 MP4 / NVENC H.264)で上限を超える場合: ダイアログで WebM / ProRes(MOV)
+        ///   への切替を促し、選択に応じて movieConfig を書き換えて続行する。
+        /// - それ以外のフォーマットで上限を超える場合: エラーダイアログを出して中止する。
+        /// ここで弾かないと録画開始後に該当アイテムが黙ってスキップされ、
+        /// 「録画は完走したのにファイルが無い」状態になる。
+        /// </summary>
+        /// <returns>false = 録画を中止する</returns>
+        private bool ConfirmMovieResolutionBeforeRecording()
+        {
+            var h264OverLimitItems = new List<MultiRecorderConfig.RecorderConfigItem>();
+            var h264OverLimitLines = new List<string>();
+            var hardErrorLines = new List<string>();
+
+            for (int timelineIndex = 0; timelineIndex < recordingQueueDirectors.Count; timelineIndex++)
+            {
+                var director = recordingQueueDirectors[timelineIndex];
+                if (director == null)
+                    continue;
+
+                var timelineConfig = GetTimelineRecorderConfig(timelineIndex);
+                if (timelineConfig == null)
+                    continue;
+
+                foreach (var item in timelineConfig.GetEnabledRecorders())
+                {
+                    if (item.recorderType != RecorderSettingsType.Movie || item.movieConfig == null)
+                        continue;
+
+                    item.GetEffectiveOutputResolution(out int effectiveWidth, out int effectiveHeight);
+                    int maxDimension = MovieRecorderSettingsConfig.GetMaxDimension(
+                        item.movieConfig.outputFormat, item.movieConfig.encoderType);
+                    if (effectiveWidth <= maxDimension && effectiveHeight <= maxDimension)
+                        continue;
+
+                    string line = $"・{director.gameObject.name} / {item.name}: {effectiveWidth}x{effectiveHeight}";
+                    if (MovieRecorderSettingsConfig.IsH264(item.movieConfig.outputFormat, item.movieConfig.encoderType))
+                    {
+                        if (!h264OverLimitItems.Contains(item))
+                        {
+                            h264OverLimitItems.Add(item);
+                            h264OverLimitLines.Add(line);
+                        }
+                    }
+                    else
+                    {
+                        hardErrorLines.Add($"{line} (上限 {maxDimension}px / {item.movieConfig.outputFormat})");
+                    }
+                }
+            }
+
+            if (hardErrorLines.Count > 0)
+            {
+                EditorUtility.DisplayDialog(
+                    "Movie 解像度が上限を超えています",
+                    "以下の Movie レコーダーは選択中の出力フォーマットの上限解像度を超えているため録画できません:\n\n" +
+                    string.Join("\n", hardErrorLines) +
+                    "\n\n解像度または出力フォーマットを見直してください。",
+                    "OK");
+                return false;
+            }
+
+            if (h264OverLimitItems.Count == 0)
+                return true;
+
+            int choice = EditorUtility.DisplayDialogComplex(
+                "H.264 の解像度上限を超えています",
+                "以下の Movie レコーダーは H.264 (MP4) の上限 " +
+                $"{MovieRecorderSettingsConfig.MaxDimensionH264}px を超える解像度です:\n\n" +
+                string.Join("\n", h264OverLimitLines) +
+                "\n\nH.264 ではこの解像度をエンコードできないため、このまま録画してもファイルは出力されません。\n" +
+                "出力フォーマットを切り替えて続行できます。",
+                "WebM に切り替えて続行",
+                "キャンセル",
+                "ProRes (MOV) に切り替えて続行");
+
+            if (choice == 1)
+                return false;
+
+            var newFormat = choice == 0
+                ? MovieRecorderSettings.VideoRecorderOutputFormat.WebM
+                : MovieRecorderSettings.VideoRecorderOutputFormat.MOV;
+
+            foreach (var item in h264OverLimitItems)
+            {
+                item.movieConfig.outputFormat = newFormat;
+                // FFmpeg NVENC 系エンコーダは MP4 コンテナ専用のため、内蔵エンコーダに戻す
+                if (item.movieConfig.encoderType != MovieEncoderType.CoreEncoder)
+                    item.movieConfig.encoderType = MovieEncoderType.CoreEncoder;
+            }
+
+            if (settings != null)
+            {
+                EditorUtility.SetDirty(settings);
+                AssetDatabase.SaveAssets();
+            }
+            SaveSettings();
+            Repaint();
+
+            MultiTimelineRecorderLogger.Log(
+                $"[MultiTimelineRecorder] {h264OverLimitItems.Count} 件の Movie レコーダーの出力フォーマットを {newFormat} に切り替えて録画を続行します");
+            return true;
+        }
+
         private void StopRecording()
         {
             MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] StopRecording called");
@@ -2802,6 +3280,7 @@ namespace Unity.MultiTimelineRecorder
             
             currentState = RecordState.Idle;
             statusMessage = "Recording stopped by user";
+            RenderHistory.FinalizeCurrent(RenderHistoryStatus.Cancelled, renderProgress, "Stop Recording ボタンで停止");
             MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] StopRecording completed");
         }
         
@@ -2819,11 +3298,23 @@ namespace Unity.MultiTimelineRecorder
                     statusMessage = "Recording complete!";
                     renderProgress = 1f;
                     EditorPrefs.DeleteKey("STR_IsRenderingComplete");
-                    
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
+
                     // Take番号のインクリメントはPlayModeTimelineRendererが1秒後に行うように変更したためここでは行わない
                     // インクリメントはOnPlayModeStateChangedのExitingPlayModeで処理される
                 }
-                
+                else if (EditorPrefs.GetBool("STR_IsRenderingFailed", false))
+                {
+                    // PlayModeTimelineRenderer が録画を安全に中断した際に設定するフラグ
+                    // （v1.5.17 時点では AbortRenderingDueToEncoderOutputStall。旧
+                    // AbortRenderingDueToBackpressureTimeout は撤去済み）。録画が不完全な
+                    // まま中断された場合、Complete扱いにせずエラーとしてユーザーに明示する。
+                    currentState = RecordState.Error;
+                    statusMessage = EditorPrefs.GetString("STR_Status", "Recording failed (encoder output stalled)");
+                    EditorPrefs.DeleteKey("STR_IsRenderingFailed");
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, renderProgress, statusMessage);
+                }
+
                 return;
             }
             
@@ -2854,6 +3345,7 @@ namespace Unity.MultiTimelineRecorder
                 currentState = RecordState.Complete;
                 statusMessage = "Recording complete!";
                 renderProgress = 1f;
+                RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
                 
                 // Set flag to increment take number when exiting play mode
                 EditorPrefs.SetBool("STR_IncrementTakeNumber", true);
@@ -2945,7 +3437,13 @@ namespace Unity.MultiTimelineRecorder
             EditorPrefs.DeleteKey("STR_Progress");
             EditorPrefs.DeleteKey("STR_Status");
             EditorPrefs.DeleteKey("STR_CurrentTime");
-            
+            // review.md イテレーション3 Minor #2: STR_IsRenderingComplete は削除するのに
+            // これらを削除しない非対称があった。OnRecordingProgressUpdate (:2996-3003) の
+            // 通常フローでは消費済みのはずだが、ウィンドウ閉鎖・Editor クラッシュでその分岐を
+            // 逃した場合の stale キー衛生として、ここでも確実にクリアする。
+            EditorPrefs.DeleteKey("STR_IsRenderingFailed");
+            EditorPrefs.DeleteKey("STR_EncoderBackpressureStalling");
+
             MultiTimelineRecorderLogger.LogVerbose("[MultiTimelineRecorder] CleanupRendering completed");
         }
         
@@ -3117,6 +3615,16 @@ namespace Unity.MultiTimelineRecorder
             // Enter Play Mode
             currentState = RecordState.WaitingForPlayMode;
             statusMessage = "Starting Unity Play Mode...";
+
+            // レンダリング履歴: ここから 1 実行として記録する（PlayMode 突入〜完走/中断までが所要時間。
+            // 準備段階のエラーは履歴に残さない）。終了は完了/中断/エラーの各遷移点で FinalizeCurrent を呼ぶ
+            var historyTimelineNames = new List<string>();
+            foreach (var historyDirector in directorsToRender)
+            {
+                if (historyDirector != null && historyDirector.gameObject != null)
+                    historyTimelineNames.Add(historyDirector.gameObject.name);
+            }
+            RenderHistory.BeginRun(historyTimelineNames);
             
             MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] === Current Play Mode state: {EditorApplication.isPlaying} ===");
             
@@ -3131,6 +3639,7 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.LogError("[MultiTimelineRecorder] tempAssetPath is null or empty!");
                     currentState = RecordState.Error;
                     statusMessage = "Timeline asset path is invalid";
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, renderProgress, statusMessage);
                     
                     // Restore original playOnAwake values
                     foreach (var kvp in originalPlayOnAwakeValues)
@@ -3157,6 +3666,11 @@ namespace Unity.MultiTimelineRecorder
                 EditorPrefs.SetInt("STR_RecorderType", (int)firstRecorderType);
                 EditorPrefs.SetInt("STR_FrameRate", frameRate);
                 EditorPrefs.SetInt("STR_PreRollFrames", preRollFrames);
+                EditorPrefs.SetBool("STR_EnableReadbackBackpressure", enableReadbackBackpressure);
+                EditorPrefs.SetInt("STR_ReadbackDrainIntervalFrames", readbackDrainIntervalFrames);
+                EditorPrefs.SetBool("STR_EnableEncoderOutputStallGuard", enableEncoderOutputStallGuard);
+                EditorPrefs.SetInt("STR_EncoderStallCheckIntervalSec", encoderStallCheckIntervalSec);
+                EditorPrefs.SetInt("STR_EncoderStallTimeoutSec", encoderStallTimeoutSec);
                 // exposedNameも保存（CreateRenderTimelineで生成されたもの）
                 if (renderTimeline != null)
                 {
@@ -3468,7 +3982,45 @@ namespace Unity.MultiTimelineRecorder
             }
             public MovieRecorderPreset moviePreset { get => MovieRecorderPreset.Custom; set { } }
             public bool useMoviePreset { get => false; set { } }
-            
+
+            // Movie encoder settings (NVENC, specs/mtr-nvenc-encoder)
+            public MovieEncoderType movieEncoderType
+            {
+                get => item.movieConfig?.encoderType ?? MovieEncoderType.CoreEncoder;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.encoderType = value;
+                }
+            }
+            public string movieFfmpegPath
+            {
+                get => item.movieConfig?.ffmpegPath ?? string.Empty;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.ffmpegPath = value;
+                }
+            }
+            public int movieFfmpegQp
+            {
+                get => item.movieConfig?.ffmpegQp ?? 24;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.ffmpegQp = value;
+                }
+            }
+            public int movieFfmpegBitrateKbps
+            {
+                get => item.movieConfig?.ffmpegTargetBitrateKbps ?? 0;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.ffmpegTargetBitrateKbps = value;
+                }
+            }
+
             // AOV settings
             public AOVType selectedAOVTypes 
             { 
@@ -3709,7 +4261,12 @@ namespace Unity.MultiTimelineRecorder
             preRollFrames = settings.preRollFrames;
             cameraTag = settings.cameraTag;
             outputResolution = settings.outputResolution;
-            
+            enableReadbackBackpressure = settings.enableReadbackBackpressure;
+            readbackDrainIntervalFrames = settings.readbackDrainIntervalFrames;
+            enableEncoderOutputStallGuard = settings.enableEncoderOutputStallGuard;
+            encoderStallCheckIntervalSec = settings.encoderStallCheckIntervalSec;
+            encoderStallTimeoutSec = settings.encoderStallTimeoutSec;
+
             selectedDirectorIndex = settings.selectedDirectorIndex;
             selectedDirectorIndices = new List<int>(settings.selectedDirectorIndices);
             
@@ -3867,7 +4424,12 @@ namespace Unity.MultiTimelineRecorder
             settings.preRollFrames = preRollFrames;
             settings.cameraTag = cameraTag;
             settings.outputResolution = outputResolution;
-            
+            settings.enableReadbackBackpressure = enableReadbackBackpressure;
+            settings.readbackDrainIntervalFrames = readbackDrainIntervalFrames;
+            settings.enableEncoderOutputStallGuard = enableEncoderOutputStallGuard;
+            settings.encoderStallCheckIntervalSec = encoderStallCheckIntervalSec;
+            settings.encoderStallTimeoutSec = encoderStallTimeoutSec;
+
             settings.selectedDirectorIndex = selectedDirectorIndex;
             settings.selectedDirectorIndices = new List<int>(selectedDirectorIndices);
             settings.timelineMarginFrames = timelineMarginFrames;
@@ -4115,7 +4677,11 @@ namespace Unity.MultiTimelineRecorder
                     new MultiTimelineRecorderSettings.TimelineTakeNumberEntry(kvp.Key, kvp.Value)
                 );
             }
-            
+
+            // 排他ルート明示上書きを保存 (Refs: mtr-batch-scene-activation)
+            sceneSettings.timelineExclusiveRootOverrides.Clear();
+            sceneSettings.timelineExclusiveRootOverrides.AddRange(settings.timelineExclusiveRootOverrides);
+
             // グローバル設定も保存
             SaveSettings();
             
@@ -4175,7 +4741,11 @@ namespace Unity.MultiTimelineRecorder
                 {
                     settings.timelineTakeNumbers.Add(entry);
                 }
-                
+
+                // 排他ルート明示上書きを復元 (Refs: mtr-batch-scene-activation)
+                settings.timelineExclusiveRootOverrides.Clear();
+                settings.timelineExclusiveRootOverrides.AddRange(sceneSettings.timelineExclusiveRootOverrides);
+
                 // インデックスの有効性を検証
                 ValidateIndices();
                 

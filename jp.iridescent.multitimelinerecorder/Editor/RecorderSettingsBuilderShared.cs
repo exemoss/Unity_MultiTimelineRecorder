@@ -300,8 +300,17 @@ namespace Unity.MultiTimelineRecorder
                 throw new NotSupportedException(
                     $"RecorderSettingsBuilderShared.BuildMovieSettings only supports RecorderSettingsType.Movie. Got: {item.recorderType}");
 
-            // Validate via the shared config validator (checks resolution ≤4096, frameRate,
-            // platform support for MOV/ProRes, alpha channel restrictions).
+            // Validate via the shared config validator (checks encoder-dependent resolution
+            // limits, frameRate, platform support for MOV/ProRes, alpha channel restrictions).
+            // RenderTexture ソースでは Recorder が RT の実寸を出力サイズに使うため、
+            // 検証も RT 実寸で行う(effectiveWidth/Height は Camera/GameView ソース用)。
+            int validationWidth  = effectiveWidth;
+            int validationHeight = effectiveHeight;
+            if (item.imageSourceType == ImageRecorderSourceType.RenderTexture && resolvedRenderTexture != null)
+            {
+                validationWidth  = resolvedRenderTexture.width;
+                validationHeight = resolvedRenderTexture.height;
+            }
             string validationError;
             // Clone a temp config for validation only — the caller owns movieConfig.
             var validationConfig = new MovieRecorderSettingsConfig
@@ -309,8 +318,8 @@ namespace Unity.MultiTimelineRecorder
                 outputFormat    = movieConfig.outputFormat,
                 videoBitrateMode = movieConfig.videoBitrateMode,
                 customBitrate   = movieConfig.customBitrate,
-                width           = effectiveWidth,
-                height          = effectiveHeight,
+                width           = validationWidth,
+                height          = validationHeight,
                 frameRate       = (int)Math.Max(1.0, effectiveFrameRate),
                 capFrameRate    = true,
                 captureAudio    = movieConfig.captureAudio,
@@ -358,6 +367,22 @@ namespace Unity.MultiTimelineRecorder
             // Recorder appends the extension (.mp4 / .mov / .webm) automatically.
             if (!string.IsNullOrEmpty(outputFile))
                 settings.OutputFile = outputFile.Replace('\\', '/');
+
+            // --- FFmpeg NVENC encoder: distributed path not supported yet ---------
+            // specs/mtr-nvenc-encoder (案1) only wires the FFmpeg NVENC encoder into the
+            // local recording path (CreateMovieRecorderSettingsFromConfig / ApplyToSettings).
+            // The distributed Worker path (this method) intentionally does NOT set
+            // settings.EncoderSettings, so it silently keeps Recorder's default
+            // CoreEncoderSettings (set by the settings.OutputFormat assignment above).
+            // Warn loudly instead of dropping the user's encoder choice without a trace.
+            if (movieConfig.encoderType != MovieEncoderType.CoreEncoder)
+            {
+                Debug.LogWarning(
+                    $"[RecorderSettingsBuilderShared.BuildMovieSettings] Movie recorder '{item.name}' " +
+                    $"specifies encoderType={movieConfig.encoderType}, but the distributed rendering " +
+                    "(Worker) path does not support the FFmpeg NVENC encoder yet. Falling back to the " +
+                    "built-in CoreEncoder for this job.");
+            }
 
             return settings;
         }

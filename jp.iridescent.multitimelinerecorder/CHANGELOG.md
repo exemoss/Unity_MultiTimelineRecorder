@@ -4,6 +4,38 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.20] - 2026-08-03
+
+### Added
+- Render History: the MTR window now records every local recording run (start
+  time, duration, recorded timelines) and its outcome — Completed, Interrupted
+  (Play Mode stopped), Cancelled (Stop button), or Error (with the error note
+  and the progress reached). Shown newest-first in a collapsible "Render
+  History" section with a Clear button. History is stored per-machine in
+  `UserSettings/MultiTimelineRecorderRenderHistory.json` (not committed to the
+  repository). Runs that ended without being detected (editor crash / window
+  closed) are marked Interrupted on the next run.
+
+## [1.5.19] - 2026-08-03
+
+### Fixed
+- Movie recorder validation now uses encoder-aware resolution limits instead of a
+  flat 4096x4096 cap: H.264 (built-in MP4 / NVENC H.264) stays at 4096, NVENC HEVC
+  and ProRes (MOV) allow up to 8192, WebM (VP8) up to 16383. The flat cap silently
+  dropped valid recordings such as wide LED-preview RenderTextures (e.g. 7488x1344)
+  exported as WebM — the recording "completed" but no file was written.
+- RenderTexture-source movie items are now validated against the RT's actual size
+  (the Recorder always outputs at the RT's own resolution, not the item's
+  width/height setting). Applies to both the local recording path and the
+  distributed `RecorderSettingsBuilderShared.BuildMovieSettings` path.
+
+### Added
+- Pre-recording dialog: starting a recording with an H.264 movie item whose
+  effective resolution exceeds 4096px now prompts to switch the output format to
+  WebM or ProRes (MOV) — or cancel — instead of silently skipping the item.
+- The per-recorder settings UI shows the same encoder-aware resolution error
+  inline (effective RT size for RenderTexture sources).
+
 ## [1.1.0] - 2026-06-02
 
 ### Added (fork: distributed rendering)

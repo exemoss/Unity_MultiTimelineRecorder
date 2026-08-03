@@ -245,7 +245,13 @@ namespace Unity.MultiTimelineRecorder
             public AudioBitRateMode audioBitrate { get => config.audioBitrate; set => config.audioBitrate = value; }
             public MovieRecorderPreset moviePreset { get => config.moviePreset; set => config.moviePreset = value; }
             public bool useMoviePreset { get => config.useMoviePreset; set => config.useMoviePreset = value; }
-            
+
+            // Movie encoder settings (NVENC, specs/mtr-nvenc-encoder)
+            public MovieEncoderType movieEncoderType { get => config.movieEncoderType; set => config.movieEncoderType = value; }
+            public string movieFfmpegPath { get => config.movieFfmpegPath; set => config.movieFfmpegPath = value; }
+            public int movieFfmpegQp { get => config.movieFfmpegQp; set => config.movieFfmpegQp = value; }
+            public int movieFfmpegBitrateKbps { get => config.movieFfmpegBitrateKbps; set => config.movieFfmpegBitrateKbps = value; }
+
             // AOV settings
             public AOVType selectedAOVTypes { get => config.selectedAOVTypes; set => config.selectedAOVTypes = value; }
             public AOVOutputFormat aovOutputFormat { get => config.aovOutputFormat; set => config.aovOutputFormat = value; }

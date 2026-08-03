@@ -761,6 +761,139 @@ namespace DistributedRecorder.Tests
 #endif
         }
 
+        // ---- Encoder-aware resolution limits (fix/movie-resolution-validation) --
+        // 旧実装はフォーマットに関係なく一律 4096 で弾いており、LED プレビュー等の
+        // 横長 RenderTexture (7488x1344) を WebM で書き出す正当なケースまで
+        // 録画時に黙って落としていた。上限はエンコーダ / コンテナ別に判定する。
+
+        [Test]
+        public void MovieConfig_Validate_H264Above4096_ReturnsFalseWithGuidance()
+        {
+            var config = MakeMovieConfig(
+                MovieRecorderSettings.VideoRecorderOutputFormat.MP4,
+                width: 7488, height: 1344);
+            bool valid = config.Validate(out string error);
+            Assert.IsFalse(valid, "H.264 (MP4) must reject dimensions above 4096.");
+            StringAssert.Contains("H.264", error,
+                "Error message should identify H.264 as the constraint.");
+            StringAssert.Contains("WebM", error,
+                "Error message should suggest WebM as an alternative.");
+        }
+
+        [Test]
+        public void MovieConfig_Validate_WebMAbove4096_IsValid()
+        {
+            var config = MakeMovieConfig(
+                MovieRecorderSettings.VideoRecorderOutputFormat.WebM,
+                width: 7488, height: 1344);
+            bool valid = config.Validate(out string error);
+            Assert.IsTrue(valid,
+                $"WebM (VP8) should accept 7488x1344. Error: {error}");
+        }
+
+        [Test]
+        public void MovieConfig_Validate_WebMAboveVp8Limit_ReturnsFalse()
+        {
+            var config = MakeMovieConfig(
+                MovieRecorderSettings.VideoRecorderOutputFormat.WebM,
+                width: MovieRecorderSettingsConfig.MaxDimensionWebM + 1, height: 1080);
+            bool valid = config.Validate(out string error);
+            Assert.IsFalse(valid, "WebM must still reject dimensions above the VP8 limit.");
+        }
+
+        [Test]
+        public void MovieConfig_GetMaxDimension_MapsEncoderAndFormat()
+        {
+            Assert.AreEqual(MovieRecorderSettingsConfig.MaxDimensionH264,
+                MovieRecorderSettingsConfig.GetMaxDimension(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.MP4, MovieEncoderType.CoreEncoder),
+                "CoreEncoder + MP4 = H.264 (Media Foundation)");
+            Assert.AreEqual(MovieRecorderSettingsConfig.MaxDimensionH264,
+                MovieRecorderSettingsConfig.GetMaxDimension(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.MP4, MovieEncoderType.FFmpegNvencH264),
+                "NVENC H.264");
+            Assert.AreEqual(MovieRecorderSettingsConfig.MaxDimensionHevc,
+                MovieRecorderSettingsConfig.GetMaxDimension(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.MP4, MovieEncoderType.FFmpegNvencHevc),
+                "NVENC HEVC");
+            Assert.AreEqual(MovieRecorderSettingsConfig.MaxDimensionWebM,
+                MovieRecorderSettingsConfig.GetMaxDimension(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.WebM, MovieEncoderType.CoreEncoder),
+                "WebM (VP8)");
+            Assert.AreEqual(MovieRecorderSettingsConfig.MaxDimensionProRes,
+                MovieRecorderSettingsConfig.GetMaxDimension(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.MOV, MovieEncoderType.CoreEncoder),
+                "MOV (ProRes)");
+        }
+
+        [Test]
+        public void RecorderConfigItem_EffectiveResolution_UsesRenderTextureSize()
+        {
+            var rt = new RenderTexture(7488, 1344, 0);
+            try
+            {
+                var item = MakeMovieItem(width: 1920, height: 1080,
+                    sourceType: ImageRecorderSourceType.RenderTexture);
+                item.imageRenderTexture = rt;
+
+                item.GetEffectiveOutputResolution(out int w, out int h);
+                Assert.AreEqual(7488, w, "RT source must report the RT's actual width.");
+                Assert.AreEqual(1344, h, "RT source must report the RT's actual height.");
+
+                // RT が無い場合は設定値へフォールバック
+                item.imageRenderTexture = null;
+                item.GetEffectiveOutputResolution(out w, out h);
+                Assert.AreEqual(1920, w);
+                Assert.AreEqual(1080, h);
+            }
+            finally { Object.DestroyImmediate(rt); }
+        }
+
+        [Test]
+        public void BuildMovieSettings_RenderTextureSource_Mp4LargeRt_Throws()
+        {
+            var rt = new RenderTexture(7488, 1344, 0);
+            try
+            {
+                var item = MakeMovieItem(width: 1920, height: 1080,
+                    sourceType: ImageRecorderSourceType.RenderTexture);
+                var config = MakeMovieConfig(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.MP4);
+                // effectiveWidth/Height(1920x1080) が上限内でも、RT 実寸(7488x1344)で
+                // 検証されて H.264 上限超過として弾かれること
+                Assert.Throws<System.InvalidOperationException>(() =>
+                    RecorderSettingsBuilderShared.BuildMovieSettings(
+                        item, config, 1920, 1080, 24.0, null, rt, "Recordings/job/output"));
+            }
+            finally { Object.DestroyImmediate(rt); }
+        }
+
+        [Test]
+        public void BuildMovieSettings_RenderTextureSource_WebMLargeRt_Builds()
+        {
+            var rt = new RenderTexture(7488, 1344, 0);
+            MovieRecorderSettings settings = null;
+            try
+            {
+                var item = MakeMovieItem(width: 1920, height: 1080,
+                    sourceType: ImageRecorderSourceType.RenderTexture);
+                var config = MakeMovieConfig(
+                    MovieRecorderSettings.VideoRecorderOutputFormat.WebM);
+                settings = RecorderSettingsBuilderShared.BuildMovieSettings(
+                    item, config, 1920, 1080, 24.0, null, rt, "Recordings/job/output");
+
+                Assert.IsInstanceOf<RenderTextureInputSettings>(settings.ImageInputSettings,
+                    "RT source must produce RenderTextureInputSettings.");
+                Assert.AreEqual(7488, settings.ImageInputSettings.OutputWidth,
+                    "Output width must come from the RT's actual size.");
+            }
+            finally
+            {
+                if (settings != null) Object.DestroyImmediate(settings);
+                Object.DestroyImmediate(rt);
+            }
+        }
+
         // ---- ResolveOutputRelativePath — Movie has no <Frame> -------------------
 
         [Test]

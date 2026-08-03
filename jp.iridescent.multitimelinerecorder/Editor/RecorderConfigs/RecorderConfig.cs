@@ -43,6 +43,12 @@ namespace Unity.MultiTimelineRecorder
         public AudioBitRateMode audioBitrate = AudioBitRateMode.High;
         public MovieRecorderPreset moviePreset = MovieRecorderPreset.HighQuality1080p;
         public bool useMoviePreset = false;
+
+        // Movie encoder settings (NVENC, specs/mtr-nvenc-encoder)
+        public MovieEncoderType movieEncoderType = MovieEncoderType.CoreEncoder;
+        public string movieFfmpegPath = string.Empty;
+        public int movieFfmpegQp = 24;
+        public int movieFfmpegBitrateKbps = 0;
         
         // AOV recorder settings
         public AOVType selectedAOVTypes = AOVType.Depth | AOVType.Normal | AOVType.Albedo;

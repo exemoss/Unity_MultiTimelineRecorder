@@ -22,7 +22,30 @@ namespace Unity.MultiTimelineRecorder
         public int preRollFrames = 0;
         public string cameraTag = "MainCamera";
         public OutputResolution outputResolution = OutputResolution.HD1080p;
-        
+
+        // AsyncGPUReadback 滞留対策（GPU device-removed クラッシュ対策）:
+        // 高速GPU x 4K長尺のようにエンコーダの消費が描画に追いつかない環境では、
+        // 読み戻し要求が無制限に積み上がりクラッシュし得るため、一定フレームごとに
+        // AsyncGPUReadback.WaitAllRequests() で描画側を待たせて滞留を上限内に抑える。
+        public bool enableReadbackBackpressure = true;
+        public int readbackDrainIntervalFrames = 1;
+
+        // v1.5.7/v1.5.10/v1.5.13-16 に存在した「エンコーダ入力キュー（プロセス RAM）の
+        // 増分監視 + director 一時停止」方式（enableEncoderMemoryBackpressure 等）は
+        // v1.5.17 で完全に撤去した。Play Mode 全体 pause・director 単体 pause のいずれも
+        // 「背圧を逃がす当のフレーム消費処理まで一緒に止めてしまい resume が来ず恒久ハング/
+        // 0秒凍結する」という同型の構造的欠陥を2世代にわたって実証したため
+        // （specs/mtr-nvenc-encoder/investigation.md イテレーション2・3）。
+        //
+        // 後継（Encoder Output Stall Guard）: 内蔵 CoreEncoder には未処理フレーム数に
+        // 相当する信号が公開されていないため、真の in-flight 有界化はできない。代わりに
+        // 録画中の Movie 出力ファイルが一定時間まったく成長していないかだけを監視する
+        // 最終安全弁。director/Play Mode は一切止めない
+        // （詳細は PlayModeTimelineRenderer.cs / specs/mtr-nvenc-encoder/implementation.md）。
+        public bool enableEncoderOutputStallGuard = true;
+        public int encoderStallCheckIntervalSec = 2;
+        public int encoderStallTimeoutSec = 120;
+
         // Image Recorder設定（Single Recorder Mode用）
         public UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat imageOutputFormat = UnityEditor.Recorder.ImageRecorderSettings.ImageRecorderOutputFormat.PNG;
         public bool imageCaptureAlpha = false;
@@ -102,7 +125,7 @@ namespace Unity.MultiTimelineRecorder
         {
             public int timelineIndex;
             public int takeNumber;
-            
+
             public TimelineTakeNumberEntry(int index, int take)
             {
                 timelineIndex = index;
@@ -110,7 +133,25 @@ namespace Unity.MultiTimelineRecorder
             }
         }
         public List<TimelineTakeNumberEntry> timelineTakeNumbers = new List<TimelineTakeNumberEntry>();
-        
+
+        // タイムライン固有の「排他ルート」明示上書き管理
+        // Refs: mtr-batch-scene-activation 案1
+        // 既定では ControlClip の排他対象は「Directorの外側プレハブインスタンスルート」を
+        // 自動推定するが、命名/構造の例外セクション向けに明示上書きできるようにする。
+        [Serializable]
+        public class TimelineExclusiveRootEntry
+        {
+            public int timelineIndex;
+            public GameObjectReference rootOverride;
+
+            public TimelineExclusiveRootEntry(int index, GameObjectReference root)
+            {
+                timelineIndex = index;
+                rootOverride = root;
+            }
+        }
+        public List<TimelineExclusiveRootEntry> timelineExclusiveRootOverrides = new List<TimelineExclusiveRootEntry>();
+
         // シーンごとの設定管理
         [Serializable]
         public class SceneSpecificSettings
@@ -123,7 +164,8 @@ namespace Unity.MultiTimelineRecorder
             public int currentTimelineIndexForRecorder = 0;
             public List<TimelineRecorderConfigEntry> timelineRecorderConfigEntries = new List<TimelineRecorderConfigEntry>();
             public List<TimelineTakeNumberEntry> timelineTakeNumbers = new List<TimelineTakeNumberEntry>();
-            
+            public List<TimelineExclusiveRootEntry> timelineExclusiveRootOverrides = new List<TimelineExclusiveRootEntry>();
+
             public SceneSpecificSettings(string path, string name)
             {
                 scenePath = path;
@@ -262,6 +304,43 @@ namespace Unity.MultiTimelineRecorder
                 dict[entry.timelineIndex] = entry.takeNumber;
             }
             return dict;
+        }
+
+        /// <summary>
+        /// 指定Timelineの「排他ルート」明示上書きを取得する（未設定なら null）。
+        /// 呼び出し側（ControlClip生成側）は null の場合、外側プレハブインスタンス
+        /// ルートを既定値として使う。
+        /// </summary>
+        public GameObject GetTimelineExclusiveRootOverride(int timelineIndex)
+        {
+            var entry = timelineExclusiveRootOverrides.Find(e => e.timelineIndex == timelineIndex);
+            return entry?.rootOverride?.GameObject;
+        }
+
+        /// <summary>
+        /// 指定Timelineの「排他ルート」明示上書きを設定する。null を渡すとエントリを削除し
+        /// 既定推定（外側プレハブインスタンスルート）に戻す。
+        /// </summary>
+        public void SetTimelineExclusiveRootOverride(int timelineIndex, GameObject root)
+        {
+            var entry = timelineExclusiveRootOverrides.Find(e => e.timelineIndex == timelineIndex);
+            if (root == null)
+            {
+                if (entry != null)
+                {
+                    timelineExclusiveRootOverrides.Remove(entry);
+                }
+            }
+            else if (entry != null)
+            {
+                entry.rootOverride.GameObject = root;
+            }
+            else
+            {
+                var reference = new GameObjectReference { GameObject = root };
+                timelineExclusiveRootOverrides.Add(new TimelineExclusiveRootEntry(timelineIndex, reference));
+            }
+            Save();
         }
         
         /// <summary>

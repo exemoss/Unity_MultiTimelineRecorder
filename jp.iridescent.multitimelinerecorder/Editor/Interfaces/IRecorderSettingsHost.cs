@@ -41,6 +41,12 @@ namespace Unity.MultiTimelineRecorder
         AudioBitRateMode audioBitrate { get; set; }
         MovieRecorderPreset moviePreset { get; set; }
         bool useMoviePreset { get; set; }
+
+        // Movie encoder settings (NVENC, specs/mtr-nvenc-encoder)
+        MovieEncoderType movieEncoderType { get; set; }
+        string movieFfmpegPath { get; set; }
+        int movieFfmpegQp { get; set; }
+        int movieFfmpegBitrateKbps { get; set; }
         
         // AOV settings
         AOVType selectedAOVTypes { get; set; }
