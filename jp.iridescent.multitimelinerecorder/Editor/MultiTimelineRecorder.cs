@@ -1927,7 +1927,72 @@ namespace Unity.MultiTimelineRecorder
         private void OnEditorUpdate()
         {
             // OnPlayModeStateChanged handles Play Mode transitions now
-            // This method can be used for other update tasks if needed
+            RenderHistoryWatchdog();
+        }
+
+        private double nextRenderHistoryWatchdogTime;
+        private const double RenderHistoryWatchdogIntervalSec = 5.0;
+        private const double RenderHistoryPrepGraceSec = 300.0;
+
+        /// <summary>
+        /// レンダリング履歴の取りこぼし監視。エラー等で終了フックを通らずに
+        /// Running エントリが残る（タイマーが回り続ける）のを防ぐ。
+        ///
+        /// PlayMode 中は判定しない（録画進行中が正常。異常系は Encoder Output Stall Guard と
+        /// PlayMode 終了時の確定キャッチオールで受ける）。PlayMode 外で Running エントリが
+        /// あるのに currentState が終了系（Error / Complete / Idle / Recording）なら即確定し、
+        /// 準備系ステートのまま固まっている場合は猶予時間を超えたらエラー確定する。
+        /// </summary>
+        private void RenderHistoryWatchdog()
+        {
+            if (EditorApplication.timeSinceStartup < nextRenderHistoryWatchdogTime)
+                return;
+            nextRenderHistoryWatchdogTime = EditorApplication.timeSinceStartup + RenderHistoryWatchdogIntervalSec;
+
+            if (EditorApplication.isPlaying)
+                return;
+            var runningEntry = RenderHistory.CurrentRunningEntry;
+            if (runningEntry == null)
+                return;
+
+            switch (currentState)
+            {
+                case RecordState.Error:
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, renderProgress,
+                        string.IsNullOrEmpty(statusMessage) ? "エラーで停止（ウォッチドッグ検知）" : statusMessage);
+                    MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] 履歴ウォッチドッグ: Error 状態の実行を確定しました");
+                    break;
+
+                case RecordState.Complete:
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
+                    break;
+
+                case RecordState.Idle:
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Interrupted, renderProgress,
+                        "終了を検知できなかったためウォッチドッグで確定");
+                    MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] 履歴ウォッチドッグ: Idle 状態で残っていた実行を中断として確定しました");
+                    break;
+
+                case RecordState.Recording:
+                case RecordState.InitializingInPlayMode:
+                    // PlayMode 外でこの状態 = PlayMode 終了の検知漏れ
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Interrupted, renderProgress,
+                        "PlayMode 終了を検知できなかったためウォッチドッグで確定");
+                    MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] 履歴ウォッチドッグ: PlayMode 終了検知漏れの実行を中断として確定しました");
+                    break;
+
+                default:
+                    // 準備系（Preparing / PreparingAssets / SavingAssets / WaitingForPlayMode）は
+                    // 正常でも時間がかかり得るため、猶予を超えた場合のみ異常（準備中の例外で
+                    // コルーチンが死んだ等）とみなす
+                    if (runningEntry.Duration.TotalSeconds > RenderHistoryPrepGraceSec)
+                    {
+                        RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, renderProgress,
+                            $"PlayMode に到達しないまま {(int)RenderHistoryPrepGraceSec} 秒経過（準備中に例外の可能性）");
+                        MultiTimelineRecorderLogger.LogWarning("[MultiTimelineRecorder] 履歴ウォッチドッグ: 準備中のまま固まった実行をエラーとして確定しました");
+                    }
+                    break;
+            }
         }
         
         private void OnSceneOpened(Scene scene, OpenSceneMode mode)
@@ -2170,6 +2235,24 @@ namespace Unity.MultiTimelineRecorder
                     Repaint();
                 }
                 
+                // 履歴の取りこぼし防止キャッチオール: PlayMode 終了はローカル録画の終了を必ず意味する。
+                // 上の分岐で確定済みなら冪等な FinalizeCurrent が no-op になるだけなので常に呼ぶ。
+                // STR_IsRenderingFailed のキー自体はここでは消費しない（OnRecordingProgressUpdate 側が読む）
+                if (EditorPrefs.GetBool("STR_IsRenderingFailed", false))
+                {
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, renderProgress,
+                        EditorPrefs.GetString("STR_Status", "Recording failed"));
+                }
+                else if (EditorPrefs.GetBool("STR_IsRenderingComplete", false))
+                {
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
+                }
+                else
+                {
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Interrupted, renderProgress,
+                        $"PlayMode 終了時に確定 (state: {currentState})");
+                }
+
                 // Take Numberインクリメントフラグをチェック
                 if (EditorPrefs.GetBool("STR_IncrementTakeNumber", false))
                 {
@@ -3868,7 +3951,9 @@ namespace Unity.MultiTimelineRecorder
             
             // IRecorderSettingsHost implementation
             public PlayableDirector selectedDirector => renderer.selectedDirector;
-            
+
+            public string recorderItemName => item.name;
+
             // Use global settings where applicable, item-specific otherwise
             public int frameRate { get => renderer.frameRate; set => renderer.frameRate = value; }
             public int width 
