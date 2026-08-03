@@ -132,6 +132,21 @@ namespace DistributedRecorder.Tests
         }
 
         [Test]
+        public void CurrentRunningEntry_TracksLifecycle()
+        {
+            Assert.IsNull(RenderHistory.CurrentRunningEntry, "開始前は null");
+            Assert.IsFalse(RenderHistory.HasUnfinishedCurrentRun);
+
+            RenderHistory.BeginRun(new[] { "S05_Timeline" });
+            Assert.IsNotNull(RenderHistory.CurrentRunningEntry, "BeginRun 後は Running エントリを返す");
+            Assert.IsTrue(RenderHistory.HasUnfinishedCurrentRun);
+
+            RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, 0.3f, "テストエラー");
+            Assert.IsNull(RenderHistory.CurrentRunningEntry, "確定後は null（ウォッチドッグの停止条件）");
+            Assert.IsFalse(RenderHistory.HasUnfinishedCurrentRun);
+        }
+
+        [Test]
         public void FormatDuration_FormatsMinutesAndHours()
         {
             Assert.AreEqual("1:05", RenderHistory.FormatDuration(TimeSpan.FromSeconds(65)));
