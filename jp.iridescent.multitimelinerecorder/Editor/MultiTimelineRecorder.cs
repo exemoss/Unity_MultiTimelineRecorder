@@ -467,7 +467,11 @@ namespace Unity.MultiTimelineRecorder
             // Status section
             DrawStatusSection();
             EditorGUILayout.Space(Styles.SectionSpacing);
-            
+
+            // Render history section
+            DrawRenderHistorySection();
+            EditorGUILayout.Space(Styles.SectionSpacing);
+
             // Debug settings
             DrawDebugSettings();
             
@@ -2025,6 +2029,7 @@ namespace Unity.MultiTimelineRecorder
                         
                         currentState = RecordState.Error;
                         statusMessage = "Failed to load recording timeline";
+                        RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, 0f, statusMessage);
                         
                         // Clear rendering flag
                         EditorPrefs.SetBool("STR_IsRendering", false);
@@ -2130,6 +2135,7 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] Recording completed successfully");
                     currentState = RecordState.Idle;
                     statusMessage = "Recording completed";
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
                     renderProgress = 0f;
                     
                     // Clear all rendering flags
@@ -2149,6 +2155,7 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] Recording was interrupted by user stopping Play Mode");
                     currentState = RecordState.Idle;
                     statusMessage = "Recording stopped by user";
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Interrupted, renderProgress, "PlayMode が停止されました");
                     renderProgress = 0f;
                     
                     // Clear rendering flags
@@ -2550,10 +2557,101 @@ namespace Unity.MultiTimelineRecorder
                     EditorGUILayout.EndHorizontal();
                 }
             }
-            
+
             EditorGUILayout.EndVertical();
         }
-        
+
+        private bool showRenderHistory = true;
+        private Vector2 renderHistoryScroll;
+
+        /// <summary>
+        /// レンダリング履歴セクション。過去の実行の開始日時・所要時間・
+        /// 終了状態（完了 / 中断 / 停止 / エラー）を新しい順に表示する。
+        /// 記録の実体は <see cref="RenderHistory"/>（UserSettings/ の JSON、マシンローカル）。
+        /// </summary>
+        private void DrawRenderHistorySection()
+        {
+            var entries = RenderHistory.Entries;
+            showRenderHistory = EditorGUILayout.Foldout(showRenderHistory, $"Render History ({entries.Count})", true);
+            if (!showRenderHistory) return;
+
+            if (entries.Count == 0)
+            {
+                EditorGUILayout.LabelField("履歴はまだありません（録画を実行すると記録されます）", EditorStyles.miniLabel);
+                return;
+            }
+
+            float rowHeight = EditorGUIUtility.singleLineHeight + 2f;
+            float viewHeight = Mathf.Min(entries.Count, 8) * rowHeight + 8f;
+            renderHistoryScroll = EditorGUILayout.BeginScrollView(renderHistoryScroll, GUILayout.Height(viewHeight));
+
+            // 新しい順に表示
+            for (int i = entries.Count - 1; i >= 0; i--)
+            {
+                var entry = entries[i];
+                EditorGUILayout.BeginHorizontal();
+
+                Color originalColor = GUI.color;
+                GUI.color = GetHistoryStatusColor(entry.Status);
+                EditorGUILayout.LabelField(GetHistoryStatusLabel(entry.Status), EditorStyles.miniBoldLabel, GUILayout.Width(56));
+                GUI.color = originalColor;
+
+                EditorGUILayout.LabelField(entry.StartedLocal.ToString("MM/dd HH:mm"), EditorStyles.miniLabel, GUILayout.Width(76));
+                EditorGUILayout.LabelField(RenderHistory.FormatDuration(entry.Duration), EditorStyles.miniLabel, GUILayout.Width(60));
+
+                // 完了以外は終了時点の進捗も出す（「どこまで進んで中断されたか」が分かるように）
+                string progressText = entry.Status == RenderHistoryStatus.Completed || entry.Status == RenderHistoryStatus.Running
+                    ? string.Empty
+                    : $"{(int)(entry.progress * 100)}%";
+                EditorGUILayout.LabelField(progressText, EditorStyles.miniLabel, GUILayout.Width(34));
+
+                string tooltip = string.IsNullOrEmpty(entry.note) ? entry.timelines : $"{entry.timelines}\n{entry.note}";
+                EditorGUILayout.LabelField(new GUIContent(entry.timelines, tooltip), EditorStyles.miniLabel);
+
+                EditorGUILayout.EndHorizontal();
+            }
+
+            EditorGUILayout.EndScrollView();
+
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Clear History", GUILayout.Width(100)))
+            {
+                if (EditorUtility.DisplayDialog("Render History",
+                    "レンダリング履歴をすべて削除しますか？", "削除", "キャンセル"))
+                {
+                    RenderHistory.Clear();
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private static string GetHistoryStatusLabel(RenderHistoryStatus status)
+        {
+            switch (status)
+            {
+                case RenderHistoryStatus.Running:     return "記録中";
+                case RenderHistoryStatus.Completed:   return "完了";
+                case RenderHistoryStatus.Interrupted: return "中断";
+                case RenderHistoryStatus.Cancelled:   return "停止";
+                case RenderHistoryStatus.Error:       return "エラー";
+                default:                              return status.ToString();
+            }
+        }
+
+        private static Color GetHistoryStatusColor(RenderHistoryStatus status)
+        {
+            switch (status)
+            {
+                case RenderHistoryStatus.Running:     return new Color(1f, 0.4f, 0.4f);
+                case RenderHistoryStatus.Completed:   return Color.green;
+                case RenderHistoryStatus.Interrupted: return new Color(1f, 0.7f, 0.2f);
+                case RenderHistoryStatus.Cancelled:   return new Color(1f, 0.7f, 0.2f);
+                case RenderHistoryStatus.Error:       return new Color(1f, 0.35f, 0.35f);
+                default:                              return Color.white;
+            }
+        }
+
         /// <summary>
         /// SignalEmitter設定のUI描画 (TODO-282)
         /// </summary>
@@ -3182,6 +3280,7 @@ namespace Unity.MultiTimelineRecorder
             
             currentState = RecordState.Idle;
             statusMessage = "Recording stopped by user";
+            RenderHistory.FinalizeCurrent(RenderHistoryStatus.Cancelled, renderProgress, "Stop Recording ボタンで停止");
             MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] StopRecording completed");
         }
         
@@ -3199,6 +3298,7 @@ namespace Unity.MultiTimelineRecorder
                     statusMessage = "Recording complete!";
                     renderProgress = 1f;
                     EditorPrefs.DeleteKey("STR_IsRenderingComplete");
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
 
                     // Take番号のインクリメントはPlayModeTimelineRendererが1秒後に行うように変更したためここでは行わない
                     // インクリメントはOnPlayModeStateChangedのExitingPlayModeで処理される
@@ -3212,6 +3312,7 @@ namespace Unity.MultiTimelineRecorder
                     currentState = RecordState.Error;
                     statusMessage = EditorPrefs.GetString("STR_Status", "Recording failed (encoder output stalled)");
                     EditorPrefs.DeleteKey("STR_IsRenderingFailed");
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, renderProgress, statusMessage);
                 }
 
                 return;
@@ -3244,6 +3345,7 @@ namespace Unity.MultiTimelineRecorder
                 currentState = RecordState.Complete;
                 statusMessage = "Recording complete!";
                 renderProgress = 1f;
+                RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
                 
                 // Set flag to increment take number when exiting play mode
                 EditorPrefs.SetBool("STR_IncrementTakeNumber", true);
@@ -3513,6 +3615,16 @@ namespace Unity.MultiTimelineRecorder
             // Enter Play Mode
             currentState = RecordState.WaitingForPlayMode;
             statusMessage = "Starting Unity Play Mode...";
+
+            // レンダリング履歴: ここから 1 実行として記録する（PlayMode 突入〜完走/中断までが所要時間。
+            // 準備段階のエラーは履歴に残さない）。終了は完了/中断/エラーの各遷移点で FinalizeCurrent を呼ぶ
+            var historyTimelineNames = new List<string>();
+            foreach (var historyDirector in directorsToRender)
+            {
+                if (historyDirector != null && historyDirector.gameObject != null)
+                    historyTimelineNames.Add(historyDirector.gameObject.name);
+            }
+            RenderHistory.BeginRun(historyTimelineNames);
             
             MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] === Current Play Mode state: {EditorApplication.isPlaying} ===");
             
@@ -3527,6 +3639,7 @@ namespace Unity.MultiTimelineRecorder
                     MultiTimelineRecorderLogger.LogError("[MultiTimelineRecorder] tempAssetPath is null or empty!");
                     currentState = RecordState.Error;
                     statusMessage = "Timeline asset path is invalid";
+                    RenderHistory.FinalizeCurrent(RenderHistoryStatus.Error, renderProgress, statusMessage);
                     
                     // Restore original playOnAwake values
                     foreach (var kvp in originalPlayOnAwakeValues)
