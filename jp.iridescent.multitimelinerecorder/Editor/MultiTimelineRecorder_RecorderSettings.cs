@@ -564,6 +564,8 @@ namespace Unity.MultiTimelineRecorder
                     timelineConfig.useGlobalResolution ? height : recorderItem.height);
                 context.TimelineName = director.gameObject.name;
                 context.RecorderName = recorderItem.recorderType.ToString();
+                // <RecorderName> はアイテムの表示名で解決する（<Recorder> は互換のためタイプ名のまま）
+                context.RecorderDisplayName = recorderItem.name;
                 context.RecorderDisplayName = recorderItem.name;
                 context.RecorderType = recorderItem.recorderType;
                 

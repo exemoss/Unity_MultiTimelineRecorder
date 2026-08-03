@@ -215,7 +215,10 @@ namespace Unity.MultiTimelineRecorder
             
             // IRecorderSettingsHost implementation
             public PlayableDirector selectedDirector => parentHost.selectedDirector;
-            
+
+            // RecorderConfig は表示名を持たないため null（<RecorderName> はタイプ名にフォールバック）
+            public string recorderItemName => null;
+
             public int frameRate { get => config.frameRate; set => config.frameRate = value; }
             public int width { get => config.width; set => config.width = value; }
             public int height { get => config.height; set => config.height = value; }

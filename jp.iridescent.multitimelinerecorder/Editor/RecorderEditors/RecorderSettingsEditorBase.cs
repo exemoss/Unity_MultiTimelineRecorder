@@ -369,6 +369,8 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             var context = new WildcardContext(host.takeNumber, host.width, host.height)
             {
                 RecorderName = GetRecorderName(),
+                // <RecorderName> は実際の録画と同じくアイテム表示名で解決する（プレビューの一致のため）
+                RecorderDisplayName = host.recorderItemName,
                 GameObjectName = GetTargetGameObjectName(),
                 TimelineName = GetTimelineName(),
                 TimelineTakeNumber = GetTimelineTakeNumber()

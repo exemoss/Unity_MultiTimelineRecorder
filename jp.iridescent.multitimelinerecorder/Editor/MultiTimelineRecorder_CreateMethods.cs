@@ -627,6 +627,9 @@ namespace Unity.MultiTimelineRecorder
                 timelineConfig.useGlobalResolution ? height : recorderItem.height);
             context.TimelineName = directors.Count > 1 ? $"MultiTimeline_{directors.Count}" : firstDirector.gameObject.name;
             context.RecorderName = recorderItem.recorderType.ToString();
+            // <RecorderName> はアイテムの表示名で解決する（従来はタイプ名にフォールバックして
+            // "Movie" 等になっていた。<Recorder> は互換のためタイプ名のまま）
+            context.RecorderDisplayName = recorderItem.name;
             context.RecorderType = recorderItem.recorderType;
             
             // Always set TimelineTakeNumber for <TimelineTake> wildcard
@@ -1053,6 +1056,9 @@ namespace Unity.MultiTimelineRecorder
                 timelineConfig.useGlobalResolution ? height : recorderItem.height);
             context.TimelineName = originalDirector.gameObject.name;
             context.RecorderName = recorderItem.recorderType.ToString();
+            // <RecorderName> はアイテムの表示名で解決する（従来はタイプ名にフォールバックして
+            // "Movie" 等になっていた。<Recorder> は互換のためタイプ名のまま）
+            context.RecorderDisplayName = recorderItem.name;
             context.RecorderType = recorderItem.recorderType;
             
             // Always set TimelineTakeNumber for <TimelineTake> wildcard
