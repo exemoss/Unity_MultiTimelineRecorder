@@ -4,6 +4,22 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.21] - 2026-08-04
+
+### Fixed
+- Render History: runs that ended abnormally no longer keep their timer running.
+  A low-frequency watchdog in the editor update loop finalizes leftover Running
+  entries (instantly when the window state is Error / Complete / Idle / stale
+  Recording, and after a 300 s grace when stuck in a preparation state), and a
+  catch-all on Play Mode exit finalizes the entry no matter which state branch
+  was taken (Error when the renderer set the failure flag, Completed when the
+  completion flag is set, otherwise Interrupted).
+- `<RecorderName>` wildcard now resolves to the recorder item's display name
+  (e.g. `M1_V_LED_L`) in the local recording path. It previously fell back to
+  the recorder type name (`Movie`). `<Recorder>` keeps resolving to the type
+  name for backwards compatibility, and the output-path preview in the recorder
+  settings UI now matches the actual output.
+
 ## [1.5.20] - 2026-08-03
 
 ### Added
