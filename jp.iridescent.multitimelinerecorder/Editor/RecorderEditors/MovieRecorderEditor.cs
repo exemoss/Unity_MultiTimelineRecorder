@@ -242,7 +242,31 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                 errorMessage = "File name cannot be empty";
                 return false;
             }
-            
+
+            // エンコーダ / コンテナ別の解像度上限チェック。
+            // RenderTexture ソースでは出力サイズは RT の実寸になるため、実効解像度で判定する
+            int effectiveWidth = host.width;
+            int effectiveHeight = host.height;
+            if (host.imageSourceType == ImageRecorderSourceType.RenderTexture && host.imageRenderTexture != null)
+            {
+                effectiveWidth = host.imageRenderTexture.width;
+                effectiveHeight = host.imageRenderTexture.height;
+            }
+            int maxDimension = MovieRecorderSettingsConfig.GetMaxDimension(host.movieOutputFormat, host.movieEncoderType);
+            if (effectiveWidth > maxDimension || effectiveHeight > maxDimension)
+            {
+                if (MovieRecorderSettingsConfig.IsH264(host.movieOutputFormat, host.movieEncoderType))
+                {
+                    errorMessage = $"解像度 {effectiveWidth}x{effectiveHeight} は H.264 の上限 ({MovieRecorderSettingsConfig.MaxDimensionH264}px) を超えています。" +
+                                   "Video Format を WebM または ProRes (MOV)、もしくはエンコーダを NVENC HEVC に変更してください";
+                }
+                else
+                {
+                    errorMessage = $"解像度 {effectiveWidth}x{effectiveHeight} は {host.movieOutputFormat}/{host.movieEncoderType} の上限 ({maxDimension}px) を超えています";
+                }
+                return false;
+            }
+
             // Check alpha support
             if (host.movieCaptureAlpha)
             {

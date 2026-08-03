@@ -2966,6 +2966,17 @@ namespace Unity.MultiTimelineRecorder
             MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Selected directors: {recordingQueueDirectors.Count}");
             MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Selected index: {selectedDirectorIndex}");
             MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Is Playing: {EditorApplication.isPlaying}");
+
+            // Movie 解像度のプリフライトチェック(H.264 上限超過はダイアログでフォーマット切替を促す)。
+            // ここで弾かないと CreateMovieRecorderSettingsFromConfig が録画開始後に該当アイテムを
+            // 黙ってスキップし、「録画は完走したのにファイルが無い」状態になる。
+            if (!ConfirmMovieResolutionBeforeRecording())
+            {
+                currentState = RecordState.Idle;
+                statusMessage = "Recording cancelled (movie resolution check)";
+                MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] Recording cancelled by movie resolution preflight check");
+                return;
+            }
             
             // SignalEmitter設定の情報を表示 (TODO-282)
             if (useSignalEmitterTiming)
@@ -3020,7 +3031,114 @@ namespace Unity.MultiTimelineRecorder
             MultiTimelineRecorderLogger.LogVerbose("[MultiTimelineRecorder] Starting new coroutine");
             renderCoroutine = EditorCoroutineUtility.StartCoroutine(RenderTimelineCoroutine(), this);
         }
-        
+
+        /// <summary>
+        /// 録画開始前の Movie 解像度プリフライトチェック。
+        /// 対象は録画キュー(recordingQueueDirectors)の各 Timeline に紐づく有効な Movie アイテムで、
+        /// 実効解像度(RenderTexture ソース時は RT 実寸)で判定する。
+        /// - H.264(内蔵 MP4 / NVENC H.264)で上限を超える場合: ダイアログで WebM / ProRes(MOV)
+        ///   への切替を促し、選択に応じて movieConfig を書き換えて続行する。
+        /// - それ以外のフォーマットで上限を超える場合: エラーダイアログを出して中止する。
+        /// ここで弾かないと録画開始後に該当アイテムが黙ってスキップされ、
+        /// 「録画は完走したのにファイルが無い」状態になる。
+        /// </summary>
+        /// <returns>false = 録画を中止する</returns>
+        private bool ConfirmMovieResolutionBeforeRecording()
+        {
+            var h264OverLimitItems = new List<MultiRecorderConfig.RecorderConfigItem>();
+            var h264OverLimitLines = new List<string>();
+            var hardErrorLines = new List<string>();
+
+            for (int timelineIndex = 0; timelineIndex < recordingQueueDirectors.Count; timelineIndex++)
+            {
+                var director = recordingQueueDirectors[timelineIndex];
+                if (director == null)
+                    continue;
+
+                var timelineConfig = GetTimelineRecorderConfig(timelineIndex);
+                if (timelineConfig == null)
+                    continue;
+
+                foreach (var item in timelineConfig.GetEnabledRecorders())
+                {
+                    if (item.recorderType != RecorderSettingsType.Movie || item.movieConfig == null)
+                        continue;
+
+                    item.GetEffectiveOutputResolution(out int effectiveWidth, out int effectiveHeight);
+                    int maxDimension = MovieRecorderSettingsConfig.GetMaxDimension(
+                        item.movieConfig.outputFormat, item.movieConfig.encoderType);
+                    if (effectiveWidth <= maxDimension && effectiveHeight <= maxDimension)
+                        continue;
+
+                    string line = $"・{director.gameObject.name} / {item.name}: {effectiveWidth}x{effectiveHeight}";
+                    if (MovieRecorderSettingsConfig.IsH264(item.movieConfig.outputFormat, item.movieConfig.encoderType))
+                    {
+                        if (!h264OverLimitItems.Contains(item))
+                        {
+                            h264OverLimitItems.Add(item);
+                            h264OverLimitLines.Add(line);
+                        }
+                    }
+                    else
+                    {
+                        hardErrorLines.Add($"{line} (上限 {maxDimension}px / {item.movieConfig.outputFormat})");
+                    }
+                }
+            }
+
+            if (hardErrorLines.Count > 0)
+            {
+                EditorUtility.DisplayDialog(
+                    "Movie 解像度が上限を超えています",
+                    "以下の Movie レコーダーは選択中の出力フォーマットの上限解像度を超えているため録画できません:\n\n" +
+                    string.Join("\n", hardErrorLines) +
+                    "\n\n解像度または出力フォーマットを見直してください。",
+                    "OK");
+                return false;
+            }
+
+            if (h264OverLimitItems.Count == 0)
+                return true;
+
+            int choice = EditorUtility.DisplayDialogComplex(
+                "H.264 の解像度上限を超えています",
+                "以下の Movie レコーダーは H.264 (MP4) の上限 " +
+                $"{MovieRecorderSettingsConfig.MaxDimensionH264}px を超える解像度です:\n\n" +
+                string.Join("\n", h264OverLimitLines) +
+                "\n\nH.264 ではこの解像度をエンコードできないため、このまま録画してもファイルは出力されません。\n" +
+                "出力フォーマットを切り替えて続行できます。",
+                "WebM に切り替えて続行",
+                "キャンセル",
+                "ProRes (MOV) に切り替えて続行");
+
+            if (choice == 1)
+                return false;
+
+            var newFormat = choice == 0
+                ? MovieRecorderSettings.VideoRecorderOutputFormat.WebM
+                : MovieRecorderSettings.VideoRecorderOutputFormat.MOV;
+
+            foreach (var item in h264OverLimitItems)
+            {
+                item.movieConfig.outputFormat = newFormat;
+                // FFmpeg NVENC 系エンコーダは MP4 コンテナ専用のため、内蔵エンコーダに戻す
+                if (item.movieConfig.encoderType != MovieEncoderType.CoreEncoder)
+                    item.movieConfig.encoderType = MovieEncoderType.CoreEncoder;
+            }
+
+            if (settings != null)
+            {
+                EditorUtility.SetDirty(settings);
+                AssetDatabase.SaveAssets();
+            }
+            SaveSettings();
+            Repaint();
+
+            MultiTimelineRecorderLogger.Log(
+                $"[MultiTimelineRecorder] {h264OverLimitItems.Count} 件の Movie レコーダーの出力フォーマットを {newFormat} に切り替えて録画を続行します");
+            return true;
+        }
+
         private void StopRecording()
         {
             MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] StopRecording called");
