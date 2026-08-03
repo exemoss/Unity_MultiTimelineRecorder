@@ -4,6 +4,18 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.20] - 2026-08-03
+
+### Added
+- Render History: the MTR window now records every local recording run (start
+  time, duration, recorded timelines) and its outcome — Completed, Interrupted
+  (Play Mode stopped), Cancelled (Stop button), or Error (with the error note
+  and the progress reached). Shown newest-first in a collapsible "Render
+  History" section with a Clear button. History is stored per-machine in
+  `UserSettings/MultiTimelineRecorderRenderHistory.json` (not committed to the
+  repository). Runs that ended without being detected (editor crash / window
+  closed) are marked Interrupted on the next run.
+
 ## [1.5.19] - 2026-08-03
 
 ### Fixed
