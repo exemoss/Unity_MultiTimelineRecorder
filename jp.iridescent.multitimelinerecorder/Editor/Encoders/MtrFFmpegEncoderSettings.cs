@@ -15,11 +15,12 @@ namespace Unity.MultiTimelineRecorder.Encoders
 {
     /// <summary>
     /// MTR 独自の FFmpeg コマンドラインエンコーダ設定。
-    /// NVENC（H.264 / HEVC）に絞った上で QP / 目標ビットレートを UI から調整できるようにしたもの。
+    /// NVENC（H.264 / HEVC）と VP9（libvpx-vp9 / WebM、ソフトウェア）に対応し、
+    /// QP / 目標ビットレートを UI から調整できるようにしたもの。
     /// Recorder 5.1.6 の公開拡張点（IEncoderSettings + [EncoderSettings] 属性）にそのまま乗るため、
     /// Recorder パッケージ本体（PackageCache）は無改変。
     /// </summary>
-    [DisplayName("MTR FFmpeg NVENC Encoder")]
+    [DisplayName("MTR FFmpeg Encoder")]
     [Serializable]
     [EncoderSettings(typeof(MtrFFmpegEncoder))]
     public sealed class MtrFFmpegEncoderSettings : IEncoderSettings, IEquatable<MtrFFmpegEncoderSettings>
@@ -37,14 +38,17 @@ namespace Unity.MultiTimelineRecorder.Encoders
         }
 
         /// <summary>
-        /// NVENC のコーデック種別。サンプルはソフトウェア H.264/HEVC/ProRes/VP8/VP9 も含む
+        /// コーデック種別。サンプルはソフトウェア H.264/HEVC/ProRes/VP8/VP9 も含む
         /// フルセットだったが、MTR の初期スコープ（plan.md 案1・ユーザー決定）は
-        /// 「H.264 / HEVC NVENC を必須、AV1 は任意」のため NVENC 2種類に絞った。
+        /// 「H.264 / HEVC NVENC を必須、AV1 は任意」のため NVENC 2種類に絞っていた。
+        /// Vp9Webm は WebM コンテナ + BT.709 タグ付きの納品要件向けに追加
+        /// （NVENC は VP9 エンコードに非対応のため libvpx-vp9 のソフトウェアエンコード）。
         /// </summary>
         public enum OutputFormat
         {
             [InspectorName("H.264 NVENC")] H264Nvenc,
             [InspectorName("H.265 HEVC NVENC")] HevcNvenc,
+            [InspectorName("VP9 (WebM, ソフトウェア)")] Vp9Webm,
         }
 
         public OutputFormat Format
@@ -78,13 +82,38 @@ namespace Unity.MultiTimelineRecorder.Encoders
         [SerializeField] int bitrateKbps;
 
         /// <inheritdoc/>
-        string IEncoderSettings.Extension => "mp4";
+        string IEncoderSettings.Extension => Format == OutputFormat.Vp9Webm ? "webm" : "mp4";
+
+        /// <summary>
+        /// RGB→YUV 変換行列を BT.709 に固定し、フレームに色情報
+        /// (colorspace / primaries / trc / range) を焼き込む共通引数。
+        /// 指定しない場合 swscale が BT.601 行列で変換する一方、プレーヤーは HD 解像度を
+        /// BT.709 と仮定して復号するため、彩度・色相がわずかにずれる。
+        /// setparams で焼き込んだ値はエンコーダ経由でコンテナの色メタデータにも書かれる
+        /// (ffprobe で color_space/primaries/transfer=bt709, range=tv になることを確認済み)。
+        /// </summary>
+        internal const string Bt709ColorArgs =
+            " -vf scale=out_color_matrix=bt709:out_range=tv,format=yuv420p," +
+            "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709" +
+            " -color_range tv";
 
         /// <summary>
         /// ffmpeg のコーデック指定と品質パラメータをコマンドライン引数として組み立てる。
         /// </summary>
         public string GetOptions()
         {
+            if (Format == OutputFormat.Vp9Webm)
+            {
+                // NVENC は VP9 エンコード非対応のため libvpx-vp9(ソフトウェア)を使う。
+                // row-mt + tile-columns でマルチスレッド化(7488x1344 実測 約12fps)。
+                // qp は VP9 では CRF として扱う(有効域 0-63 のうち UI の 0-51 を使用)。
+                string vp9RateControl = bitrateKbps > 0
+                    ? $"-b:v {bitrateKbps}k"
+                    : $"-crf {qp} -b:v 0";
+                return $"-c:v libvpx-vp9 {vp9RateControl} -row-mt 1 -tile-columns 3 -cpu-used 4 -deadline good"
+                       + Bt709ColorArgs;
+            }
+
             string codec = Format == OutputFormat.HevcNvenc ? "hevc_nvenc" : "h264_nvenc";
 
             // レート制御引数(constqp の qmin/qmax、または vbr の b:v/maxrate/bufsize)は
@@ -96,11 +125,12 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 : $"-rc constqp -qmin 17 -qmax 51 -qp {qp}";
             string profileArg = Format == OutputFormat.H264Nvenc ? " -profile:v high" : "";
 
-            return $"-c:v {codec} -pix_fmt yuv420p {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}";
+            return $"-c:v {codec} -pix_fmt yuv420p {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
+                   + Bt709ColorArgs;
         }
 
         /// <summary>
-        /// NVENC 経路はアルファチャンネルに対応しないため、常に rgb24 を返す。
+        /// 本エンコーダはアルファチャンネルに対応しないため、常に rgb24 を返す。
         /// </summary>
         public string GetPixelFormat(bool inputContainsAlpha) => "rgb24";
 
@@ -122,10 +152,10 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 errors.Add($"ffmpeg.exe が見つかりません: {FfmpegPath}");
 
             if (ctx.doCaptureAlpha)
-                errors.Add("MTR FFmpeg NVENC Encoder はアルファチャンネルに対応していません。");
+                errors.Add("MTR FFmpeg Encoder はアルファチャンネルに対応していません。");
 
             if (ctx.frameRateMode == FrameRatePlayback.Variable)
-                errors.Add("MTR FFmpeg NVENC Encoder は可変フレームレートに対応していません。Constant を使用してください。");
+                errors.Add("MTR FFmpeg Encoder は可変フレームレートに対応していません。Constant を使用してください。");
         }
 
         /// <inheritdoc/>

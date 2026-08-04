@@ -61,9 +61,15 @@ namespace Unity.MultiTimelineRecorder.Encoders
                     // If the file has audio, it will always be stereo
                     var audioSampleRate = new MediaRational(AudioSettings.outputSampleRate);
 
+                    // WebM コンテナは Vorbis/Opus しか許容しないため、VP9(WebM) では Opus で
+                    // エンコードする(AAC のまま remux すると webm muxer が拒否する)。
+                    var audioCodec = ffmpegSettings.Format == MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm
+                        ? "libopus"
+                        : "aac";
+
                     var audioArgs = "  -loglevel error -y -ar " + audioSampleRate.numerator
                         + " -ac 2"
-                        + " -f f32le -i - -c:a aac " + fileNameAudio;
+                        + " -f f32le -i - -c:a " + audioCodec + " " + fileNameAudio;
                     _ffmpegAudioPipe = new MtrFFmpegPipe(audioArgs, ffmpegSettings.FfmpegPath, "AudioPipe");
 
                     Log($"Audio: {audioArgs}");
