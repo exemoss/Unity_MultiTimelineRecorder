@@ -157,7 +157,7 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             DrawSubsectionHeader("Encoder");
 
             host.movieEncoderType = (MovieEncoderType)EditorGUILayout.EnumPopup(
-                new GUIContent("Encoder", "既定は内蔵エンコーダ(Media Foundation, ソフトウェア H.264)。NVENC はNVIDIA GPUのハードウェアエンコードで高速だが、事前に各マシンへ ffmpeg.exe の導入が必要。"),
+                new GUIContent("Encoder", "既定は内蔵エンコーダ(Media Foundation H.264 / VP8 WebM / ProRes)。FFmpeg 系は事前に各マシンへ ffmpeg.exe の導入が必要。NVENC は NVIDIA GPU のハードウェアエンコードで高速(MP4)。VP9 は WebM 向けソフトウェアエンコードで、色を BT.709 で変換・タグ付けする。"),
                 host.movieEncoderType);
 
             if (host.movieEncoderType == MovieEncoderType.CoreEncoder)
@@ -165,7 +165,18 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
 
             EditorGUI.indentLevel++;
 
-            if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
+            if (host.movieEncoderType == MovieEncoderType.FFmpegVp9)
+            {
+                if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.WebM)
+                {
+                    EditorGUILayout.HelpBox("FFmpeg VP9 エンコーダは WebM コンテナのみ対応しています。上の Format を WebM に設定してください。", MessageType.Error);
+                }
+                EditorGUILayout.HelpBox(
+                    "VP9 はソフトウェアエンコードのため NVENC より大幅に遅くなります(7K 幅クラスで実時間の数倍)。" +
+                    "出力は BT.709 (color_space/primaries/trc) タグ付き・リミテッドレンジの WebM です。",
+                    MessageType.Info);
+            }
+            else if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
             {
                 EditorGUILayout.HelpBox("FFmpeg NVENC エンコーダは MP4 コンテナのみ対応しています。上の Format を MP4 に設定してください。", MessageType.Error);
             }
@@ -198,11 +209,11 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             using (new EditorGUI.DisabledScope(host.movieFfmpegBitrateKbps > 0))
             {
                 host.movieFfmpegQp = EditorGUILayout.IntSlider(
-                    new GUIContent("QP", "固定量子化パラメータ。値が小さいほど高画質・大容量(目安 0-51、既定24)。目標ビットレートが0より大きい場合は無視される。"),
+                    new GUIContent("QP", "固定量子化パラメータ。値が小さいほど高画質・大容量(目安 0-51、既定24)。VP9 では CRF として使用される。目標ビットレートが0より大きい場合は無視される。"),
                     host.movieFfmpegQp, 0, 51);
             }
 
-            EditorGUILayout.HelpBox("FFmpeg NVENC を選択した場合、上の Quality / Bitrate (Mbps) は使用されません(内蔵エンコーダ専用の設定です)。", MessageType.Info);
+            EditorGUILayout.HelpBox("FFmpeg エンコーダを選択した場合、上の Quality / Bitrate (Mbps) は使用されません(内蔵エンコーダ専用の設定です)。", MessageType.Info);
 
             EditorGUI.indentLevel--;
         }
@@ -280,10 +291,24 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                 }
             }
 
-            // FFmpeg NVENC エンコーダのチェック(specs/mtr-nvenc-encoder)
+            // FFmpeg エンコーダのチェック(specs/mtr-nvenc-encoder)
             if (host.movieEncoderType != MovieEncoderType.CoreEncoder)
             {
-                if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
+                if (host.movieCaptureAlpha)
+                {
+                    errorMessage = "FFmpeg 系エンコーダ(NVENC / VP9)はアルファチャンネルに対応していません";
+                    return false;
+                }
+
+                if (host.movieEncoderType == MovieEncoderType.FFmpegVp9)
+                {
+                    if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.WebM)
+                    {
+                        errorMessage = "FFmpeg VP9 encoder requires the WebM format";
+                        return false;
+                    }
+                }
+                else if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
                 {
                     errorMessage = "FFmpeg NVENC encoder requires the MP4 format";
                     return false;

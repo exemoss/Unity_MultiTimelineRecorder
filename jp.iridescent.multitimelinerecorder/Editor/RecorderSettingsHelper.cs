@@ -311,9 +311,18 @@ namespace Unity.MultiTimelineRecorder
                 var encoderType = MovieEncoderType.CoreEncoder;
                 if (settings.EncoderSettings is Encoders.MtrFFmpegEncoderSettings ffmpegEncoder)
                 {
-                    encoderType = ffmpegEncoder.Format == Encoders.MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc
-                        ? MovieEncoderType.FFmpegNvencHevc
-                        : MovieEncoderType.FFmpegNvencH264;
+                    switch (ffmpegEncoder.Format)
+                    {
+                        case Encoders.MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc:
+                            encoderType = MovieEncoderType.FFmpegNvencHevc;
+                            break;
+                        case Encoders.MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm:
+                            encoderType = MovieEncoderType.FFmpegVp9;
+                            break;
+                        default:
+                            encoderType = MovieEncoderType.FFmpegNvencH264;
+                            break;
+                    }
                 }
 
                 int maxDimension = MovieRecorderSettingsConfig.GetMaxDimension(settings.OutputFormat, encoderType);

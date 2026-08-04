@@ -17,15 +17,19 @@ namespace Unity.MultiTimelineRecorder
     }
 
     /// <summary>
-    /// Movie 出力のエンコーダ種別。既定は内蔵 CoreEncoder(Media Foundation ソフトウェア H.264)で
-    /// 後方互換を保つ。FFmpeg 系は NVIDIA GPU の NVENC を使ったハードウェアエンコードで、
-    /// 事前に ffmpeg.exe の導入(ffmpegPath の明示指定)が必要(specs/mtr-nvenc-encoder/plan.md 案1)。
+    /// Movie 出力のエンコーダ種別。既定は内蔵 CoreEncoder(Media Foundation ソフトウェア H.264 /
+    /// VP8 WebM / ProRes MOV)で後方互換を保つ。FFmpeg 系は事前に ffmpeg.exe の導入
+    /// (ffmpegPath の明示指定)が必要(specs/mtr-nvenc-encoder/plan.md 案1)。
+    /// - NVENC 系: NVIDIA GPU のハードウェアエンコード(MP4 コンテナ専用)
+    /// - VP9: libvpx-vp9 のソフトウェアエンコード(WebM コンテナ専用、BT.709 変換・タグ付き)。
+    ///   NVENC は VP9 エンコードに非対応のため CPU エンコードとなり NVENC より大幅に遅い
     /// </summary>
     public enum MovieEncoderType
     {
-        CoreEncoder,
-        FFmpegNvencH264,
-        FFmpegNvencHevc,
+        [InspectorName("内蔵 (Core Encoder)")] CoreEncoder,
+        [InspectorName("FFmpeg NVENC H.264")] FFmpegNvencH264,
+        [InspectorName("FFmpeg NVENC HEVC")] FFmpegNvencHevc,
+        [InspectorName("FFmpeg VP9 (WebM, BT.709)")] FFmpegVp9,
     }
 
     /// <summary>
@@ -153,11 +157,23 @@ namespace Unity.MultiTimelineRecorder
             // 必ず OutputFormat の設定が先、EncoderSettings の上書きが後でなければならない。
             if (encoderType != MovieEncoderType.CoreEncoder)
             {
+                MtrFFmpegEncoderSettings.OutputFormat ffmpegFormat;
+                switch (encoderType)
+                {
+                    case MovieEncoderType.FFmpegNvencHevc:
+                        ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc;
+                        break;
+                    case MovieEncoderType.FFmpegVp9:
+                        ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm;
+                        break;
+                    default:
+                        ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.H264Nvenc;
+                        break;
+                }
+
                 settings.EncoderSettings = new MtrFFmpegEncoderSettings
                 {
-                    Format = encoderType == MovieEncoderType.FFmpegNvencHevc
-                        ? MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc
-                        : MtrFFmpegEncoderSettings.OutputFormat.H264Nvenc,
+                    Format = ffmpegFormat,
                     FfmpegPath = ffmpegPath,
                     Qp = ffmpegQp,
                     BitrateKbps = ffmpegTargetBitrateKbps,
@@ -291,6 +307,12 @@ namespace Unity.MultiTimelineRecorder
                     errorMessage = "Alpha channel is only supported with MOV (ProRes 4444) or WebM formats";
                     return false;
                 }
+
+                if (encoderType != MovieEncoderType.CoreEncoder)
+                {
+                    errorMessage = "FFmpeg 系エンコーダ(NVENC / VP9)はアルファチャンネルに対応していません。内蔵エンコーダを使用してください。";
+                    return false;
+                }
             }
 
             // FFmpeg NVENC エンコーダのバリデーション(specs/mtr-nvenc-encoder)。
@@ -299,7 +321,15 @@ namespace Unity.MultiTimelineRecorder
             // 走るが、こちらは設定編集時点で早期に気付けるようにするためのもの)。
             if (encoderType != MovieEncoderType.CoreEncoder)
             {
-                if (outputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
+                if (encoderType == MovieEncoderType.FFmpegVp9)
+                {
+                    if (outputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.WebM)
+                    {
+                        errorMessage = "FFmpeg VP9 エンコーダは WebM コンテナのみ対応しています。Video Format を WebM に設定してください。";
+                        return false;
+                    }
+                }
+                else if (outputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
                 {
                     errorMessage = "FFmpeg NVENC エンコーダは MP4 コンテナのみ対応しています。Video Format を MP4 に設定してください。";
                     return false;

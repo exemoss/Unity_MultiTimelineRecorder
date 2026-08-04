@@ -4,6 +4,25 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.22] - 2026-08-04
+
+### Added
+- VP9 / WebM output with proper BT.709 color: new encoder option
+  "FFmpeg VP9 (WebM, BT.709)" (`MovieEncoderType.FFmpegVp9`). Encodes with
+  libvpx-vp9 (software — NVENC cannot encode VP9), converts RGB→YUV with the
+  BT.709 matrix (limited range) and writes full color metadata
+  (color_space / primaries / trc = bt709, range = tv) into the WebM stream.
+  Audio is encoded as Opus (WebM does not allow AAC). Requires ffmpeg.exe,
+  same as the NVENC options; the QP slider acts as CRF for VP9.
+
+### Changed
+- The FFmpeg NVENC (H.264 / HEVC) paths now share the same BT.709
+  conversion/tagging. Previously the RGB→YUV conversion used swscale's
+  default BT.601 matrix with no color tags, so players assuming BT.709 for
+  HD content showed slightly shifted colors. New NVENC output is
+  colorimetrically correct and consistent with the VP9 path (note: it will
+  differ very slightly from pre-1.5.22 renders).
+
 ## [1.5.21] - 2026-08-04
 
 ### Fixed
