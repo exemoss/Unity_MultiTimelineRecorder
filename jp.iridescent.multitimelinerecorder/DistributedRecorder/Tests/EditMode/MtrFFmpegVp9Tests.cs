@@ -103,6 +103,76 @@ namespace DistributedRecorder.Tests
             Assert.AreEqual("mp4", nvenc.Extension);
         }
 
+        // ---- Output scaling (RT ソースの Resolution 尊重) ------------------------
+
+        [Test]
+        public void GetOptions_WithScale_InsertsSizeIntoScaleFilter()
+        {
+            var settings = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm,
+                ScaleWidth = 1920,
+                ScaleHeight = 1080,
+            };
+            StringAssert.Contains("scale=1920:1080:out_color_matrix=bt709", settings.GetOptions(),
+                "スケーリング指定時は scale フィルタに幅高さを渡す");
+        }
+
+        [Test]
+        public void GetOptions_WithoutScale_KeepsSourceSize()
+        {
+            var settings = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm,
+            };
+            StringAssert.Contains("scale=out_color_matrix=bt709", settings.GetOptions(),
+                "未指定(0)ならサイズ変更なし");
+        }
+
+        [Test]
+        public void GetOptions_OddScale_IsRoundedToEven()
+        {
+            var settings = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm,
+                ScaleWidth = 1919,
+                ScaleHeight = 1079,
+            };
+            StringAssert.Contains("scale=1918:1078:", settings.GetOptions(),
+                "yuv420p 系の制約に合わせ偶数へ丸める");
+        }
+
+        [Test]
+        public void EffectiveResolution_RtWithFfmpegMovie_UsesItemResolution()
+        {
+            var rt = new RenderTexture(3840, 2160, 0);
+            try
+            {
+                var item = new MultiRecorderConfig.RecorderConfigItem
+                {
+                    recorderType = RecorderSettingsType.Movie,
+                    imageSourceType = ImageRecorderSourceType.RenderTexture,
+                    width = 1920,
+                    height = 1080,
+                    name = "Test Movie Recorder",
+                    movieConfig = MakeVp9Config(),
+                };
+                item.imageRenderTexture = rt;
+                item.movieConfig.encoderType = MovieEncoderType.FFmpegVp9;
+
+                item.GetEffectiveOutputResolution(out int w, out int h);
+                Assert.AreEqual(1920, w, "FFmpeg エンコーダはスケーリングにより Resolution 指定が出力解像度になる");
+                Assert.AreEqual(1080, h);
+
+                // 内蔵 CoreEncoder は従来どおり RT 実寸
+                item.movieConfig.encoderType = MovieEncoderType.CoreEncoder;
+                item.GetEffectiveOutputResolution(out w, out h);
+                Assert.AreEqual(3840, w);
+                Assert.AreEqual(2160, h);
+            }
+            finally { Object.DestroyImmediate(rt); }
+        }
+
         // ---- MovieRecorderSettingsConfig.Validate -------------------------------
 
         private MovieRecorderSettingsConfig MakeVp9Config(

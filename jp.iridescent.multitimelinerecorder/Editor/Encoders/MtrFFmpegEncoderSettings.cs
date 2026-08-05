@@ -81,6 +81,26 @@ namespace Unity.MultiTimelineRecorder.Encoders
         }
         [SerializeField] int bitrateKbps;
 
+        /// <summary>
+        /// 出力スケーリング先の解像度(px)。0 の場合は入力フレームの実寸のまま出力する。
+        /// RenderTexture ソースは Recorder の制約で RT 実寸のフレームが供給されるため、
+        /// アイテムの Resolution 指定を出力解像度にするにはここでスケーリングする
+        /// (scale フィルタに幅高さを渡す。yuv420p 系の制約に合わせ偶数へ丸める)。
+        /// </summary>
+        public int ScaleWidth
+        {
+            get => scaleWidth;
+            set => scaleWidth = value;
+        }
+        [SerializeField] int scaleWidth;
+
+        public int ScaleHeight
+        {
+            get => scaleHeight;
+            set => scaleHeight = value;
+        }
+        [SerializeField] int scaleHeight;
+
         /// <inheritdoc/>
         string IEncoderSettings.Extension => Format == OutputFormat.Vp9Webm ? "webm" : "mp4";
 
@@ -93,11 +113,16 @@ namespace Unity.MultiTimelineRecorder.Encoders
         /// (ffprobe で color_space/primaries/transfer=bt709, range=tv になることを確認済み)。
         /// アルファ付き(VP9/WebM のみ)は yuva420p でアルファを保持する
         /// (WebM の alpha_mode=1 として格納。RGBA デコード往復を確認済み)。
+        /// <see cref="ScaleWidth"/> / <see cref="ScaleHeight"/> が設定されていれば
+        /// 同じ scale フィルタで出力解像度へスケーリングする(lanczos)。
         /// </summary>
-        internal static string GetBt709ColorArgs(bool withAlpha)
+        internal string GetColorAndScaleArgs(bool withAlpha)
         {
+            string scaleSize = scaleWidth > 1 && scaleHeight > 1
+                ? $"{scaleWidth & ~1}:{scaleHeight & ~1}:"
+                : "";
             string pixelFormat = withAlpha ? "yuva420p" : "yuv420p";
-            return $" -vf scale=out_color_matrix=bt709:out_range=tv,format={pixelFormat}," +
+            return $" -vf scale={scaleSize}out_color_matrix=bt709:out_range=tv:flags=lanczos,format={pixelFormat}," +
                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709" +
                    " -color_range tv";
         }
@@ -129,7 +154,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
                     ? $"-b:v {bitrateKbps}k"
                     : $"-crf {qp} -b:v 0";
                 return $"-c:v libvpx-vp9 {vp9RateControl} -row-mt 1 -tile-columns 3 -cpu-used 4 -deadline good"
-                       + GetBt709ColorArgs(inputContainsAlpha)
+                       + GetColorAndScaleArgs(inputContainsAlpha)
                        + " -flush_packets 1 -cluster_time_limit 2000";
             }
 
@@ -145,7 +170,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
             string profileArg = Format == OutputFormat.H264Nvenc ? " -profile:v high" : "";
 
             return $"-c:v {codec} -pix_fmt yuv420p {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
-                   + GetBt709ColorArgs(false);
+                   + GetColorAndScaleArgs(false);
         }
 
         /// <summary>
@@ -190,7 +215,9 @@ namespace Unity.MultiTimelineRecorder.Encoders
             return outputFormat == other.outputFormat
                 && ffmpegPath == other.ffmpegPath
                 && qp == other.qp
-                && bitrateKbps == other.bitrateKbps;
+                && bitrateKbps == other.bitrateKbps
+                && scaleWidth == other.scaleWidth
+                && scaleHeight == other.scaleHeight;
         }
 
         public override bool Equals(object obj)
@@ -200,7 +227,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
         public override int GetHashCode()
         {
-            return HashCode.Combine((int)outputFormat, ffmpegPath, qp, bitrateKbps);
+            return HashCode.Combine((int)outputFormat, ffmpegPath, qp, bitrateKbps, scaleWidth, scaleHeight);
         }
     }
 }

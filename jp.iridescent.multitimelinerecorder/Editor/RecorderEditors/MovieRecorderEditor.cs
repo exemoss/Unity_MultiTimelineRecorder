@@ -177,7 +177,17 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     "Capture Alpha にも対応します(アルファを持つソース: RenderTexture / Target Camera が必要。Game View は不透過)。",
                     MessageType.Info);
             }
-            else if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
+
+            if (host.imageSourceType == ImageRecorderSourceType.RenderTexture)
+            {
+                EditorGUILayout.HelpBox(
+                    "RenderTexture ソース: FFmpeg エンコーダでは上の Resolution の指定解像度へスケーリングして出力します" +
+                    "(RT 実寸と同じ場合はスケーリングなし。内蔵エンコーダは RT 実寸固定)。",
+                    MessageType.Info);
+            }
+
+            if (host.movieEncoderType != MovieEncoderType.FFmpegVp9 &&
+                host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
             {
                 EditorGUILayout.HelpBox("FFmpeg NVENC エンコーダは MP4 コンテナのみ対応しています。上の Format を MP4 に設定してください。", MessageType.Error);
             }
