@@ -308,9 +308,10 @@ namespace Unity.MultiTimelineRecorder
                     return false;
                 }
 
-                if (encoderType != MovieEncoderType.CoreEncoder)
+                if (encoderType == MovieEncoderType.FFmpegNvencH264 ||
+                    encoderType == MovieEncoderType.FFmpegNvencHevc)
                 {
-                    errorMessage = "FFmpeg 系エンコーダ(NVENC / VP9)はアルファチャンネルに対応していません。内蔵エンコーダを使用してください。";
+                    errorMessage = "FFmpeg NVENC エンコーダはアルファチャンネルに対応していません。VP9(WebM) または内蔵エンコーダを使用してください。";
                     return false;
                 }
             }

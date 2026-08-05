@@ -149,11 +149,52 @@ namespace DistributedRecorder.Tests
         }
 
         [Test]
-        public void Validate_FfmpegWithAlpha_IsRejected()
+        public void Validate_Vp9WithAlpha_IsValid()
         {
+            // バストアップ素材等の透過 WebM 用途(v1.5.22 で誤って弾いていた回帰の防止)
             var config = MakeVp9Config();
             config.captureAlpha = true;
-            Assert.IsFalse(config.Validate(out string error), "FFmpeg 系エンコーダはアルファ非対応");
+            bool valid = config.Validate(out string error);
+            Assert.IsTrue(valid, $"VP9(WebM) はアルファ対応。Error: {error}");
+        }
+
+        [Test]
+        public void Validate_NvencWithAlpha_IsRejected()
+        {
+            var config = new MovieRecorderSettingsConfig
+            {
+                outputFormat = MovieRecorderSettings.VideoRecorderOutputFormat.WebM,
+                encoderType = MovieEncoderType.FFmpegNvencH264,
+                ffmpegPath = fakeFfmpegPath,
+                width = 1920,
+                height = 1080,
+                frameRate = 30,
+                captureAlpha = true,
+            };
+            Assert.IsFalse(config.Validate(out _), "NVENC はアルファ非対応のまま");
+        }
+
+        [Test]
+        public void Vp9Alpha_UsesRgbaInputAndYuva420p()
+        {
+            var settings = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm,
+            };
+
+            Assert.IsTrue(((IEncoderSettings)settings).CanCaptureAlpha, "VP9 はアルファ対応を宣言する");
+            Assert.AreEqual("rgba", settings.GetPixelFormat(true));
+            Assert.AreEqual("rgb24", settings.GetPixelFormat(false));
+            StringAssert.Contains("format=yuva420p", settings.GetOptions(true),
+                "アルファ付きは yuva420p でエンコードする(WebM の alpha_mode=1)");
+            StringAssert.Contains("format=yuv420p", settings.GetOptions(false));
+
+            var nvenc = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.H264Nvenc,
+            };
+            Assert.IsFalse(((IEncoderSettings)nvenc).CanCaptureAlpha, "NVENC はアルファ非対応のまま");
+            Assert.AreEqual("rgb24", nvenc.GetPixelFormat(true));
         }
 
         [Test]
