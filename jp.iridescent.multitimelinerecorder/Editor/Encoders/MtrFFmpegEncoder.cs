@@ -36,7 +36,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
             try
             {
-                var options = ffmpegSettings.GetOptions();
+                var options = ffmpegSettings.GetOptions(ctx.doCaptureAlpha);
                 var pixel = ffmpegSettings.GetPixelFormat(ctx.doCaptureAlpha);
 
                 var arguments = "  -y -f rawvideo -vcodec rawvideo"

@@ -173,7 +173,8 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                 }
                 EditorGUILayout.HelpBox(
                     "VP9 はソフトウェアエンコードのため NVENC より大幅に遅くなります(7K 幅クラスで実時間の数倍)。" +
-                    "出力は BT.709 (color_space/primaries/trc) タグ付き・リミテッドレンジの WebM です。",
+                    "出力は BT.709 (color_space/primaries/trc) タグ付き・リミテッドレンジの WebM です。" +
+                    "Capture Alpha にも対応します(アルファを持つソース: RenderTexture / Target Camera が必要。Game View は不透過)。",
                     MessageType.Info);
             }
             else if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
@@ -294,9 +295,9 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             // FFmpeg エンコーダのチェック(specs/mtr-nvenc-encoder)
             if (host.movieEncoderType != MovieEncoderType.CoreEncoder)
             {
-                if (host.movieCaptureAlpha)
+                if (host.movieCaptureAlpha && host.movieEncoderType != MovieEncoderType.FFmpegVp9)
                 {
-                    errorMessage = "FFmpeg 系エンコーダ(NVENC / VP9)はアルファチャンネルに対応していません";
+                    errorMessage = "FFmpeg NVENC エンコーダはアルファチャンネルに対応していません(VP9 は対応)";
                     return false;
                 }
 

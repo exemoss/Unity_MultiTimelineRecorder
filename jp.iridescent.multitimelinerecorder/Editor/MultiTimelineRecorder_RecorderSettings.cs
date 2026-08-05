@@ -424,11 +424,17 @@ namespace Unity.MultiTimelineRecorder
                         };
                         break;
                 }
+
+                // GameView はアルファを持たないため、アルファ設定を自動でオフにする
+                // (共有ビルダー BuildMovieSettings と同じ挙動。放置すると VP9 のアルファ経路が
+                // 不透過ソースに対して rgba パイプラインを組んでしまう)
+                if (settings.ImageInputSettings is GameViewInputSettings)
+                    settings.CaptureAlpha = false;
             }
-            
+
             return settings;
         }
-        
+
         private List<RecorderSettings> CreateAOVRecorderSettingsFromConfig(string outputPath, string outputFileName, MultiRecorderConfig.RecorderConfigItem config)
         {
             var settingsConfig = config.aovConfig;
