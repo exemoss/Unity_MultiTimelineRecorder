@@ -322,6 +322,9 @@ namespace Unity.MultiTimelineRecorder
                         case Encoders.MtrFFmpegEncoderSettings.OutputFormat.ProRes4444Mov:
                             encoderType = MovieEncoderType.FFmpegProRes4444;
                             break;
+                        case Encoders.MtrFFmpegEncoderSettings.OutputFormat.ProRes422HqMov:
+                            encoderType = MovieEncoderType.FFmpegProRes422Hq;
+                            break;
                         default:
                             encoderType = MovieEncoderType.FFmpegNvencH264;
                             break;

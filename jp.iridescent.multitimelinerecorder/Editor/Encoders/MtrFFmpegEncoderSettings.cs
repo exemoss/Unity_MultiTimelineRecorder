@@ -50,11 +50,16 @@ namespace Unity.MultiTimelineRecorder.Encoders
             [InspectorName("H.265 HEVC NVENC")] HevcNvenc,
             [InspectorName("VP9 (WebM, ソフトウェア)")] Vp9Webm,
             [InspectorName("ProRes 4444 (MOV, アルファ対応)")] ProRes4444Mov,
+            [InspectorName("ProRes 422 HQ (MOV)")] ProRes422HqMov,
         }
 
-        /// <summary>この Format がアルファチャンネルを保持できるか。</summary>
+        /// <summary>この Format がアルファチャンネルを保持できるか(ProRes 422 系は非対応)。</summary>
         internal bool FormatSupportsAlpha =>
             Format == OutputFormat.Vp9Webm || Format == OutputFormat.ProRes4444Mov;
+
+        /// <summary>ProRes 系(MOV コンテナ)か。</summary>
+        internal bool IsProRes =>
+            Format == OutputFormat.ProRes4444Mov || Format == OutputFormat.ProRes422HqMov;
 
         public OutputFormat Format
         {
@@ -109,7 +114,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
         /// <inheritdoc/>
         string IEncoderSettings.Extension =>
             Format == OutputFormat.Vp9Webm ? "webm"
-            : Format == OutputFormat.ProRes4444Mov ? "mov"
+            : IsProRes ? "mov"
             : "mp4";
 
         /// <summary>
@@ -165,14 +170,20 @@ namespace Unity.MultiTimelineRecorder.Encoders
                        + " -flush_packets 1 -cluster_time_limit 2000";
             }
 
-            if (Format == OutputFormat.ProRes4444Mov)
+            if (IsProRes)
             {
-                // Premiere 等でネイティブに読めるアルファ対応の中間コーデック。
+                // Premiere 等でネイティブに読める中間コーデック。
                 // prores_ks はソフトウェアだが VP9 より大幅に高速。品質はプロファイル既定
                 // (qp / bitrate は使用しない)。MOV(mp4系) muxer は mdat を逐次書き込むため
-                // webm のようなフラッシュ強制は不要
-                return "-c:v prores_ks -profile:v 4444 -vendor apl0"
-                       + GetColorAndScaleArgs(inputContainsAlpha ? "yuva444p10le" : "yuv444p10le");
+                // webm のようなフラッシュ強制は不要。
+                // 4444 はアルファ対応(yuva444p10le)、422 HQ は 10bit 4:2:2(アルファ無し)
+                if (Format == OutputFormat.ProRes4444Mov)
+                {
+                    return "-c:v prores_ks -profile:v 4444 -vendor apl0"
+                           + GetColorAndScaleArgs(inputContainsAlpha ? "yuva444p10le" : "yuv444p10le");
+                }
+                return "-c:v prores_ks -profile:v hq -vendor apl0"
+                       + GetColorAndScaleArgs("yuv422p10le");
             }
 
             string codec = Format == OutputFormat.HevcNvenc ? "hevc_nvenc" : "h264_nvenc";
