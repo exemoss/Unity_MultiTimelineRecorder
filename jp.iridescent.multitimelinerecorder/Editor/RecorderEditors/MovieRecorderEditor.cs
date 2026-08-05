@@ -178,29 +178,34 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     MessageType.Info);
             }
 
-            if (host.movieEncoderType == MovieEncoderType.FFmpegProRes4444)
+            bool isProRes = host.movieEncoderType == MovieEncoderType.FFmpegProRes4444 ||
+                            host.movieEncoderType == MovieEncoderType.FFmpegProRes422Hq;
+            if (isProRes)
             {
                 if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MOV)
                 {
-                    EditorGUILayout.HelpBox("FFmpeg ProRes 4444 エンコーダは MOV コンテナのみ対応しています。上の Format を MOV に設定してください。", MessageType.Error);
+                    EditorGUILayout.HelpBox("FFmpeg ProRes エンコーダは MOV コンテナのみ対応しています。上の Format を MOV に設定してください。", MessageType.Error);
                 }
                 EditorGUILayout.HelpBox(
-                    "ProRes 4444 (MOV): Premiere / AE 等でネイティブに読める中間コーデック。" +
-                    "Capture Alpha に対応し、BT.709 タグ付き・Resolution へのスケーリングも有効です。" +
-                    "ソフトウェアエンコードですが VP9 より大幅に高速です(品質はプロファイル既定、QP/Bitrate は使用しません)。",
+                    host.movieEncoderType == MovieEncoderType.FFmpegProRes4444
+                        ? "ProRes 4444 (MOV): Premiere / AE 等でネイティブに読める中間コーデック。" +
+                          "Capture Alpha に対応し、BT.709 タグ付き・Resolution へのスケーリングも有効です。" +
+                          "ソフトウェアエンコードですが VP9 より大幅に高速です(品質はプロファイル既定、QP/Bitrate は使用しません)。"
+                        : "ProRes 422 HQ (MOV): アルファ無しの標準的な中間コーデック(10bit 4:2:2)。" +
+                          "4444 よりファイルが小さく、BT.709 タグ付き・Resolution へのスケーリングも有効です" +
+                          "(品質はプロファイル既定、QP/Bitrate は使用しません)。",
                     MessageType.Info);
             }
 
             if (host.imageSourceType == ImageRecorderSourceType.RenderTexture)
             {
                 EditorGUILayout.HelpBox(
-                    "RenderTexture ソース: FFmpeg エンコーダでは上の Resolution の指定解像度へスケーリングして出力します" +
-                    "(RT 実寸と同じ場合はスケーリングなし。内蔵エンコーダは RT 実寸固定)。",
+                    "RenderTexture ソース: 上の Resolution の指定解像度へスケーリングして出力します" +
+                    "(FFmpeg 系は ffmpeg の scale、内蔵エンコーダ/連番はプロキシ RT 経由。RT 実寸と同じ場合は変換なし)。",
                     MessageType.Info);
             }
 
-            if (host.movieEncoderType != MovieEncoderType.FFmpegVp9 &&
-                host.movieEncoderType != MovieEncoderType.FFmpegProRes4444 &&
+            if (host.movieEncoderType != MovieEncoderType.FFmpegVp9 && !isProRes &&
                 host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
             {
                 EditorGUILayout.HelpBox("FFmpeg NVENC エンコーダは MP4 コンテナのみ対応しています。上の Format を MP4 に設定してください。", MessageType.Error);
@@ -210,6 +215,24 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             host.movieFfmpegPath = EditorGUILayout.TextField(
                 new GUIContent("FFmpeg Path", "ffmpeg.exe への絶対パス。リポジトリには同梱しないため、各マシンで導入したパスを明示指定すること。"),
                 host.movieFfmpegPath);
+            if (GUILayout.Button(new GUIContent("自動検出",
+                "この PC の定番の場所(PATH / WinGet / Chocolatey / Scoop / C:\\ffmpeg)から ffmpeg.exe を探して設定します"),
+                GUILayout.Width(64)))
+            {
+                var found = Unity.MultiTimelineRecorder.Encoders.FfmpegLocator.TryFindFfmpeg();
+                if (!string.IsNullOrEmpty(found))
+                {
+                    host.movieFfmpegPath = found;
+                    GUI.changed = true;
+                }
+                else
+                {
+                    EditorUtility.DisplayDialog("ffmpeg 自動検出",
+                        "ffmpeg.exe が見つかりませんでした。\n" +
+                        "PATH への追加、または winget install Gyan.FFmpeg 等で導入してから再試行してください。",
+                        "OK");
+                }
+            }
             if (GUILayout.Button("...", GUILayout.Width(28)))
             {
                 var selected = EditorUtility.OpenFilePanel("ffmpeg.exe を選択", "", "exe");
@@ -323,7 +346,7 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     host.movieEncoderType != MovieEncoderType.FFmpegVp9 &&
                     host.movieEncoderType != MovieEncoderType.FFmpegProRes4444)
                 {
-                    errorMessage = "FFmpeg NVENC エンコーダはアルファチャンネルに対応していません(VP9 / ProRes 4444 は対応)";
+                    errorMessage = "選択中の FFmpeg エンコーダはアルファチャンネルに対応していません(VP9 / ProRes 4444 は対応)";
                     return false;
                 }
 
@@ -335,11 +358,12 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                         return false;
                     }
                 }
-                else if (host.movieEncoderType == MovieEncoderType.FFmpegProRes4444)
+                else if (host.movieEncoderType == MovieEncoderType.FFmpegProRes4444 ||
+                         host.movieEncoderType == MovieEncoderType.FFmpegProRes422Hq)
                 {
                     if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MOV)
                     {
-                        errorMessage = "FFmpeg ProRes 4444 encoder requires the MOV format";
+                        errorMessage = "FFmpeg ProRes encoder requires the MOV format";
                         return false;
                     }
                 }
