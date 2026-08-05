@@ -179,6 +179,78 @@ namespace DistributedRecorder.Tests
             finally { Object.DestroyImmediate(settings); }
         }
 
+        // ---- ProRes 422 HQ (MOV) ------------------------------------------------
+
+        [Test]
+        public void ProRes422Hq_GetOptions_UsesHqProfileWithoutAlpha()
+        {
+            var settings = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.ProRes422HqMov,
+            };
+
+            string options = settings.GetOptions(true);
+            StringAssert.Contains("-c:v prores_ks", options);
+            StringAssert.Contains("-profile:v hq", options);
+            StringAssert.Contains("format=yuv422p10le", options, "422 はアルファ無しの 10bit 4:2:2");
+            StringAssert.DoesNotContain("yuva", options, "アルファ入力でもアルファプレーンは使わない");
+            Assert.AreEqual("mov", ((IEncoderSettings)settings).Extension);
+            Assert.IsFalse(((IEncoderSettings)settings).CanCaptureAlpha, "422 系はアルファ非対応");
+        }
+
+        [Test]
+        public void Validate_ProRes422HqWithMov_IsValid_ButAlphaRejected()
+        {
+            var config = new MovieRecorderSettingsConfig
+            {
+                outputFormat = MovieRecorderSettings.VideoRecorderOutputFormat.MOV,
+                encoderType = MovieEncoderType.FFmpegProRes422Hq,
+                ffmpegPath = fakeFfmpegPath,
+                width = 1920,
+                height = 1080,
+                frameRate = 30,
+            };
+            Assert.IsTrue(config.Validate(out string error), $"422 HQ + MOV は有効。Error: {error}");
+
+            config.captureAlpha = true;
+            Assert.IsFalse(config.Validate(out _), "422 HQ はアルファ非対応(4444 へ誘導)");
+        }
+
+        [Test]
+        public void ApplyToSettings_ProRes422Hq_MapsToProRes422HqMov()
+        {
+            var config = new MovieRecorderSettingsConfig
+            {
+                outputFormat = MovieRecorderSettings.VideoRecorderOutputFormat.MOV,
+                encoderType = MovieEncoderType.FFmpegProRes422Hq,
+                ffmpegPath = fakeFfmpegPath,
+                width = 1920,
+                height = 1080,
+                frameRate = 30,
+            };
+            var settings = ScriptableObject.CreateInstance<MovieRecorderSettings>();
+            try
+            {
+                config.ApplyToSettings(settings);
+                var encoder = settings.EncoderSettings as MtrFFmpegEncoderSettings;
+                Assert.IsNotNull(encoder);
+                Assert.AreEqual(MtrFFmpegEncoderSettings.OutputFormat.ProRes422HqMov, encoder.Format);
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
+        // ---- FfmpegLocator ------------------------------------------------------
+
+        [Test]
+        public void FfmpegLocator_ReturnsExistingFileOrNull()
+        {
+            // ffmpeg が導入されていないマシンでは null が正常(失敗にしない)。
+            // 見つかった場合は必ず実在パスであること
+            string found = FfmpegLocator.TryFindFfmpeg();
+            if (found != null)
+                Assert.IsTrue(File.Exists(found), $"検出結果は実在するファイルであること: {found}");
+        }
+
         // ---- Output scaling (RT ソースの Resolution 尊重) ------------------------
 
         [Test]
@@ -240,11 +312,11 @@ namespace DistributedRecorder.Tests
                 Assert.AreEqual(1920, w, "FFmpeg エンコーダはスケーリングにより Resolution 指定が出力解像度になる");
                 Assert.AreEqual(1080, h);
 
-                // 内蔵 CoreEncoder は従来どおり RT 実寸
+                // v1.5.27: 内蔵 CoreEncoder もプロキシ RT 経由で Resolution 指定が実効になる
                 item.movieConfig.encoderType = MovieEncoderType.CoreEncoder;
                 item.GetEffectiveOutputResolution(out w, out h);
-                Assert.AreEqual(3840, w);
-                Assert.AreEqual(2160, h);
+                Assert.AreEqual(1920, w);
+                Assert.AreEqual(1080, h);
             }
             finally { Object.DestroyImmediate(rt); }
         }
