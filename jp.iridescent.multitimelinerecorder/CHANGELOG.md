@@ -4,6 +4,24 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.24] - 2026-08-05
+
+### Fixed
+- Recorder items whose movie configuration fails validation no longer get
+  silently dropped at recording start (the run "completed" with no output and
+  only a Console error). The pre-recording check now runs the full validation
+  for every enabled Movie item and shows a blocking dialog listing each item
+  and its error. This is what made a VP9 + Capture Alpha item record nothing
+  in 1.5.22/1.5.23.
+
+### Added
+- VP9/WebM alpha support: Capture Alpha now works with the FFmpeg VP9 encoder
+  (RGBA input → yuva420p, stored as WebM alpha_mode=1; verified to decode back
+  to RGBA). Requires an alpha-capable source (RenderTexture / Target Camera —
+  Game View has no alpha and auto-disables it, matching the shared builder).
+  NVENC (H.264/HEVC) remains alpha-unsupported and is now reported as a
+  pre-recording error instead of a silent skip.
+
 ## [1.5.23] - 2026-08-05
 
 ### Fixed
