@@ -430,6 +430,21 @@ namespace Unity.MultiTimelineRecorder
                 // 不透過ソースに対して rgba パイプラインを組んでしまう)
                 if (settings.ImageInputSettings is GameViewInputSettings)
                     settings.CaptureAlpha = false;
+
+                // RenderTexture ソースは Recorder の制約で RT 実寸のフレームが供給される
+                // (RenderTextureInputSettings の出力サイズは常に RT 実寸)。アイテムの
+                // Resolution 指定を出力解像度にするため、FFmpeg 系エンコーダでは
+                // ffmpeg 側のスケーリングで実現する。内蔵 CoreEncoder は手段が無いため
+                // 従来どおり RT 実寸のまま
+                if (config.imageSourceType == ImageRecorderSourceType.RenderTexture
+                    && config.imageRenderTexture != null
+                    && settings.EncoderSettings is Unity.MultiTimelineRecorder.Encoders.MtrFFmpegEncoderSettings ffmpegEncoderSettings
+                    && config.width > 0 && config.height > 0
+                    && (config.width != config.imageRenderTexture.width || config.height != config.imageRenderTexture.height))
+                {
+                    ffmpegEncoderSettings.ScaleWidth = config.width;
+                    ffmpegEncoderSettings.ScaleHeight = config.height;
+                }
             }
 
             return settings;

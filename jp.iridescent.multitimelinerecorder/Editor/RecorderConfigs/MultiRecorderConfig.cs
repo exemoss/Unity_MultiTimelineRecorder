@@ -153,13 +153,25 @@ namespace Unity.MultiTimelineRecorder
             /// <summary>
             /// Movie/Image 出力の実効解像度を返す。
             /// RenderTexture ソースでは Recorder(RenderTextureInputSettings)が
-            /// 常に RT の実寸を出力サイズとして使うため、width/height 設定値ではなく
-            /// RT 実寸が実際の出力解像度になる。検証・プリフライトはこちらを使うこと。
+            /// 常に RT の実寸を出力サイズとして使うため、原則 RT 実寸が実際の
+            /// 出力解像度になる。ただし FFmpeg 系エンコーダの Movie は ffmpeg 側の
+            /// スケーリングで width/height 指定が出力解像度になる(v1.5.25)。
+            /// 検証・プリフライトはこちらを使うこと。
             /// </summary>
             public void GetEffectiveOutputResolution(out int effectiveWidth, out int effectiveHeight)
             {
                 if (imageSourceType == ImageRecorderSourceType.RenderTexture && imageRenderTexture != null)
                 {
+                    bool ffmpegScaledMovie = recorderType == RecorderSettingsType.Movie
+                        && movieConfig != null
+                        && movieConfig.encoderType != MovieEncoderType.CoreEncoder
+                        && width > 0 && height > 0;
+                    if (ffmpegScaledMovie)
+                    {
+                        effectiveWidth = width;
+                        effectiveHeight = height;
+                        return;
+                    }
                     effectiveWidth = imageRenderTexture.width;
                     effectiveHeight = imageRenderTexture.height;
                     return;
