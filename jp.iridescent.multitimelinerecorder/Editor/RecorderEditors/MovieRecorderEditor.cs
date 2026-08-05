@@ -178,6 +178,19 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     MessageType.Info);
             }
 
+            if (host.movieEncoderType == MovieEncoderType.FFmpegProRes4444)
+            {
+                if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MOV)
+                {
+                    EditorGUILayout.HelpBox("FFmpeg ProRes 4444 エンコーダは MOV コンテナのみ対応しています。上の Format を MOV に設定してください。", MessageType.Error);
+                }
+                EditorGUILayout.HelpBox(
+                    "ProRes 4444 (MOV): Premiere / AE 等でネイティブに読める中間コーデック。" +
+                    "Capture Alpha に対応し、BT.709 タグ付き・Resolution へのスケーリングも有効です。" +
+                    "ソフトウェアエンコードですが VP9 より大幅に高速です(品質はプロファイル既定、QP/Bitrate は使用しません)。",
+                    MessageType.Info);
+            }
+
             if (host.imageSourceType == ImageRecorderSourceType.RenderTexture)
             {
                 EditorGUILayout.HelpBox(
@@ -187,6 +200,7 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             }
 
             if (host.movieEncoderType != MovieEncoderType.FFmpegVp9 &&
+                host.movieEncoderType != MovieEncoderType.FFmpegProRes4444 &&
                 host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MP4)
             {
                 EditorGUILayout.HelpBox("FFmpeg NVENC エンコーダは MP4 コンテナのみ対応しています。上の Format を MP4 に設定してください。", MessageType.Error);
@@ -305,9 +319,11 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             // FFmpeg エンコーダのチェック(specs/mtr-nvenc-encoder)
             if (host.movieEncoderType != MovieEncoderType.CoreEncoder)
             {
-                if (host.movieCaptureAlpha && host.movieEncoderType != MovieEncoderType.FFmpegVp9)
+                if (host.movieCaptureAlpha &&
+                    host.movieEncoderType != MovieEncoderType.FFmpegVp9 &&
+                    host.movieEncoderType != MovieEncoderType.FFmpegProRes4444)
                 {
-                    errorMessage = "FFmpeg NVENC エンコーダはアルファチャンネルに対応していません(VP9 は対応)";
+                    errorMessage = "FFmpeg NVENC エンコーダはアルファチャンネルに対応していません(VP9 / ProRes 4444 は対応)";
                     return false;
                 }
 
@@ -316,6 +332,14 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.WebM)
                     {
                         errorMessage = "FFmpeg VP9 encoder requires the WebM format";
+                        return false;
+                    }
+                }
+                else if (host.movieEncoderType == MovieEncoderType.FFmpegProRes4444)
+                {
+                    if (host.movieOutputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MOV)
+                    {
+                        errorMessage = "FFmpeg ProRes 4444 encoder requires the MOV format";
                         return false;
                     }
                 }
