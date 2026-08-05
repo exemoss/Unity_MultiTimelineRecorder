@@ -4,6 +4,23 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.27] - 2026-08-05
+
+### Added
+- "自動検出" button next to FFmpeg Path: finds ffmpeg.exe from PATH, WinGet
+  (Links and package dirs), Chocolatey, Scoop, or C:\ffmpeg\bin (plus
+  Homebrew/system paths on macOS/Linux) and fills the field.
+- FFmpeg ProRes 422 HQ (MOV) encoder (`MovieEncoderType.FFmpegProRes422Hq`,
+  prores_ks profile hq, 10-bit 4:2:2, no alpha — validation points to
+  ProRes 4444 when Capture Alpha is on). Same BT.709 tagging and Resolution
+  scaling as the other FFmpeg encoders.
+- RenderTexture-source Resolution scaling now works for ALL recording paths:
+  image sequences (PNG/JPEG/EXR) and built-in Core Encoder movies record a
+  scaled proxy RT (created as a temp asset, blitted from the source RT every
+  frame at end of URP frame rendering, cleaned up after recording). FFmpeg
+  paths keep using ffmpeg's scale filter. Effective-resolution validation
+  now always honors the item Resolution for RT sources.
+
 ## [1.5.26] - 2026-08-05
 
 ### Added
