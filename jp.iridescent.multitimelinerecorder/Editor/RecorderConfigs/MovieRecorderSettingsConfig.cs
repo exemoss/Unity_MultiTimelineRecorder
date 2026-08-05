@@ -30,6 +30,7 @@ namespace Unity.MultiTimelineRecorder
         [InspectorName("FFmpeg NVENC H.264")] FFmpegNvencH264,
         [InspectorName("FFmpeg NVENC HEVC")] FFmpegNvencHevc,
         [InspectorName("FFmpeg VP9 (WebM, BT.709)")] FFmpegVp9,
+        [InspectorName("FFmpeg ProRes 4444 (MOV, BT.709)")] FFmpegProRes4444,
     }
 
     /// <summary>
@@ -165,6 +166,9 @@ namespace Unity.MultiTimelineRecorder
                         break;
                     case MovieEncoderType.FFmpegVp9:
                         ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm;
+                        break;
+                    case MovieEncoderType.FFmpegProRes4444:
+                        ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.ProRes4444Mov;
                         break;
                     default:
                         ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.H264Nvenc;
@@ -327,6 +331,14 @@ namespace Unity.MultiTimelineRecorder
                     if (outputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.WebM)
                     {
                         errorMessage = "FFmpeg VP9 エンコーダは WebM コンテナのみ対応しています。Video Format を WebM に設定してください。";
+                        return false;
+                    }
+                }
+                else if (encoderType == MovieEncoderType.FFmpegProRes4444)
+                {
+                    if (outputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MOV)
+                    {
+                        errorMessage = "FFmpeg ProRes 4444 エンコーダは MOV コンテナのみ対応しています。Video Format を MOV に設定してください。";
                         return false;
                     }
                 }

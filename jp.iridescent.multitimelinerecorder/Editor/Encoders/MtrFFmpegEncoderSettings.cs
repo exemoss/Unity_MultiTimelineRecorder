@@ -49,7 +49,12 @@ namespace Unity.MultiTimelineRecorder.Encoders
             [InspectorName("H.264 NVENC")] H264Nvenc,
             [InspectorName("H.265 HEVC NVENC")] HevcNvenc,
             [InspectorName("VP9 (WebM, ソフトウェア)")] Vp9Webm,
+            [InspectorName("ProRes 4444 (MOV, アルファ対応)")] ProRes4444Mov,
         }
+
+        /// <summary>この Format がアルファチャンネルを保持できるか。</summary>
+        internal bool FormatSupportsAlpha =>
+            Format == OutputFormat.Vp9Webm || Format == OutputFormat.ProRes4444Mov;
 
         public OutputFormat Format
         {
@@ -102,7 +107,10 @@ namespace Unity.MultiTimelineRecorder.Encoders
         [SerializeField] int scaleHeight;
 
         /// <inheritdoc/>
-        string IEncoderSettings.Extension => Format == OutputFormat.Vp9Webm ? "webm" : "mp4";
+        string IEncoderSettings.Extension =>
+            Format == OutputFormat.Vp9Webm ? "webm"
+            : Format == OutputFormat.ProRes4444Mov ? "mov"
+            : "mp4";
 
         /// <summary>
         /// RGB→YUV 変換行列を BT.709 に固定し、フレームに色情報
@@ -116,12 +124,11 @@ namespace Unity.MultiTimelineRecorder.Encoders
         /// <see cref="ScaleWidth"/> / <see cref="ScaleHeight"/> が設定されていれば
         /// 同じ scale フィルタで出力解像度へスケーリングする(lanczos)。
         /// </summary>
-        internal string GetColorAndScaleArgs(bool withAlpha)
+        internal string GetColorAndScaleArgs(string pixelFormat)
         {
             string scaleSize = scaleWidth > 1 && scaleHeight > 1
                 ? $"{scaleWidth & ~1}:{scaleHeight & ~1}:"
                 : "";
-            string pixelFormat = withAlpha ? "yuva420p" : "yuv420p";
             return $" -vf scale={scaleSize}out_color_matrix=bt709:out_range=tv:flags=lanczos,format={pixelFormat}," +
                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709" +
                    " -color_range tv";
@@ -154,8 +161,18 @@ namespace Unity.MultiTimelineRecorder.Encoders
                     ? $"-b:v {bitrateKbps}k"
                     : $"-crf {qp} -b:v 0";
                 return $"-c:v libvpx-vp9 {vp9RateControl} -row-mt 1 -tile-columns 3 -cpu-used 4 -deadline good"
-                       + GetColorAndScaleArgs(inputContainsAlpha)
+                       + GetColorAndScaleArgs(inputContainsAlpha ? "yuva420p" : "yuv420p")
                        + " -flush_packets 1 -cluster_time_limit 2000";
+            }
+
+            if (Format == OutputFormat.ProRes4444Mov)
+            {
+                // Premiere 等でネイティブに読めるアルファ対応の中間コーデック。
+                // prores_ks はソフトウェアだが VP9 より大幅に高速。品質はプロファイル既定
+                // (qp / bitrate は使用しない)。MOV(mp4系) muxer は mdat を逐次書き込むため
+                // webm のようなフラッシュ強制は不要
+                return "-c:v prores_ks -profile:v 4444 -vendor apl0"
+                       + GetColorAndScaleArgs(inputContainsAlpha ? "yuva444p10le" : "yuv444p10le");
             }
 
             string codec = Format == OutputFormat.HevcNvenc ? "hevc_nvenc" : "h264_nvenc";
@@ -170,24 +187,24 @@ namespace Unity.MultiTimelineRecorder.Encoders
             string profileArg = Format == OutputFormat.H264Nvenc ? " -profile:v high" : "";
 
             return $"-c:v {codec} -pix_fmt yuv420p {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
-                   + GetColorAndScaleArgs(false);
+                   + GetColorAndScaleArgs("yuv420p");
         }
 
         /// <summary>
-        /// VP9(WebM) はアルファ対応(rgba 入力 → yuva420p)。NVENC 系は非対応のため常に rgb24。
+        /// VP9(WebM) / ProRes 4444(MOV) はアルファ対応(rgba 入力)。NVENC 系は非対応のため常に rgb24。
         /// </summary>
         public string GetPixelFormat(bool inputContainsAlpha) =>
-            Format == OutputFormat.Vp9Webm && inputContainsAlpha ? "rgba" : "rgb24";
+            FormatSupportsAlpha && inputContainsAlpha ? "rgba" : "rgb24";
 
         /// <inheritdoc/>
-        bool IEncoderSettings.CanCaptureAlpha => Format == OutputFormat.Vp9Webm;
+        bool IEncoderSettings.CanCaptureAlpha => FormatSupportsAlpha;
 
         /// <inheritdoc/>
         bool IEncoderSettings.CanCaptureAudio => true;
 
         /// <inheritdoc/>
         TextureFormat IEncoderSettings.GetTextureFormat(bool inputContainsAlpha) =>
-            Format == OutputFormat.Vp9Webm && inputContainsAlpha ? TextureFormat.RGBA32 : TextureFormat.RGB24;
+            FormatSupportsAlpha && inputContainsAlpha ? TextureFormat.RGBA32 : TextureFormat.RGB24;
 
         /// <inheritdoc/>
         void IEncoderSettings.ValidateRecording(RecordingContext ctx, List<string> errors, List<string> warnings)
@@ -197,8 +214,8 @@ namespace Unity.MultiTimelineRecorder.Encoders
             else if (!File.Exists(FfmpegPath))
                 errors.Add($"ffmpeg.exe が見つかりません: {FfmpegPath}");
 
-            if (ctx.doCaptureAlpha && Format != OutputFormat.Vp9Webm)
-                errors.Add("MTR FFmpeg Encoder のアルファチャンネル対応は VP9(WebM) のみです。");
+            if (ctx.doCaptureAlpha && !FormatSupportsAlpha)
+                errors.Add("MTR FFmpeg Encoder のアルファチャンネル対応は VP9(WebM) / ProRes 4444(MOV) のみです。");
 
             if (ctx.frameRateMode == FrameRatePlayback.Variable)
                 errors.Add("MTR FFmpeg Encoder は可変フレームレートに対応していません。Constant を使用してください。");
