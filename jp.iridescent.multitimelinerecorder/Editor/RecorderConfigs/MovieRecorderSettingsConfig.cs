@@ -31,6 +31,7 @@ namespace Unity.MultiTimelineRecorder
         [InspectorName("FFmpeg NVENC HEVC")] FFmpegNvencHevc,
         [InspectorName("FFmpeg VP9 (WebM, BT.709)")] FFmpegVp9,
         [InspectorName("FFmpeg ProRes 4444 (MOV, BT.709)")] FFmpegProRes4444,
+        [InspectorName("FFmpeg ProRes 422 HQ (MOV, BT.709)")] FFmpegProRes422Hq,
     }
 
     /// <summary>
@@ -169,6 +170,9 @@ namespace Unity.MultiTimelineRecorder
                         break;
                     case MovieEncoderType.FFmpegProRes4444:
                         ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.ProRes4444Mov;
+                        break;
+                    case MovieEncoderType.FFmpegProRes422Hq:
+                        ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.ProRes422HqMov;
                         break;
                     default:
                         ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.H264Nvenc;
@@ -315,7 +319,13 @@ namespace Unity.MultiTimelineRecorder
                 if (encoderType == MovieEncoderType.FFmpegNvencH264 ||
                     encoderType == MovieEncoderType.FFmpegNvencHevc)
                 {
-                    errorMessage = "FFmpeg NVENC エンコーダはアルファチャンネルに対応していません。VP9(WebM) または内蔵エンコーダを使用してください。";
+                    errorMessage = "FFmpeg NVENC エンコーダはアルファチャンネルに対応していません。VP9(WebM) / ProRes 4444 または内蔵エンコーダを使用してください。";
+                    return false;
+                }
+
+                if (encoderType == MovieEncoderType.FFmpegProRes422Hq)
+                {
+                    errorMessage = "ProRes 422 HQ はアルファチャンネルに対応していません。アルファが必要な場合は ProRes 4444 を使用してください。";
                     return false;
                 }
             }
@@ -334,11 +344,12 @@ namespace Unity.MultiTimelineRecorder
                         return false;
                     }
                 }
-                else if (encoderType == MovieEncoderType.FFmpegProRes4444)
+                else if (encoderType == MovieEncoderType.FFmpegProRes4444 ||
+                         encoderType == MovieEncoderType.FFmpegProRes422Hq)
                 {
                     if (outputFormat != MovieRecorderSettings.VideoRecorderOutputFormat.MOV)
                     {
-                        errorMessage = "FFmpeg ProRes 4444 エンコーダは MOV コンテナのみ対応しています。Video Format を MOV に設定してください。";
+                        errorMessage = "FFmpeg ProRes エンコーダは MOV コンテナのみ対応しています。Video Format を MOV に設定してください。";
                         return false;
                     }
                 }

@@ -2164,6 +2164,9 @@ namespace Unity.MultiTimelineRecorder
                     renderingData.exclusiveRoots = exclusiveRoots;
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Collected {exclusiveRoots.Count} exclusive root(s) for this batch: {string.Join(", ", exclusiveRoots.ConvertAll(r => r.name))}");
 
+                    // RT スケーリングプロキシの Blitter を作成(録画準備時に作られたペアがあれば)
+                    CreateScaledRtBlittersInPlayMode();
+
                     // PlayModeTimelineRenderer GameObjectを作成
                     var rendererGO = new GameObject("[PlayModeTimelineRenderer]");
                     var renderer = rendererGO.AddComponent<PlayModeTimelineRenderer>();
@@ -3515,6 +3518,9 @@ namespace Unity.MultiTimelineRecorder
                 MultiTimelineRecorderLogger.LogVerbose("[MultiTimelineRecorder] Destroying PlayModeTimelineRenderer GameObject");
                 DestroyImmediate(rendererGO);
             }
+
+            // クリーンアップ: RT スケーリングプロキシ(Blitter GO + 一時 RT アセット)
+            CleanupScaledRtProxies();
             
             // EditorPrefsのクリーンアップ
             EditorPrefs.DeleteKey("STR_DirectorName");

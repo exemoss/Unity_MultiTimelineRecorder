@@ -827,8 +827,10 @@ namespace DistributedRecorder.Tests
         }
 
         [Test]
-        public void RecorderConfigItem_EffectiveResolution_UsesRenderTextureSize()
+        public void RecorderConfigItem_EffectiveResolution_HonorsItemResolution()
         {
+            // v1.5.27: FFmpeg 系は scale フィルタ、連番/内蔵はプロキシ RT により、
+            // RT ソースでも Resolution 指定が出力解像度になる
             var rt = new RenderTexture(7488, 1344, 0);
             try
             {
@@ -837,10 +839,19 @@ namespace DistributedRecorder.Tests
                 item.imageRenderTexture = rt;
 
                 item.GetEffectiveOutputResolution(out int w, out int h);
-                Assert.AreEqual(7488, w, "RT source must report the RT's actual width.");
-                Assert.AreEqual(1344, h, "RT source must report the RT's actual height.");
+                Assert.AreEqual(1920, w, "RT ソースでも Resolution 指定が実効解像度になる");
+                Assert.AreEqual(1080, h);
+
+                // Resolution 未設定(0)なら RT 実寸へフォールバック
+                item.width = 0;
+                item.height = 0;
+                item.GetEffectiveOutputResolution(out w, out h);
+                Assert.AreEqual(7488, w);
+                Assert.AreEqual(1344, h);
 
                 // RT が無い場合は設定値へフォールバック
+                item.width = 1920;
+                item.height = 1080;
                 item.imageRenderTexture = null;
                 item.GetEffectiveOutputResolution(out w, out h);
                 Assert.AreEqual(1920, w);
