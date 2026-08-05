@@ -4,6 +4,16 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.26] - 2026-08-05
+
+### Added
+- FFmpeg ProRes 4444 (MOV) encoder (`MovieEncoderType.FFmpegProRes4444`,
+  prores_ks): natively readable by Premiere / AE, supports Capture Alpha
+  (rgba → yuva444p10le), BT.709 conversion/tagging, and — unlike the built-in
+  Core Encoder MOV path — output scaling to the item Resolution for
+  RenderTexture sources. Software encoding but much faster than VP9; quality
+  uses the profile default (QP / bitrate are not used). Audio is AAC-in-MOV.
+
 ## [1.5.25] - 2026-08-05
 
 ### Fixed
