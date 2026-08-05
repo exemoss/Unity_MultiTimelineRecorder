@@ -315,13 +315,15 @@ namespace Unity.MultiTimelineRecorder
             // Local MTR recording passes Camera / RenderTexture by direct reference
             // (config.imageTargetCamera / config.imageRenderTexture are already resolved in-Editor).
             // fallbackToGameViewOnMissingRef=true mirrors the original inline behaviour.
+            // 連番 Image には ffmpeg のようなスケーリング手段が無いため、RT ソースで
+            // Resolution が RT 実寸と異なる場合は縮小プロキシ RT を録画対象にする
             var settings = RecorderSettingsBuilderShared.BuildImageSettings(
                 config,
                 config.width,
                 config.height,
                 frameRate,
                 config.imageTargetCamera,
-                config.imageRenderTexture,
+                ResolveRenderTextureForRecording(config),
                 outputFile,
                 fallbackToGameViewOnMissingRef: true);
 
@@ -398,9 +400,14 @@ namespace Unity.MultiTimelineRecorder
                     case ImageRecorderSourceType.RenderTexture:
                         if (config.imageRenderTexture != null)
                         {
+                            // 内蔵 CoreEncoder はスケーリング手段が無いため縮小プロキシ RT 経由で
+                            // Resolution 指定を効かせる(FFmpeg 系は ffmpeg の scale フィルタで行う)
+                            var recordingRenderTexture = settingsConfig.encoderType == MovieEncoderType.CoreEncoder
+                                ? ResolveRenderTextureForRecording(config)
+                                : config.imageRenderTexture;
                             var renderTextureInputSettings = new RenderTextureInputSettings
                             {
-                                RenderTexture = config.imageRenderTexture,
+                                RenderTexture = recordingRenderTexture,
                                 FlipFinalOutput = false
                             };
                             settings.ImageInputSettings = renderTextureInputSettings;

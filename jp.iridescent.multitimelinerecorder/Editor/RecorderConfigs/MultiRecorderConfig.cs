@@ -162,11 +162,10 @@ namespace Unity.MultiTimelineRecorder
             {
                 if (imageSourceType == ImageRecorderSourceType.RenderTexture && imageRenderTexture != null)
                 {
-                    bool ffmpegScaledMovie = recorderType == RecorderSettingsType.Movie
-                        && movieConfig != null
-                        && movieConfig.encoderType != MovieEncoderType.CoreEncoder
-                        && width > 0 && height > 0;
-                    if (ffmpegScaledMovie)
+                    // v1.5.27: FFmpeg 系は scale フィルタ、連番 Image / 内蔵 CoreEncoder は
+                    // 縮小プロキシ RT により、いずれの経路でも Resolution 指定が出力解像度になる。
+                    // 未設定(0 以下)の場合のみ RT 実寸へフォールバック
+                    if (width > 0 && height > 0)
                     {
                         effectiveWidth = width;
                         effectiveHeight = height;
