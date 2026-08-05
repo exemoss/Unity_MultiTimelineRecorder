@@ -4,6 +4,17 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.23] - 2026-08-05
+
+### Fixed
+- VP9/WebM: the output file no longer stays at 0 bytes for the whole recording.
+  ffmpeg's webm muxer buffered everything until a clean close, so the file
+  looked "not saved" while recording, an abnormal end (Play Mode killed,
+  editor crash, stall-guard abort) lost the entire recording, and the Encoder
+  Output Stall Guard could falsely abort the run because the file never grew.
+  `-flush_packets 1 -cluster_time_limit 2000` forces continuous writes — the
+  file now grows from ~2 s after recording starts (measured).
+
 ## [1.5.22] - 2026-08-04
 
 ### Added

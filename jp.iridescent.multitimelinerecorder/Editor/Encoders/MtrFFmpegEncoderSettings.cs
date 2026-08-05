@@ -107,11 +107,19 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 // NVENC は VP9 エンコード非対応のため libvpx-vp9(ソフトウェア)を使う。
                 // row-mt + tile-columns でマルチスレッド化(7488x1344 実測 約12fps)。
                 // qp は VP9 では CRF として扱う(有効域 0-63 のうち UI の 0-51 を使用)。
+                //
+                // -flush_packets 1 + -cluster_time_limit 2000 は必須:
+                // webm(matroska) muxer は既定で出力をバッファし続け、正常クローズまで
+                // ファイルが 0 バイトのままになる(実測)。録画が異常終了すると内容ごと失われ、
+                // Encoder Output Stall Guard も「ファイルが成長しない」と誤検知して録画を
+                // 中断してしまう。フラッシュ強制でファイルは録画開始 約2 秒後から連続的に
+                // 成長する(実測)。mp4 は mdat が逐次書き込まれるため NVENC 経路では不要。
                 string vp9RateControl = bitrateKbps > 0
                     ? $"-b:v {bitrateKbps}k"
                     : $"-crf {qp} -b:v 0";
                 return $"-c:v libvpx-vp9 {vp9RateControl} -row-mt 1 -tile-columns 3 -cpu-used 4 -deadline good"
-                       + Bt709ColorArgs;
+                       + Bt709ColorArgs
+                       + " -flush_packets 1 -cluster_time_limit 2000";
             }
 
             string codec = Format == OutputFormat.HevcNvenc ? "hevc_nvenc" : "h264_nvenc";
