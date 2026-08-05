@@ -3246,23 +3246,29 @@ namespace Unity.MultiTimelineRecorder
                         continue;
 
                     item.GetEffectiveOutputResolution(out int effectiveWidth, out int effectiveHeight);
+
+                    // H.264 の解像度上限超過だけは「フォーマット切替で続行」の
+                    // インタラクティブな救済があるため専用リストへ
                     int maxDimension = MovieRecorderSettingsConfig.GetMaxDimension(
                         item.movieConfig.outputFormat, item.movieConfig.encoderType);
-                    if (effectiveWidth <= maxDimension && effectiveHeight <= maxDimension)
-                        continue;
-
-                    string line = $"・{director.gameObject.name} / {item.name}: {effectiveWidth}x{effectiveHeight}";
-                    if (MovieRecorderSettingsConfig.IsH264(item.movieConfig.outputFormat, item.movieConfig.encoderType))
+                    bool overLimit = effectiveWidth > maxDimension || effectiveHeight > maxDimension;
+                    if (overLimit && MovieRecorderSettingsConfig.IsH264(item.movieConfig.outputFormat, item.movieConfig.encoderType))
                     {
                         if (!h264OverLimitItems.Contains(item))
                         {
                             h264OverLimitItems.Add(item);
-                            h264OverLimitLines.Add(line);
+                            h264OverLimitLines.Add($"・{director.gameObject.name} / {item.name}: {effectiveWidth}x{effectiveHeight}");
                         }
+                        continue;
                     }
-                    else
+
+                    // それ以外は Validate 全体を録画前に走らせ、失敗をダイアログで可視化する。
+                    // ここで弾かないと CreateMovieRecorderSettingsFromConfig が録画開始後に
+                    // Console へのエラー 1 行だけ残してアイテムを黙って捨て、
+                    // 「録画は完走したのにファイルが無い」になる(v1.5.22 のアルファ検証で実害)
+                    if (!item.movieConfig.Validate(effectiveWidth, effectiveHeight, out string validateError))
                     {
-                        hardErrorLines.Add($"{line} (上限 {maxDimension}px / {item.movieConfig.outputFormat})");
+                        hardErrorLines.Add($"・{director.gameObject.name} / {item.name}: {validateError}");
                     }
                 }
             }
@@ -3270,10 +3276,10 @@ namespace Unity.MultiTimelineRecorder
             if (hardErrorLines.Count > 0)
             {
                 EditorUtility.DisplayDialog(
-                    "Movie 解像度が上限を超えています",
-                    "以下の Movie レコーダーは選択中の出力フォーマットの上限解像度を超えているため録画できません:\n\n" +
+                    "Movie レコーダーの設定エラー",
+                    "以下の Movie レコーダーは設定エラーのため録画できません:\n\n" +
                     string.Join("\n", hardErrorLines) +
-                    "\n\n解像度または出力フォーマットを見直してください。",
+                    "\n\n設定を修正してから録画を開始してください。",
                     "OK");
                 return false;
             }
