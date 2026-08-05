@@ -51,6 +51,9 @@ namespace DistributedRecorder.Tests
             StringAssert.Contains("-row-mt 1", options, "row-mt 無しでは 7K 幅で実用速度が出ない");
             StringAssert.Contains("out_color_matrix=bt709", options, "RGB→YUV 変換行列の BT.709 固定");
             StringAssert.Contains("color_trc=bt709", options, "BT.709 メタデータの焼き込み");
+            StringAssert.Contains("-flush_packets 1", options,
+                "フラッシュ強制無しでは webm がクローズまで 0 バイトのままになり、" +
+                "異常終了でデータ喪失 + ストールガード誤検知を招く");
         }
 
         [Test]
