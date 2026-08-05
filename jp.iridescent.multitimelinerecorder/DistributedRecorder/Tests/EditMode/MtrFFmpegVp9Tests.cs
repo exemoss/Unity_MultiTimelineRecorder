@@ -103,6 +103,82 @@ namespace DistributedRecorder.Tests
             Assert.AreEqual("mp4", nvenc.Extension);
         }
 
+        // ---- ProRes 4444 (MOV) --------------------------------------------------
+
+        [Test]
+        public void ProRes_GetOptions_UsesProResKsWithBt709()
+        {
+            var settings = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.ProRes4444Mov,
+            };
+
+            string options = settings.GetOptions(true);
+            StringAssert.Contains("-c:v prores_ks", options);
+            StringAssert.Contains("-profile:v 4444", options);
+            StringAssert.Contains("format=yuva444p10le", options, "アルファ付きは 4444 のアルファプレーンを使う");
+            StringAssert.Contains("out_color_matrix=bt709", options);
+            StringAssert.Contains("format=yuv444p10le", settings.GetOptions(false));
+            Assert.AreEqual("mov", ((IEncoderSettings)settings).Extension);
+            Assert.IsTrue(((IEncoderSettings)settings).CanCaptureAlpha);
+        }
+
+        [Test]
+        public void Validate_ProResWithMovAndAlpha_IsValid()
+        {
+            var config = new MovieRecorderSettingsConfig
+            {
+                outputFormat = MovieRecorderSettings.VideoRecorderOutputFormat.MOV,
+                encoderType = MovieEncoderType.FFmpegProRes4444,
+                ffmpegPath = fakeFfmpegPath,
+                width = 1920,
+                height = 1080,
+                frameRate = 30,
+                captureAlpha = true,
+            };
+            bool valid = config.Validate(out string error);
+            Assert.IsTrue(valid, $"ProRes 4444 + MOV + アルファは有効。Error: {error}");
+        }
+
+        [Test]
+        public void Validate_ProResWithWebm_IsRejected()
+        {
+            var config = new MovieRecorderSettingsConfig
+            {
+                outputFormat = MovieRecorderSettings.VideoRecorderOutputFormat.WebM,
+                encoderType = MovieEncoderType.FFmpegProRes4444,
+                ffmpegPath = fakeFfmpegPath,
+                width = 1920,
+                height = 1080,
+                frameRate = 30,
+            };
+            Assert.IsFalse(config.Validate(out _), "ProRes 4444 は MOV コンテナ専用");
+        }
+
+        [Test]
+        public void ApplyToSettings_ProRes_MapsToProRes4444Mov()
+        {
+            var config = new MovieRecorderSettingsConfig
+            {
+                outputFormat = MovieRecorderSettings.VideoRecorderOutputFormat.MOV,
+                encoderType = MovieEncoderType.FFmpegProRes4444,
+                ffmpegPath = fakeFfmpegPath,
+                width = 1920,
+                height = 1080,
+                frameRate = 30,
+            };
+            var settings = ScriptableObject.CreateInstance<MovieRecorderSettings>();
+            try
+            {
+                config.ApplyToSettings(settings);
+                var encoder = settings.EncoderSettings as MtrFFmpegEncoderSettings;
+                Assert.IsNotNull(encoder);
+                Assert.AreEqual(MtrFFmpegEncoderSettings.OutputFormat.ProRes4444Mov, encoder.Format);
+                Assert.AreEqual("mov", ((IEncoderSettings)encoder).Extension);
+            }
+            finally { Object.DestroyImmediate(settings); }
+        }
+
         // ---- Output scaling (RT ソースの Resolution 尊重) ------------------------
 
         [Test]
