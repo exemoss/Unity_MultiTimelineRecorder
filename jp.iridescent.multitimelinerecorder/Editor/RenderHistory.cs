@@ -24,6 +24,49 @@ namespace Unity.MultiTimelineRecorder
     }
 
     /// <summary>
+    /// 履歴エントリに記録する、録画に使われたレコーダー 1 件分の要約。
+    /// 「あの書き出しはどの設定だったか」を後から追えるようにするためのもので、
+    /// 設定の復元用ではない（表示専用のスナップショット）。
+    /// </summary>
+    [Serializable]
+    public class RenderHistoryRecorderInfo
+    {
+        /// <summary>レコーダーアイテムの表示名</summary>
+        public string name;
+        /// <summary>Movie / Image / AOV 等（RecorderSettingsType の名前）</summary>
+        public string recorderType;
+        /// <summary>Movie なら MP4/WebM/MOV、Image なら PNG/JPEG/EXR</summary>
+        public string format;
+        /// <summary>Movie のエンコーダ種別（Movie 以外は空）</summary>
+        public string encoder;
+        /// <summary>実効出力解像度（"1920x1080"）</summary>
+        public string resolution;
+        /// <summary>GameView / TargetCamera / RenderTexture</summary>
+        public string source;
+        /// <summary>アルファ付きで録画したか</summary>
+        public bool captureAlpha;
+
+        /// <summary>1 行表示用の要約（"M2_KAF_Bustup: MOV/ProRes4444 1920x1080 +A"）。</summary>
+        public string ToShortString()
+        {
+            string codec = string.IsNullOrEmpty(encoder) || encoder == "CoreEncoder"
+                ? format
+                : $"{format}/{encoder}";
+            string alpha = captureAlpha ? " +A" : string.Empty;
+            return $"{name}: {codec} {resolution}{alpha}";
+        }
+
+        /// <summary>ツールチップ用の詳細（複数行）。</summary>
+        public string ToDetailString()
+        {
+            return $"{name}\n  種別: {recorderType}\n  形式: {format}" +
+                   (string.IsNullOrEmpty(encoder) ? string.Empty : $"\n  エンコーダ: {encoder}") +
+                   $"\n  解像度: {resolution}\n  ソース: {source}" +
+                   (captureAlpha ? "\n  アルファ: あり" : string.Empty);
+        }
+    }
+
+    /// <summary>
     /// レンダリング実行 1 回分の履歴エントリ。
     /// </summary>
     [Serializable]
@@ -32,6 +75,11 @@ namespace Unity.MultiTimelineRecorder
         public string id;
         /// <summary>録画対象 Timeline 名のカンマ区切り（表示用）</summary>
         public string timelines;
+        /// <summary>
+        /// この実行で使われたレコーダーの要約一覧（v1.5.28 で追加）。
+        /// これより前に記録されたエントリでは空になる。
+        /// </summary>
+        public List<RenderHistoryRecorderInfo> recorders = new List<RenderHistoryRecorderInfo>();
         public long startedUnixMs;
         /// <summary>0 = 未終了（Running）</summary>
         public long endedUnixMs;
@@ -44,6 +92,17 @@ namespace Unity.MultiTimelineRecorder
 
         public RenderHistoryStatus Status => (RenderHistoryStatus)status;
         public DateTime StartedLocal => DateTimeOffset.FromUnixTimeMilliseconds(startedUnixMs).LocalDateTime;
+
+        /// <summary>レコーダー一覧の 1 行表示（記録が無い旧エントリは空文字列）。</summary>
+        public string RecordersSummary
+        {
+            get
+            {
+                if (recorders == null || recorders.Count == 0)
+                    return string.Empty;
+                return string.Join(", ", recorders.ConvertAll(r => r.ToShortString()));
+            }
+        }
 
         /// <summary>所要時間。未終了エントリは現在時刻までの経過時間を返す。</summary>
         public TimeSpan Duration
@@ -116,6 +175,16 @@ namespace Unity.MultiTimelineRecorder
         /// </summary>
         public static RenderHistoryEntry BeginRun(IEnumerable<string> timelineNames)
         {
+            return BeginRun(timelineNames, null);
+        }
+
+        /// <summary>
+        /// レコーダーの要約付きで録画実行の開始を記録する。
+        /// </summary>
+        public static RenderHistoryEntry BeginRun(
+            IEnumerable<string> timelineNames,
+            IEnumerable<RenderHistoryRecorderInfo> recorderInfos)
+        {
             var data = Load();
 
             // 終了検知を取り逃した Running エントリの掃き出し
@@ -133,6 +202,9 @@ namespace Unity.MultiTimelineRecorder
             {
                 id = Guid.NewGuid().ToString("N"),
                 timelines = string.Join(", ", timelineNames ?? Array.Empty<string>()),
+                recorders = recorderInfos != null
+                    ? new List<RenderHistoryRecorderInfo>(recorderInfos)
+                    : new List<RenderHistoryRecorderInfo>(),
                 startedUnixMs = NowMs(),
                 endedUnixMs = 0,
                 status = (int)RenderHistoryStatus.Running,
@@ -212,6 +284,9 @@ namespace Unity.MultiTimelineRecorder
 
             data ??= new RenderHistoryData();
             data.entries ??= new List<RenderHistoryEntry>();
+            // v1.5.28 より前に保存されたエントリには recorders が無い（null になる）
+            foreach (var entry in data.entries)
+                entry.recorders ??= new List<RenderHistoryRecorderInfo>();
             if (fileOverrideForTests == null)
                 cache = data;
             return data;

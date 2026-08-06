@@ -2668,7 +2668,8 @@ namespace Unity.MultiTimelineRecorder
             }
 
             float rowHeight = EditorGUIUtility.singleLineHeight + 2f;
-            float viewHeight = Mathf.Min(entries.Count, 8) * rowHeight + 8f;
+            // レコーダー行を持つエントリは 2 行分の高さになるため、表示件数分を見積もる
+            float viewHeight = Mathf.Min(entries.Count, 6) * rowHeight * 2f + 8f;
             renderHistoryScroll = EditorGUILayout.BeginScrollView(renderHistoryScroll, GUILayout.Height(viewHeight));
 
             // 新しい順に表示
@@ -2695,6 +2696,21 @@ namespace Unity.MultiTimelineRecorder
                 EditorGUILayout.LabelField(new GUIContent(entry.timelines, tooltip), EditorStyles.miniLabel);
 
                 EditorGUILayout.EndHorizontal();
+
+                // レコーダー行（どの設定で書き出したかを後から追えるように）
+                string recordersSummary = entry.RecordersSummary;
+                if (!string.IsNullOrEmpty(recordersSummary))
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    GUILayout.Space(60);
+                    var details = new List<string>();
+                    foreach (var recorder in entry.recorders)
+                        details.Add(recorder.ToDetailString());
+                    EditorGUILayout.LabelField(
+                        new GUIContent("↳ " + recordersSummary, string.Join("\n", details)),
+                        EditorStyles.miniLabel);
+                    EditorGUILayout.EndHorizontal();
+                }
             }
 
             EditorGUILayout.EndScrollView();
@@ -3217,6 +3233,83 @@ namespace Unity.MultiTimelineRecorder
         }
 
         /// <summary>
+        /// この録画で使われる有効なレコーダーの要約を集める（Render History 表示用）。
+        /// 同一設定のアイテムが複数 Timeline で重複しないよう、要約文字列で重複排除する。
+        /// </summary>
+        private List<RenderHistoryRecorderInfo> CollectRenderHistoryRecorderInfos(List<PlayableDirector> directorsToRender)
+        {
+            var infos = new List<RenderHistoryRecorderInfo>();
+            var seen = new HashSet<string>();
+
+            foreach (var director in directorsToRender)
+            {
+                int timelineIndex = recordingQueueDirectors.IndexOf(director);
+                if (timelineIndex < 0)
+                    continue;
+                var timelineConfig = GetTimelineRecorderConfig(timelineIndex);
+                if (timelineConfig == null)
+                    continue;
+
+                foreach (var item in timelineConfig.GetEnabledRecorders())
+                {
+                    var info = BuildRenderHistoryRecorderInfo(item);
+                    if (info == null || !seen.Add(info.ToShortString()))
+                        continue;
+                    infos.Add(info);
+                }
+            }
+            return infos;
+        }
+
+        /// <summary>
+        /// レコーダーアイテム 1 件を履歴用の要約に変換する。
+        /// 解像度は録画時と同じ実効値（RT ソースならスケーリング後）を使う。
+        /// </summary>
+        private static RenderHistoryRecorderInfo BuildRenderHistoryRecorderInfo(MultiRecorderConfig.RecorderConfigItem item)
+        {
+            if (item == null)
+                return null;
+
+            item.GetEffectiveOutputResolution(out int width, out int height);
+
+            string format;
+            string encoder = string.Empty;
+            switch (item.recorderType)
+            {
+                case RecorderSettingsType.Movie:
+                    format = item.movieConfig != null ? item.movieConfig.outputFormat.ToString() : "?";
+                    encoder = item.movieConfig != null ? item.movieConfig.encoderType.ToString() : string.Empty;
+                    break;
+                case RecorderSettingsType.Image:
+                    format = item.imageFormat.ToString();
+                    break;
+                case RecorderSettingsType.AOV:
+                    format = item.aovConfig != null ? item.aovConfig.outputFormat.ToString() : "?";
+                    break;
+                default:
+                    // Animation / Alembic / FBX は形式の選択肢が無いので種別名をそのまま出す
+                    format = item.recorderType.ToString();
+                    break;
+            }
+
+            // アルファは Movie/Image で保持場所が違う（Movie は movieConfig 側）
+            bool captureAlpha = item.recorderType == RecorderSettingsType.Movie
+                ? item.movieConfig != null && item.movieConfig.captureAlpha
+                : item.captureAlpha;
+
+            return new RenderHistoryRecorderInfo
+            {
+                name = item.name,
+                recorderType = item.recorderType.ToString(),
+                format = format,
+                encoder = encoder,
+                resolution = $"{width}x{height}",
+                source = item.imageSourceType.ToString(),
+                captureAlpha = captureAlpha,
+            };
+        }
+
+        /// <summary>
         /// 録画開始前の Movie 解像度プリフライトチェック。
         /// 対象は録画キュー(recordingQueueDirectors)の各 Timeline に紐づく有効な Movie アイテムで、
         /// 実効解像度(RenderTexture ソース時は RT 実寸)で判定する。
@@ -3719,7 +3812,7 @@ namespace Unity.MultiTimelineRecorder
                 if (historyDirector != null && historyDirector.gameObject != null)
                     historyTimelineNames.Add(historyDirector.gameObject.name);
             }
-            RenderHistory.BeginRun(historyTimelineNames);
+            RenderHistory.BeginRun(historyTimelineNames, CollectRenderHistoryRecorderInfos(directorsToRender));
             
             MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] === Current Play Mode state: {EditorApplication.isPlaying} ===");
             
