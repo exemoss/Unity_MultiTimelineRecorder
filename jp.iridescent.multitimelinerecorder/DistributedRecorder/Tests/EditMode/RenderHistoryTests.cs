@@ -147,6 +147,74 @@ namespace DistributedRecorder.Tests
         }
 
         [Test]
+        public void BeginRun_WithRecorderInfos_PersistsThem()
+        {
+            var infos = new[]
+            {
+                new RenderHistoryRecorderInfo
+                {
+                    name = "M2_KAF_Bustup",
+                    recorderType = "Movie",
+                    format = "MOV",
+                    encoder = "FFmpegProRes4444",
+                    resolution = "1920x1080",
+                    source = "RenderTexture",
+                    captureAlpha = true,
+                },
+                new RenderHistoryRecorderInfo
+                {
+                    name = "Seq",
+                    recorderType = "Image",
+                    format = "PNG",
+                    resolution = "3840x2160",
+                    source = "GameView",
+                },
+            };
+
+            RenderHistory.BeginRun(new[] { "Rec_Timeline" }, infos);
+            RenderHistory.FinalizeCurrent(RenderHistoryStatus.Completed, 1f, null);
+
+            // fileOverrideForTests 使用時はキャッシュしないので、これはファイル往復後の値
+            var entry = RenderHistory.Entries[0];
+            Assert.AreEqual(2, entry.recorders.Count, "レコーダー情報が永続化される");
+            Assert.AreEqual("M2_KAF_Bustup", entry.recorders[0].name);
+            Assert.AreEqual("FFmpegProRes4444", entry.recorders[0].encoder);
+            Assert.IsTrue(entry.recorders[0].captureAlpha);
+
+            StringAssert.Contains("MOV/FFmpegProRes4444", entry.RecordersSummary);
+            StringAssert.Contains("1920x1080", entry.RecordersSummary);
+            StringAssert.Contains("+A", entry.RecordersSummary, "アルファ有りは +A で示す");
+            StringAssert.Contains("Seq: PNG 3840x2160", entry.RecordersSummary);
+        }
+
+        [Test]
+        public void RecorderInfo_ShortString_OmitsCoreEncoderName()
+        {
+            var info = new RenderHistoryRecorderInfo
+            {
+                name = "Movie",
+                recorderType = "Movie",
+                format = "MP4",
+                encoder = "CoreEncoder",
+                resolution = "1920x1080",
+                source = "GameView",
+            };
+            Assert.AreEqual("Movie: MP4 1920x1080", info.ToShortString(),
+                "内蔵エンコーダは既定なので表示を短くする");
+        }
+
+        [Test]
+        public void BeginRun_WithoutRecorderInfos_HasEmptySummary()
+        {
+            // v1.5.28 より前に記録されたエントリ相当（後方互換）
+            RenderHistory.BeginRun(new[] { "Rec_Timeline" });
+            var entry = RenderHistory.Entries[0];
+            Assert.IsNotNull(entry.recorders, "null ではなく空リストであること");
+            Assert.AreEqual(0, entry.recorders.Count);
+            Assert.AreEqual(string.Empty, entry.RecordersSummary);
+        }
+
+        [Test]
         public void FormatDuration_FormatsMinutesAndHours()
         {
             Assert.AreEqual("1:05", RenderHistory.FormatDuration(TimeSpan.FromSeconds(65)));
