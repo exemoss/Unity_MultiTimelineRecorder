@@ -3,6 +3,25 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR when
+existing settings produce different output, MINOR for features that leave output
+unchanged, PATCH for fixes.
+
+## [1.6.0-rc.1] - 2026-08-06
+
+Release candidate: the distributed-rendering job manifest needs verification
+across Master and Worker machines before 1.6.0 is finalized.
+
+### Added
+- Job manifest for distributed rendering: export the dispatch plan to a JSON
+  manifest and import it back (`JobManifest` DTO + `JobManifestIO` with
+  read/write/validation), wired into the Distributed section of the MTR window.
+- `JobDispatcher` accepts an optional commit override, so a run can be pinned to
+  a specific project commit instead of the Worker's current checkout.
+
+### Fixed
+- Dispatcher now distinguishes "no commit override" from an explicit empty
+  override (the latter previously leaked the Master's HEAD to Workers).
 
 ## [1.5.28] - 2026-08-05
 
