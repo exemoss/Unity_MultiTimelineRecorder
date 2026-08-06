@@ -4,6 +4,16 @@ All notable changes to Unity Multi Timeline Recorder will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.28] - 2026-08-05
+
+### Added
+- Render History now records the recorders used for each run, not just the
+  timelines: name, recorder type, format, encoder, effective resolution,
+  source, and whether alpha was captured. Each history row shows a summary
+  line (e.g. "↳ M2_KAF_Bustup: MOV/FFmpegProRes4444 1920x1080 +A") with the
+  full per-recorder details in its tooltip. Entries recorded before 1.5.28
+  keep working and simply show no recorder line.
+
 ## [1.5.27] - 2026-08-05
 
 ### Added
