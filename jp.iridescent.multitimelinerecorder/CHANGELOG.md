@@ -7,6 +7,27 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [1.7.0] - 2026-08-06
+
+### Added
+- Per-recorder recording range: each recorder item can now record only a slice
+  of its timeline instead of the whole thing ("Recording Range" section, shown
+  for every recorder type). Enter the range in frames or seconds via a unit
+  toggle — it is always stored as frames, so switching units never loses the
+  value. Both ends are inclusive, positions are relative to the start of the
+  section timeline, and a range past the end of the timeline is clamped into it.
+  Off by default, so existing configurations record the full timeline as before.
+  - Takes precedence over SignalEmitter timing when both are set (the
+    per-recorder range is the more specific instruction).
+  - Invalid ranges (end before start) are reported by the pre-recording
+    validation dialog, for every recorder type — not just Movie.
+  - Render History records the range (e.g. `f120-300`) alongside the other
+    recorder details.
+
+> Includes the distributed-rendering job manifest previously tagged
+> `v1.6.0-rc.1`, which is still pending Master/Worker verification. It only
+> affects the distributed path; local recording is unchanged.
+
 ## [1.6.0-rc.1] - 2026-08-06
 
 Release candidate: the distributed-rendering job manifest needs verification
