@@ -7,6 +7,23 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [1.8.0] - 2026-08-06
+
+### Added
+- "Skip Before Range" for recorders with a custom range: playback now starts a
+  configurable lead-in before the recorded range instead of playing the whole
+  timeline up to it. The lead-in (frames or seconds, following the same unit
+  toggle) is played but not recorded, so cloth/particles/VFX can settle before
+  the first recorded frame — and the long unused head of the timeline is no
+  longer played back at all, which is the point: waiting through it is dead
+  wall-clock time.
+  - The playback window is the union of what every enabled recorder on that
+    timeline needs. If even one of them records the full timeline (or has no
+    range), playback still starts at the head, because those frames are needed.
+  - Pre-roll now anchors to the start of the resolved playback window rather
+    than always to frame 0 / the SignalEmitter start.
+  - Off by default, so existing configurations play and record exactly as before.
+
 ## [1.7.0] - 2026-08-06
 
 ### Added
