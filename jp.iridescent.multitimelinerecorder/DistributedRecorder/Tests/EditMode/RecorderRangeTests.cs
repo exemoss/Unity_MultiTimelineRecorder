@@ -123,6 +123,104 @@ namespace DistributedRecorder.Tests
             StringAssert.Contains("尺範囲", error);
         }
 
+        // ---- ResolvePlaybackWindow（前尺スキップ） --------------------------------
+
+        private static MultiRecorderConfig.RecorderConfigItem MakeSkipItem(
+            int start, int end, int leadIn)
+        {
+            var item = MakeItem(start: start, end: end);
+            item.skipBeforeRange = true;
+            item.leadInFrames = leadIn;
+            return item;
+        }
+
+        [Test]
+        public void PlaybackWindow_NoItems_UsesFullTimeline()
+        {
+            var w = MultiRecorderConfig.ResolvePlaybackWindow(null, 20.0, 30.0);
+            Assert.AreEqual(0.0, w.clipIn, 0.0001);
+            Assert.AreEqual(20.0, w.duration, 0.0001);
+            Assert.IsFalse(w.skippedLeadIn);
+        }
+
+        [Test]
+        public void PlaybackWindow_SkipsLeadIn_WhenAllItemsOptIn()
+        {
+            // 30fps: 録画 f120-300、助走 60 フレーム(2秒) -> 再生は f60(2.0s) から
+            var items = new[] { MakeSkipItem(120, 300, 60) };
+            var w = MultiRecorderConfig.ResolvePlaybackWindow(items, 20.0, 30.0);
+
+            Assert.AreEqual(2.0, w.clipIn, 0.0001, "録画開始の 2 秒前から再生");
+            // 窓の終端は録画終端(301/30 = 10.033s)
+            Assert.AreEqual(301 / 30.0 - 2.0, w.duration, 0.0001);
+            Assert.IsTrue(w.skippedLeadIn);
+        }
+
+        [Test]
+        public void PlaybackWindow_NotSkipped_WhenAnyItemRecordsFullTimeline()
+        {
+            // 1 つでも範囲指定なしのレコーダーがあれば、その絵が要るので切り詰めない
+            var items = new[] { MakeSkipItem(120, 300, 60), MakeItem(useCustomRange: false) };
+            var w = MultiRecorderConfig.ResolvePlaybackWindow(items, 20.0, 30.0);
+
+            Assert.AreEqual(0.0, w.clipIn, 0.0001);
+            Assert.AreEqual(20.0, w.duration, 0.0001);
+            Assert.IsFalse(w.skippedLeadIn);
+        }
+
+        [Test]
+        public void PlaybackWindow_NotSkipped_WhenItemHasRangeButNoSkipFlag()
+        {
+            // 範囲指定はあるが前尺スキップ off のレコーダーが混ざる場合も切り詰めない
+            var items = new[] { MakeSkipItem(120, 300, 60), MakeItem(start: 0, end: 100) };
+            var w = MultiRecorderConfig.ResolvePlaybackWindow(items, 20.0, 30.0);
+
+            Assert.AreEqual(0.0, w.clipIn, 0.0001);
+            Assert.IsFalse(w.skippedLeadIn);
+        }
+
+        [Test]
+        public void PlaybackWindow_TakesUnionOfAllRanges()
+        {
+            // A: f120-300 (助走60 -> 開始 f60) / B: f600-900 (助走0 -> 開始 f600)
+            // 和集合 = f60 〜 f901
+            var items = new[] { MakeSkipItem(120, 300, 60), MakeSkipItem(600, 900, 0) };
+            var w = MultiRecorderConfig.ResolvePlaybackWindow(items, 40.0, 30.0);
+
+            Assert.AreEqual(60 / 30.0, w.clipIn, 0.0001, "最も早い再生開始に合わせる");
+            Assert.AreEqual(901 / 30.0 - 60 / 30.0, w.duration, 0.0001, "最も遅い録画終端まで再生する");
+        }
+
+        [Test]
+        public void PlaybackWindow_LeadInBeyondStart_ClampsToZero()
+        {
+            // 助走が録画開始より長い場合は Timeline 先頭で頭打ち（スキップは発生しない）
+            var items = new[] { MakeSkipItem(30, 300, 600) };
+            var w = MultiRecorderConfig.ResolvePlaybackWindow(items, 20.0, 30.0);
+
+            Assert.AreEqual(0.0, w.clipIn, 0.0001);
+            Assert.IsFalse(w.skippedLeadIn, "先頭から再生するならスキップしたことにはならない");
+        }
+
+        [Test]
+        public void PlaybackWindow_UsesSignalRangeAsFallback()
+        {
+            // 前尺スキップ非対応のレコーダーがある場合、既定は SignalEmitter 範囲
+            var items = new[] { MakeItem(useCustomRange: false) };
+            var w = MultiRecorderConfig.ResolvePlaybackWindow(items, 20.0, 30.0,
+                signalStartTime: 3.0, signalDuration: 5.0);
+
+            Assert.AreEqual(3.0, w.clipIn, 0.0001);
+            Assert.AreEqual(5.0, w.duration, 0.0001);
+        }
+
+        [Test]
+        public void ValidateRange_NegativeLeadIn_IsRejected()
+        {
+            var item = MakeSkipItem(120, 300, -1);
+            Assert.IsFalse(item.ValidateRange(out _));
+        }
+
         // ---- Clone ---------------------------------------------------------------
 
         [Test]
@@ -131,12 +229,17 @@ namespace DistributedRecorder.Tests
             var item = MakeItem(start: 120, end: 300);
             item.rangeUnit = RecorderRangeUnit.Seconds;
 
+            item.skipBeforeRange = true;
+            item.leadInFrames = 60;
+
             var clone = item.Clone();
 
             Assert.IsTrue(clone.useCustomRange);
             Assert.AreEqual(RecorderRangeUnit.Seconds, clone.rangeUnit);
             Assert.AreEqual(120, clone.rangeStartFrame);
             Assert.AreEqual(300, clone.rangeEndFrame);
+            Assert.IsTrue(clone.skipBeforeRange);
+            Assert.AreEqual(60, clone.leadInFrames);
         }
     }
 }
