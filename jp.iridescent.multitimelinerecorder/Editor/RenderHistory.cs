@@ -46,14 +46,18 @@ namespace Unity.MultiTimelineRecorder
         /// <summary>アルファ付きで録画したか</summary>
         public bool captureAlpha;
 
-        /// <summary>1 行表示用の要約（"M2_KAF_Bustup: MOV/ProRes4444 1920x1080 +A"）。</summary>
+        /// <summary>尺範囲の指定（未指定なら空 = Timeline 全体）。例: "f120-300"</summary>
+        public string range;
+
+        /// <summary>1 行表示用の要約（"M2_KAF_Bustup: MOV/ProRes4444 1920x1080 +A f120-300"）。</summary>
         public string ToShortString()
         {
             string codec = string.IsNullOrEmpty(encoder) || encoder == "CoreEncoder"
                 ? format
                 : $"{format}/{encoder}";
             string alpha = captureAlpha ? " +A" : string.Empty;
-            return $"{name}: {codec} {resolution}{alpha}";
+            string rangeText = string.IsNullOrEmpty(range) ? string.Empty : $" {range}";
+            return $"{name}: {codec} {resolution}{alpha}{rangeText}";
         }
 
         /// <summary>ツールチップ用の詳細（複数行）。</summary>
@@ -62,7 +66,8 @@ namespace Unity.MultiTimelineRecorder
             return $"{name}\n  種別: {recorderType}\n  形式: {format}" +
                    (string.IsNullOrEmpty(encoder) ? string.Empty : $"\n  エンコーダ: {encoder}") +
                    $"\n  解像度: {resolution}\n  ソース: {source}" +
-                   (captureAlpha ? "\n  アルファ: あり" : string.Empty);
+                   (captureAlpha ? "\n  アルファ: あり" : string.Empty) +
+                   (string.IsNullOrEmpty(range) ? "\n  尺範囲: Timeline 全体" : $"\n  尺範囲: {range}");
         }
     }
 

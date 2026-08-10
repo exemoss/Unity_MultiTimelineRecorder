@@ -3306,6 +3306,7 @@ namespace Unity.MultiTimelineRecorder
                 resolution = $"{width}x{height}",
                 source = item.imageSourceType.ToString(),
                 captureAlpha = captureAlpha,
+                range = item.useCustomRange ? $"f{item.rangeStartFrame}-{item.rangeEndFrame}" : string.Empty,
             };
         }
 
@@ -3338,6 +3339,13 @@ namespace Unity.MultiTimelineRecorder
 
                 foreach (var item in timelineConfig.GetEnabledRecorders())
                 {
+                    // 尺範囲は全レコーダー種別で使えるので、Movie 判定より先に検証する
+                    if (!item.ValidateRange(out string rangeError))
+                    {
+                        hardErrorLines.Add($"・{director.gameObject.name} / {item.name}: {rangeError}");
+                        continue;
+                    }
+
                     if (item.recorderType != RecorderSettingsType.Movie || item.movieConfig == null)
                         continue;
 
@@ -4058,6 +4066,11 @@ namespace Unity.MultiTimelineRecorder
             public PlayableDirector selectedDirector => renderer.selectedDirector;
 
             public string recorderItemName => item.name;
+
+            public bool useCustomRange { get => item.useCustomRange; set => item.useCustomRange = value; }
+            public RecorderRangeUnit rangeUnit { get => item.rangeUnit; set => item.rangeUnit = value; }
+            public int rangeStartFrame { get => item.rangeStartFrame; set => item.rangeStartFrame = value; }
+            public int rangeEndFrame { get => item.rangeEndFrame; set => item.rangeEndFrame = value; }
 
             // Use global settings where applicable, item-specific otherwise
             public int frameRate { get => renderer.frameRate; set => renderer.frameRate = value; }

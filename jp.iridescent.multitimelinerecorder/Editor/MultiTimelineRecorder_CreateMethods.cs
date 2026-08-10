@@ -391,13 +391,26 @@ namespace Unity.MultiTimelineRecorder
                         
                         recorderClip.displayName = $"{director.gameObject.name} - {recorderItem.recorderType}";
                         recorderClip.start = actualRecordingStartTime;  // Pre-Rollを考慮した実際の録画開始時間を使用
-                        
+
+                        // レコーダー個別の尺範囲（Recording Range）。指定があればそれを最優先で使う。
+                        // Timeline は従来どおり全長を再生し、RecorderClip だけを区間内へ寄せることで
+                        // 「その区間だけ録画される」状態を作る（SignalEmitter より個別指定が具体的なので優先）
+                        var customRange = recorderItem.ResolveRange(originalTimeline.duration, frameRate);
+                        if (customRange.HasValue)
+                        {
+                            recorderClip.start = actualRecordingStartTime + customRange.Value.StartTime(frameRate);
+                            recorderClip.duration = customRange.Value.Duration(frameRate);
+                            MultiTimelineRecorderLogger.Log(
+                                $"[MultiTimelineRecorder] RecorderClip for {director.gameObject.name} / {recorderItem.name} uses custom range: " +
+                                $"frames {customRange.Value.startFrame}-{customRange.Value.endFrame} " +
+                                $"(Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s)");
+                        }
                         // SignalEmitter設定によるRecorderClipの同期 (TODO-282)
-                        if (useSignalEmitterTiming)
+                        else if (useSignalEmitterTiming)
                         {
                             var recordingRange = SignalEmitterRecordControl.GetRecordingRangeFromSignalsWithFallback(
                                 originalTimeline, startTimingName, endTimingName, true);
-                            
+
                             if (recordingRange.isValid)
                             {
                                 // Recorderの期間をSignalEmitter範囲に合わせる
@@ -415,7 +428,7 @@ namespace Unity.MultiTimelineRecorder
                         {
                             recorderClip.duration = timelineDuration;
                         }
-                        
+
                         var recorderAsset = recorderClip.asset as UnityEditor.Recorder.Timeline.RecorderClip;
                         recorderAsset.settings = recorderSettings;
                         
@@ -1182,20 +1195,31 @@ namespace Unity.MultiTimelineRecorder
             
             recorderClip.displayName = $"Record {recorderItem.recorderType}";
             recorderClip.start = preRollTime;
-            
+
+            // レコーダー個別の尺範囲（Recording Range）。指定があれば SignalEmitter より優先する
+            var customRange = recorderItem.ResolveRange(originalTimeline.duration, frameRate);
+            if (customRange.HasValue)
+            {
+                recorderClip.start = preRollTime + customRange.Value.StartTime(frameRate);
+                recorderClip.duration = customRange.Value.Duration(frameRate);
+                MultiTimelineRecorderLogger.Log(
+                    $"[MultiTimelineRecorder] RecorderClip for {recorderItem.name} uses custom range: " +
+                    $"frames {customRange.Value.startFrame}-{customRange.Value.endFrame} " +
+                    $"(Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s)");
+            }
             // SignalEmitter設定によるRecorderClipの同期 (TODO-282)
-            if (useSignalEmitterTiming)
+            else if (useSignalEmitterTiming)
             {
                 var recordingRange = SignalEmitterRecordControl.GetRecordingRangeFromSignalsWithFallback(
                     originalTimeline, startTimingName, endTimingName, true);
-                
+
                 if (recordingRange.isValid)
                 {
                     // RecorderClipは実際のRecording区間のみをカバー
                     // PreRollは含まない（Control Clipで処理されるため）
                     recorderClip.start = preRollTime;
                     recorderClip.duration = recordingRange.duration;
-                    
+
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] RecorderClip synchronized to SignalEmitter range: Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s");
                 }
                 else
@@ -1209,7 +1233,7 @@ namespace Unity.MultiTimelineRecorder
             {
                 recorderClip.duration = originalTimeline.duration + oneFrameDuration;
             }
-            
+
             var recorderAsset = recorderClip.asset as UnityEditor.Recorder.Timeline.RecorderClip;
             recorderAsset.settings = recorderSettings;
             

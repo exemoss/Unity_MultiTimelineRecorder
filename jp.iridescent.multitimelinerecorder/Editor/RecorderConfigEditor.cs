@@ -219,6 +219,12 @@ namespace Unity.MultiTimelineRecorder
             // RecorderConfig は表示名を持たないため null（<RecorderName> はタイプ名にフォールバック）
             public string recorderItemName => null;
 
+            // RecorderConfig は尺範囲に非対応（常に Timeline 全体）
+            public bool useCustomRange { get => false; set { } }
+            public RecorderRangeUnit rangeUnit { get => RecorderRangeUnit.Frames; set { } }
+            public int rangeStartFrame { get => 0; set { } }
+            public int rangeEndFrame { get => 0; set { } }
+
             public int frameRate { get => config.frameRate; set => config.frameRate = value; }
             public int width { get => config.width; set => config.width = value; }
             public int height { get => config.height; set => config.height = value; }

@@ -92,7 +92,7 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             }
             
             EditorGUILayout.Space(5);
-            
+
             // Output File section
             outputFileFoldout = DrawSectionHeader("Output File", outputFileFoldout);
             if (outputFileFoldout)
@@ -101,6 +101,78 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                 DrawOutputFileSettings();
                 EditorGUI.indentLevel--;
             }
+
+            EditorGUILayout.Space(5);
+
+            // Recording Range section（全レコーダー種別で共通）
+            recordingRangeFoldout = DrawSectionHeader("Recording Range", recordingRangeFoldout);
+            if (recordingRangeFoldout)
+            {
+                EditorGUI.indentLevel++;
+                DrawRecordingRangeSettings();
+                EditorGUI.indentLevel--;
+            }
+        }
+
+        protected bool recordingRangeFoldout = true;
+
+        /// <summary>
+        /// 尺範囲（このレコーダーだけ Timeline の一部区間を録る）の UI。
+        /// 入力単位はフレーム / 秒を切り替えられるが、保持は常にフレーム。
+        /// </summary>
+        protected virtual void DrawRecordingRangeSettings()
+        {
+            host.useCustomRange = EditorGUILayout.Toggle(
+                new GUIContent("Use Custom Range",
+                    "有効にすると、このレコーダーだけ Timeline の指定区間だけを録画する。無効なら Timeline 全体（SignalEmitter 使用時はその範囲）"),
+                host.useCustomRange);
+
+            if (!host.useCustomRange)
+            {
+                EditorGUILayout.LabelField(" ", "Timeline 全体を録画します", EditorStyles.miniLabel);
+                return;
+            }
+
+            int fps = Mathf.Max(1, host.frameRate);
+
+            host.rangeUnit = (RecorderRangeUnit)EditorGUILayout.EnumPopup(
+                new GUIContent("Unit", "入力単位。内部は常にフレームで保持するため、切り替えても値は失われない"),
+                host.rangeUnit);
+
+            if (host.rangeUnit == RecorderRangeUnit.Frames)
+            {
+                host.rangeStartFrame = Mathf.Max(0, EditorGUILayout.IntField(
+                    new GUIContent("Start Frame", "Timeline の先頭を 0 とした開始フレーム（このフレームを含む）"),
+                    host.rangeStartFrame));
+                host.rangeEndFrame = EditorGUILayout.IntField(
+                    new GUIContent("End Frame", "終了フレーム（このフレームを含む）"),
+                    host.rangeEndFrame);
+            }
+            else
+            {
+                float startSec = Mathf.Max(0f, EditorGUILayout.FloatField(
+                    new GUIContent("Start (s)", "Timeline の先頭を 0 とした開始時刻（秒）"),
+                    host.rangeStartFrame / (float)fps));
+                float endSec = EditorGUILayout.FloatField(
+                    new GUIContent("End (s)", "終了時刻（秒）。この時刻のフレームまで録画に含む"),
+                    (host.rangeEndFrame + 1) / (float)fps);
+
+                host.rangeStartFrame = Mathf.Max(0, Mathf.RoundToInt(startSec * fps));
+                // 秒指定は「その時刻まで」を意味するので、最終フレームは 1 引いて inclusive に戻す
+                host.rangeEndFrame = Mathf.Max(host.rangeStartFrame, Mathf.RoundToInt(endSec * fps) - 1);
+            }
+
+            if (host.rangeEndFrame < host.rangeStartFrame)
+            {
+                EditorGUILayout.HelpBox("終了が開始より前です。録画開始時にエラーになります。", MessageType.Error);
+                return;
+            }
+
+            int frameCount = host.rangeEndFrame - host.rangeStartFrame + 1;
+            EditorGUILayout.LabelField(" ",
+                $"→ {frameCount} frames / {frameCount / (float)fps:F2}s" +
+                $"  ({host.rangeStartFrame / (float)fps:F2}s 〜 {(host.rangeEndFrame + 1) / (float)fps:F2}s)",
+                EditorStyles.miniLabel);
         }
         
         /// <summary>

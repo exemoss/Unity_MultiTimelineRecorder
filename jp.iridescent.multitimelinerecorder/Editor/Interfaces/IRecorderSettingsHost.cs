@@ -25,6 +25,12 @@ namespace Unity.MultiTimelineRecorder
         string filePath { get; set; }
         int takeNumber { get; set; }
         RecorderTakeMode takeMode { get; set; }
+
+        // 尺範囲（Recording Range）。対応しないホストは useCustomRange が常に false を返してよい
+        bool useCustomRange { get; set; }
+        RecorderRangeUnit rangeUnit { get; set; }
+        int rangeStartFrame { get; set; }
+        int rangeEndFrame { get; set; }
         string cameraTag { get; set; }
         OutputResolution outputResolution { get; set; }
         

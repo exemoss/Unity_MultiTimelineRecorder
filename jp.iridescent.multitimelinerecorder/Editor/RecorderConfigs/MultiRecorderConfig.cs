@@ -23,6 +23,31 @@ namespace Unity.MultiTimelineRecorder
     }
     
     /// <summary>
+    /// 尺範囲（Recording Range）の入力単位。表示・入力のみに影響し、
+    /// 保持は常にフレーム（<see cref="MultiRecorderConfig.RecorderConfigItem.rangeStartFrame"/> 等）。
+    /// </summary>
+    public enum RecorderRangeUnit
+    {
+        Frames,
+        Seconds
+    }
+
+    /// <summary>
+    /// 録画する尺範囲（セクション Timeline の先頭を 0 とした相対位置）。
+    /// フレームは開始・終了とも録画に含む（inclusive）。
+    /// </summary>
+    public struct RecorderRange
+    {
+        public int startFrame;
+        /// <summary>録画に含まれる最終フレーム（inclusive）</summary>
+        public int endFrame;
+
+        public int FrameCount => Mathf.Max(0, endFrame - startFrame + 1);
+        public double StartTime(double frameRate) => frameRate > 0 ? startFrame / frameRate : 0.0;
+        public double Duration(double frameRate) => frameRate > 0 ? FrameCount / frameRate : 0.0;
+    }
+
+    /// <summary>
     /// 複数のレコーダー設定を管理するためのコンフィグクラス
     /// </summary>
     [Serializable]
@@ -96,6 +121,60 @@ namespace Unity.MultiTimelineRecorder
             public int height = 1080;
             public int frameRate = 24;
             public bool capFrameRate = true;
+
+            // 尺範囲（Recording Range）: このレコーダーだけを Timeline の一部区間で録る。
+            // 既定は無効＝従来どおり Timeline 全体（または SignalEmitter 範囲）を録画する。
+            [Tooltip("有効にすると、このレコーダーだけ Timeline の指定区間だけを録画する")]
+            public bool useCustomRange = false;
+
+            [Tooltip("尺範囲の入力単位。保持は常にフレームで、秒表示は frameRate から換算する")]
+            public RecorderRangeUnit rangeUnit = RecorderRangeUnit.Frames;
+
+            [Tooltip("録画開始フレーム（セクション Timeline の先頭を 0 とした相対位置、このフレームを含む）")]
+            public int rangeStartFrame = 0;
+
+            [Tooltip("録画終了フレーム（このフレームを含む）")]
+            public int rangeEndFrame = 0;
+
+            /// <summary>
+            /// この録画で使う尺範囲を解決する。<paramref name="timelineDuration"/> は
+            /// 対象 Timeline の尺（秒）で、範囲はこの中にクランプされる。
+            /// <see cref="useCustomRange"/> が false の場合は null（＝呼び出し側の既定範囲を使う）。
+            /// </summary>
+            public RecorderRange? ResolveRange(double timelineDuration, double effectiveFrameRate)
+            {
+                if (!useCustomRange || effectiveFrameRate <= 0)
+                    return null;
+
+                // Timeline 末尾を超える指定は、尺内へ丸める（録画されない区間を指定しても
+                // 空ファイルにならないように）
+                int lastFrame = Mathf.Max(0, Mathf.CeilToInt((float)(timelineDuration * effectiveFrameRate)) - 1);
+                int start = Mathf.Clamp(rangeStartFrame, 0, lastFrame);
+                int end = Mathf.Clamp(rangeEndFrame, start, lastFrame);
+                return new RecorderRange { startFrame = start, endFrame = end };
+            }
+
+            /// <summary>
+            /// 尺範囲の設定として妥当か検証する（録画前チェック用）。
+            /// </summary>
+            public bool ValidateRange(out string errorMessage)
+            {
+                errorMessage = string.Empty;
+                if (!useCustomRange)
+                    return true;
+
+                if (rangeStartFrame < 0)
+                {
+                    errorMessage = "尺範囲の開始フレームが負の値です。";
+                    return false;
+                }
+                if (rangeEndFrame < rangeStartFrame)
+                {
+                    errorMessage = $"尺範囲の終了フレーム({rangeEndFrame})が開始フレーム({rangeStartFrame})より前です。";
+                    return false;
+                }
+                return true;
+            }
             
             /// <summary>
             /// 設定をクローン
@@ -120,7 +199,11 @@ namespace Unity.MultiTimelineRecorder
                     width = this.width,
                     height = this.height,
                     frameRate = this.frameRate,
-                    capFrameRate = this.capFrameRate
+                    capFrameRate = this.capFrameRate,
+                    useCustomRange = this.useCustomRange,
+                    rangeUnit = this.rangeUnit,
+                    rangeStartFrame = this.rangeStartFrame,
+                    rangeEndFrame = this.rangeEndFrame
                 };
                 
                 // 各設定のクローン
@@ -207,7 +290,10 @@ namespace Unity.MultiTimelineRecorder
                     errorMessage = "Frame rate must be between 1 and 120";
                     return false;
                 }
-                
+
+                if (!ValidateRange(out errorMessage))
+                    return false;
+
                 // レコーダータイプ固有の検証
                 switch (recorderType)
                 {
