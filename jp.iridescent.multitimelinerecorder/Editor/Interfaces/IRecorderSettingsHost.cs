@@ -31,6 +31,8 @@ namespace Unity.MultiTimelineRecorder
         RecorderRangeUnit rangeUnit { get; set; }
         int rangeStartFrame { get; set; }
         int rangeEndFrame { get; set; }
+        bool skipBeforeRange { get; set; }
+        int leadInFrames { get; set; }
         string cameraTag { get; set; }
         OutputResolution outputResolution { get; set; }
         

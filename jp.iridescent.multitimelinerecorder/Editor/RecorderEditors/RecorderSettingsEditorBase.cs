@@ -173,6 +173,49 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                 $"→ {frameCount} frames / {frameCount / (float)fps:F2}s" +
                 $"  ({host.rangeStartFrame / (float)fps:F2}s 〜 {(host.rangeEndFrame + 1) / (float)fps:F2}s)",
                 EditorStyles.miniLabel);
+
+            // 前尺スキップ（録画範囲の手前から再生を始め、それより前は再生しない）
+            EditorGUILayout.Space(3);
+            host.skipBeforeRange = EditorGUILayout.Toggle(
+                new GUIContent("Skip Before Range",
+                    "録画範囲より前の再生（前尺）をスキップし、下の助走ぶんだけ手前から再生する。長い前尺の再生待ちが無くなる"),
+                host.skipBeforeRange);
+
+            if (!host.skipBeforeRange)
+            {
+                EditorGUILayout.LabelField(" ", "Timeline の先頭から再生します（録画は上の範囲のみ）", EditorStyles.miniLabel);
+                return;
+            }
+
+            EditorGUI.indentLevel++;
+            if (host.rangeUnit == RecorderRangeUnit.Frames)
+            {
+                host.leadInFrames = Mathf.Max(0, EditorGUILayout.IntField(
+                    new GUIContent("Lead-in (frames)",
+                        "録画開始の何フレーム前から再生を始めるか。布・パーティクル等を落ち着かせる助走で、この区間は録画されない"),
+                    host.leadInFrames));
+            }
+            else
+            {
+                float leadSec = Mathf.Max(0f, EditorGUILayout.FloatField(
+                    new GUIContent("Lead-in (s)",
+                        "録画開始の何秒前から再生を始めるか。布・パーティクル等を落ち着かせる助走で、この区間は録画されない"),
+                    host.leadInFrames / (float)fps));
+                host.leadInFrames = Mathf.Max(0, Mathf.RoundToInt(leadSec * fps));
+            }
+
+            int playbackStartFrame = Mathf.Max(0, host.rangeStartFrame - host.leadInFrames);
+            int skippedFrames = playbackStartFrame;
+            EditorGUILayout.LabelField(" ",
+                $"→ 再生は frame {playbackStartFrame} ({playbackStartFrame / (float)fps:F2}s) から" +
+                (skippedFrames > 0 ? $"（前尺 {skippedFrames} frames / {skippedFrames / (float)fps:F2}s をスキップ）" : "（先頭から）"),
+                EditorStyles.miniLabel);
+
+            EditorGUILayout.HelpBox(
+                "同じ Timeline の有効なレコーダーが全て Skip 設定のときだけ前尺をスキップします。" +
+                "1 つでも全体録画のレコーダーがあると、その絵が必要なため先頭から再生されます（録画範囲は各レコーダーの指定どおり）。",
+                MessageType.Info);
+            EditorGUI.indentLevel--;
         }
         
         /// <summary>

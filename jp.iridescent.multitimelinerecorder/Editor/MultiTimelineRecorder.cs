@@ -4071,6 +4071,8 @@ namespace Unity.MultiTimelineRecorder
             public RecorderRangeUnit rangeUnit { get => item.rangeUnit; set => item.rangeUnit = value; }
             public int rangeStartFrame { get => item.rangeStartFrame; set => item.rangeStartFrame = value; }
             public int rangeEndFrame { get => item.rangeEndFrame; set => item.rangeEndFrame = value; }
+            public bool skipBeforeRange { get => item.skipBeforeRange; set => item.skipBeforeRange = value; }
+            public int leadInFrames { get => item.leadInFrames; set => item.leadInFrames = value; }
 
             // Use global settings where applicable, item-specific otherwise
             public int frameRate { get => renderer.frameRate; set => renderer.frameRate = value; }

@@ -224,6 +224,8 @@ namespace Unity.MultiTimelineRecorder
             public RecorderRangeUnit rangeUnit { get => RecorderRangeUnit.Frames; set { } }
             public int rangeStartFrame { get => 0; set { } }
             public int rangeEndFrame { get => 0; set { } }
+            public bool skipBeforeRange { get => false; set { } }
+            public int leadInFrames { get => 0; set { } }
 
             public int frameRate { get => config.frameRate; set => config.frameRate = value; }
             public int width { get => config.width; set => config.width = value; }

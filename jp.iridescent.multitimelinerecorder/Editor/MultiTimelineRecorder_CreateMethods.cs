@@ -138,7 +138,10 @@ namespace Unity.MultiTimelineRecorder
                             MultiTimelineRecorderLogger.LogWarning($"[MultiTimelineRecorder] SignalEmitter timing not found for {director.gameObject.name}, using full timeline duration");
                         }
                     }
-                    
+
+                    // 再生窓（Pre-roll と本クリップの両方がこの窓を基準にする）
+                    var playbackWindow = ResolveSectionPlaybackWindow(director, originalTimeline, signalEmitterRange, oneFrameDuration);
+
                     // Add pre-roll for each timeline if enabled
                     if (preRollFrames > 0)
                     {
@@ -165,15 +168,14 @@ namespace Unity.MultiTimelineRecorder
                         preRollAsset.active = true;
                         preRollAsset.postPlayback = ActivationControlPlayable.PostPlaybackState.Active;
                         
-                        // SignalEmitterの場合、Pre-Rollの開始位置を調整
-                        if (signalEmitterRange.HasValue)
+                        // Pre-Roll の開始位置は再生窓の先頭を基準にする
+                        // （SignalEmitter 範囲・前尺スキップのどちらでも窓の手前から助走させる）
+                        if (playbackWindow.clipIn > 0.0)
                         {
-                            // SignalEmitterの開始位置に合わせてPre-Rollクリップを調整
-                            // Pre-RollはSignalEmitterの開始タイミングから逆算した位置から開始
-                            double preRollStartTime = Math.Max(0, signalEmitterRange.Value.startTime - preRollTime);
+                            double preRollStartTime = Math.Max(0, playbackWindow.clipIn - preRollTime);
                             preRollClip.clipIn = preRollStartTime;
                             preRollClip.timeScale = 1.0; // 通常再生
-                            MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Pre-roll adjusted for SignalEmitter: clipIn={preRollStartTime:F2}s");
+                            MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Pre-roll adjusted to playback window: clipIn={preRollStartTime:F2}s");
                         }
                         else
                         {
@@ -196,19 +198,16 @@ namespace Unity.MultiTimelineRecorder
                     
                     controlClip.displayName = director.gameObject.name;
                     controlClip.start = currentStartTime;
-                    
-                    // SignalEmitter設定によるクリップのクロップ
-                    if (signalEmitterRange.HasValue)
+
+                    // 再生窓は RecorderClip 側（CreateRecorderTracksForMultipleTimelines）と
+                    // 同じヘルパーで解決済み。2 つのループが同じ窓を前提にすることを保証する
+                    controlClip.clipIn = playbackWindow.clipIn;
+                    controlClip.duration = playbackWindow.duration;
+                    if (playbackWindow.skippedLeadIn)
                     {
-                        // SignalEmitterの開始時刻に合わせてクリップをクロップ
-                        // controlClip.startはそのままで、clipInを設定して開始位置を調整
-                        controlClip.clipIn = signalEmitterRange.Value.startTime;
-                        controlClip.duration = signalEmitterRange.Value.duration;
-                    }
-                    else
-                    {
-                        // SignalEmitterが見つからない場合は従来通り
-                        controlClip.duration = originalTimeline.duration + oneFrameDuration;
+                        MultiTimelineRecorderLogger.Log(
+                            $"[MultiTimelineRecorder] {director.gameObject.name}: 前尺をスキップして {playbackWindow.clipIn:F2}s から再生します" +
+                            $"（再生 {playbackWindow.duration:F2}s / Timeline 全長 {originalTimeline.duration:F2}s）");
                     }
                     
                     var controlAsset = controlClip.asset as ControlPlayableAsset;
@@ -272,6 +271,29 @@ namespace Unity.MultiTimelineRecorder
             }
         }
         
+        /// <summary>
+        /// このセクションを結合 Timeline 上でどこからどれだけ再生するかを解決する。
+        /// ControlClip を作る側と RecorderClip を作る側の両方から呼ばれ、
+        /// 2 つのループが同一の窓を前提にすることを保証する（ズレると録画位置が破綻する）。
+        /// </summary>
+        private SectionPlaybackWindow ResolveSectionPlaybackWindow(
+            PlayableDirector director, TimelineAsset originalTimeline,
+            RecordingRange? signalEmitterRange, float oneFrameDuration)
+        {
+            double fullDuration = originalTimeline.duration + oneFrameDuration;
+
+            int timelineIndex = recordingQueueDirectors.IndexOf(director);
+            var config = timelineIndex >= 0 ? GetTimelineRecorderConfig(timelineIndex) : null;
+            var enabledItems = config != null ? config.GetEnabledRecorders() : null;
+
+            return MultiRecorderConfig.ResolvePlaybackWindow(
+                enabledItems,
+                fullDuration,
+                frameRate,
+                signalEmitterRange?.startTime,
+                signalEmitterRange?.duration);
+        }
+
         private TimelineAsset CreateRecorderTracksForMultipleTimelines(TimelineAsset timeline, List<PlayableDirector> directors, float preRollTime, float oneFrameDuration)
         {
             // Create recorder tracks for each timeline segment
@@ -314,9 +336,9 @@ namespace Unity.MultiTimelineRecorder
                 
                 MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Timeline {i+1}/{directors.Count}: currentStartTime={currentStartTime:F2}s, actualRecordingStartTime={actualRecordingStartTime:F2}s, preRollTime={preRollTime:F2}s");
                 
-                float timelineDuration = signalEmitterRange.HasValue 
-                    ? (float)signalEmitterRange.Value.duration 
-                    : (float)originalTimeline.duration + oneFrameDuration;
+                // ControlClip 側と同じヘルパーで再生窓を解決する（窓がズレると録画位置が破綻する）
+                var playbackWindow = ResolveSectionPlaybackWindow(director, originalTimeline, signalEmitterRange, oneFrameDuration);
+                float timelineDuration = (float)playbackWindow.duration;
                 
                 // Find the timeline index in the selected directors list
                 int timelineIndex = recordingQueueDirectors.IndexOf(director);
@@ -398,12 +420,16 @@ namespace Unity.MultiTimelineRecorder
                         var customRange = recorderItem.ResolveRange(originalTimeline.duration, frameRate);
                         if (customRange.HasValue)
                         {
-                            recorderClip.start = actualRecordingStartTime + customRange.Value.StartTime(frameRate);
+                            // 範囲の位置は「再生窓の先頭からの相対」に直す。前尺スキップで窓が
+                            // 切り詰められている場合、その分だけクリップを手前へ寄せる必要がある
+                            double offsetInWindow = customRange.Value.StartTime(frameRate) - playbackWindow.clipIn;
+                            recorderClip.start = actualRecordingStartTime + System.Math.Max(0.0, offsetInWindow);
                             recorderClip.duration = customRange.Value.Duration(frameRate);
                             MultiTimelineRecorderLogger.Log(
                                 $"[MultiTimelineRecorder] RecorderClip for {director.gameObject.name} / {recorderItem.name} uses custom range: " +
                                 $"frames {customRange.Value.startFrame}-{customRange.Value.endFrame} " +
-                                $"(Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s)");
+                                $"(Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s" +
+                                (playbackWindow.skippedLeadIn ? $", 再生窓 {playbackWindow.clipIn:F2}s 起点" : "") + ")");
                         }
                         // SignalEmitter設定によるRecorderClipの同期 (TODO-282)
                         else if (useSignalEmitterTiming)
@@ -927,22 +953,25 @@ namespace Unity.MultiTimelineRecorder
                 // Add one frame to ensure the last frame is included
                 float oneFrameDuration = 1.0f / frameRate;
                 
-                // SignalEmitter設定によるクリップのクロップ (TODO-282)
+                // 再生窓を解決（尺範囲＋前尺スキップ、または SignalEmitter 範囲）
+                var singlePlaybackWindow = ResolveSectionPlaybackWindow(originalDirector, originalTimeline, signalEmitterRange, oneFrameDuration);
+                controlClip.clipIn = singlePlaybackWindow.clipIn;
+                controlClip.duration = singlePlaybackWindow.duration;
+
                 if (signalEmitterRange.HasValue)
                 {
-                    // SignalEmitterの開始時刻に合わせてクリップをクロップ
-                    controlClip.clipIn = signalEmitterRange.Value.startTime;
-                    controlClip.duration = signalEmitterRange.Value.duration;
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] 🎯 SignalEmitter Recording: Single Timeline -> {startTimingName}({signalEmitterRange.Value.startTime:F2}s) to {endTimingName}({signalEmitterRange.Value.endTime:F2}s) [Duration: {signalEmitterRange.Value.duration:F2}s]");
                 }
-                else
+                else if (useSignalEmitterTiming)
                 {
-                    // SignalEmitterが見つからない場合は従来通り
-                    controlClip.duration = originalTimeline.duration + oneFrameDuration;
-                    if (useSignalEmitterTiming)
-                    {
-                        MultiTimelineRecorderLogger.LogWarning($"[MultiTimelineRecorder] SignalEmitter timing not found, using full timeline duration");
-                    }
+                    MultiTimelineRecorderLogger.LogWarning($"[MultiTimelineRecorder] SignalEmitter timing not found, using full timeline duration");
+                }
+
+                if (singlePlaybackWindow.skippedLeadIn)
+                {
+                    MultiTimelineRecorderLogger.Log(
+                        $"[MultiTimelineRecorder] 前尺をスキップして {singlePlaybackWindow.clipIn:F2}s から再生します" +
+                        $"（再生 {singlePlaybackWindow.duration:F2}s / Timeline 全長 {originalTimeline.duration:F2}s）");
                 }
                 
                 var controlAsset = controlClip.asset as ControlPlayableAsset;
@@ -1200,12 +1229,24 @@ namespace Unity.MultiTimelineRecorder
             var customRange = recorderItem.ResolveRange(originalTimeline.duration, frameRate);
             if (customRange.HasValue)
             {
-                recorderClip.start = preRollTime + customRange.Value.StartTime(frameRate);
+                // ControlClip と同じ窓を基準に、窓先頭からの相対位置へ直す
+                // （SignalEmitter 範囲も ControlClip 側と同条件で解決する）
+                RecordingRange? windowSignalRange = null;
+                if (useSignalEmitterTiming)
+                {
+                    var r = SignalEmitterRecordControl.GetRecordingRangeFromSignalsWithFallback(
+                        originalTimeline, startTimingName, endTimingName, true);
+                    if (r.isValid) windowSignalRange = r;
+                }
+                var window = ResolveSectionPlaybackWindow(originalDirector, originalTimeline, windowSignalRange, oneFrameDuration);
+                double offsetInWindow = customRange.Value.StartTime(frameRate) - window.clipIn;
+                recorderClip.start = preRollTime + System.Math.Max(0.0, offsetInWindow);
                 recorderClip.duration = customRange.Value.Duration(frameRate);
                 MultiTimelineRecorderLogger.Log(
                     $"[MultiTimelineRecorder] RecorderClip for {recorderItem.name} uses custom range: " +
                     $"frames {customRange.Value.startFrame}-{customRange.Value.endFrame} " +
-                    $"(Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s)");
+                    $"(Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s" +
+                    (window.skippedLeadIn ? $", 再生窓 {window.clipIn:F2}s 起点" : "") + ")");
             }
             // SignalEmitter設定によるRecorderClipの同期 (TODO-282)
             else if (useSignalEmitterTiming)

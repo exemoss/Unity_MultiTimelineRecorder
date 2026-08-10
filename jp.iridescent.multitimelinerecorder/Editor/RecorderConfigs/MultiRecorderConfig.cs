@@ -48,6 +48,22 @@ namespace Unity.MultiTimelineRecorder
     }
 
     /// <summary>
+    /// セクション（1 本の Timeline）を結合 Timeline 上でどこからどれだけ再生するか。
+    /// ControlClip の clipIn / duration にそのまま対応する。
+    /// </summary>
+    public struct SectionPlaybackWindow
+    {
+        /// <summary>元 Timeline 上の再生開始位置（秒）</summary>
+        public double clipIn;
+        /// <summary>再生する長さ（秒）</summary>
+        public double duration;
+        /// <summary>前尺スキップが実際に効いたか（ログ・UI 用）</summary>
+        public bool skippedLeadIn;
+
+        public double ClipOut => clipIn + duration;
+    }
+
+    /// <summary>
     /// 複数のレコーダー設定を管理するためのコンフィグクラス
     /// </summary>
     [Serializable]
@@ -136,6 +152,12 @@ namespace Unity.MultiTimelineRecorder
             [Tooltip("録画終了フレーム（このフレームを含む）")]
             public int rangeEndFrame = 0;
 
+            [Tooltip("録画範囲より前の再生（前尺）をスキップし、助走ぶんだけ手前から再生する")]
+            public bool skipBeforeRange = false;
+
+            [Tooltip("録画開始の何フレーム前から再生を始めるか。布・パーティクル等を落ち着かせる助走で、この区間は録画されない")]
+            public int leadInFrames = 0;
+
             /// <summary>
             /// この録画で使う尺範囲を解決する。<paramref name="timelineDuration"/> は
             /// 対象 Timeline の尺（秒）で、範囲はこの中にクランプされる。
@@ -173,6 +195,11 @@ namespace Unity.MultiTimelineRecorder
                     errorMessage = $"尺範囲の終了フレーム({rangeEndFrame})が開始フレーム({rangeStartFrame})より前です。";
                     return false;
                 }
+                if (skipBeforeRange && leadInFrames < 0)
+                {
+                    errorMessage = "前尺スキップの助走フレーム数が負の値です。";
+                    return false;
+                }
                 return true;
             }
             
@@ -203,7 +230,9 @@ namespace Unity.MultiTimelineRecorder
                     useCustomRange = this.useCustomRange,
                     rangeUnit = this.rangeUnit,
                     rangeStartFrame = this.rangeStartFrame,
-                    rangeEndFrame = this.rangeEndFrame
+                    rangeEndFrame = this.rangeEndFrame,
+                    skipBeforeRange = this.skipBeforeRange,
+                    leadInFrames = this.leadInFrames
                 };
                 
                 // 各設定のクローン
@@ -333,6 +362,74 @@ namespace Unity.MultiTimelineRecorder
         public string globalOutputPath = "Recordings";
         public bool useGlobalResolution = true;
         
+        /// <summary>
+        /// このセクションの再生窓を決める。
+        ///
+        /// 既定は「Timeline 全体（SignalEmitter 使用時はその範囲）を再生」。
+        /// 有効なレコーダーが **すべて** 前尺スキップ付きの尺範囲を持つ場合だけ、
+        /// 各レコーダーが必要とする区間の和集合まで再生窓を切り詰める
+        /// （1 つでも全体録画のレコーダーがあれば、その分の絵が必要なので切り詰められない）。
+        ///
+        /// 録画されるのはあくまで各 RecorderClip の区間で、助走（lead-in）区間は
+        /// 再生されるだけで録画されない。
+        /// </summary>
+        public static SectionPlaybackWindow ResolvePlaybackWindow(
+            IEnumerable<RecorderConfigItem> enabledItems,
+            double timelineDuration,
+            double frameRate,
+            double? signalStartTime = null,
+            double? signalDuration = null)
+        {
+            var fallback = new SectionPlaybackWindow
+            {
+                clipIn = signalStartTime ?? 0.0,
+                duration = signalDuration ?? timelineDuration,
+                skippedLeadIn = false,
+            };
+
+            if (enabledItems == null || frameRate <= 0)
+                return fallback;
+
+            double windowStart = double.MaxValue;
+            double windowEnd = double.MinValue;
+            int considered = 0;
+
+            foreach (var item in enabledItems)
+            {
+                if (item == null)
+                    continue;
+
+                // 1 つでも「範囲指定なし」or「前尺スキップなし」があれば切り詰められない
+                if (!item.useCustomRange || !item.skipBeforeRange)
+                    return fallback;
+
+                var range = item.ResolveRange(timelineDuration, frameRate);
+                if (!range.HasValue)
+                    return fallback;
+
+                double leadIn = Math.Max(0, item.leadInFrames) / frameRate;
+                double start = Math.Max(0.0, range.Value.StartTime(frameRate) - leadIn);
+                double end = range.Value.StartTime(frameRate) + range.Value.Duration(frameRate);
+
+                windowStart = Math.Min(windowStart, start);
+                windowEnd = Math.Max(windowEnd, end);
+                considered++;
+            }
+
+            if (considered == 0)
+                return fallback;
+
+            windowStart = Math.Max(0.0, windowStart);
+            windowEnd = Math.Min(Math.Max(windowEnd, windowStart), timelineDuration);
+
+            return new SectionPlaybackWindow
+            {
+                clipIn = windowStart,
+                duration = Math.Max(0.0, windowEnd - windowStart),
+                skippedLeadIn = windowStart > 0.0,
+            };
+        }
+
         /// <summary>
         /// レコーダー設定のリストを取得
         /// </summary>
