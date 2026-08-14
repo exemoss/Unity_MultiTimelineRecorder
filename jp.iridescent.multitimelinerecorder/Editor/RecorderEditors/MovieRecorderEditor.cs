@@ -34,6 +34,17 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     {
                         EditorGUILayout.HelpBox("Please assign a target camera.", MessageType.Warning);
                     }
+                    host.captureUI = EditorGUILayout.Toggle(
+                        new GUIContent("Capture UI",
+                            "画面に重ねている UI（Screen Space - Overlay の Canvas）を録画に含める。" +
+                            "Overlay はカメラを経由せず画面へ直接描かれるため、OFF だと画面で見えている UI が録画に写らない"),
+                        host.captureUI);
+                    if (host.captureUI)
+                    {
+                        EditorGUILayout.HelpBox(
+                            "録画中だけ、対象カメラと同じ Display の Overlay Canvas をカメラ経由描画へ切り替えます（終了時に元へ戻します）。",
+                            MessageType.Info);
+                    }
                     break;
                     
                 case ImageRecorderSourceType.RenderTexture:

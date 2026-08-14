@@ -116,6 +116,11 @@ namespace Unity.MultiTimelineRecorder
             
             // RenderTextureは通常アセット参照なので、そのまま保持
             public RenderTexture imageRenderTexture = null;
+
+            [Tooltip("画面に重ねている UI（Screen Space - Overlay の Canvas）を録画に含めるか。" +
+                     "Target Camera ソースのみ有効。Overlay はカメラを経由せず画面へ直接描かれるため、" +
+                     "OFF だと画面に見えている UI が録画に写らない")]
+            public bool captureUI = false;
             
             // Movie Recorder
             public MovieRecorderSettingsConfig movieConfig = new MovieRecorderSettingsConfig();
@@ -223,6 +228,7 @@ namespace Unity.MultiTimelineRecorder
                     exrCompression = this.exrCompression,
                     imageSourceType = this.imageSourceType,
                     imageRenderTexture = this.imageRenderTexture,
+                    captureUI = this.captureUI,
                     width = this.width,
                     height = this.height,
                     frameRate = this.frameRate,

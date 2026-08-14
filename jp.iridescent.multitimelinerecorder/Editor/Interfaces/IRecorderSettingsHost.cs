@@ -44,6 +44,7 @@ namespace Unity.MultiTimelineRecorder
         ImageRecorderSourceType imageSourceType { get; set; }
         Camera imageTargetCamera { get; set; }
         RenderTexture imageRenderTexture { get; set; }
+        bool captureUI { get; set; }
         
         // Movie settings
         MovieRecorderSettings.VideoRecorderOutputFormat movieOutputFormat { get; set; }

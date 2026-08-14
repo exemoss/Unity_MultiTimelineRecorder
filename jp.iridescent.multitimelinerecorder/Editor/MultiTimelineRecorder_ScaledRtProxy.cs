@@ -41,6 +41,7 @@ namespace Unity.MultiTimelineRecorder
             /// <summary>カメラの GameObject 名（PlayMode 側で名前解決する）</summary>
             public string cameraName;
             public string rtGuid;
+            public bool captureUI;
         }
 
         [Serializable]
@@ -84,6 +85,7 @@ namespace Unity.MultiTimelineRecorder
                 {
                     cameraName = camera.name,
                     rtGuid = AssetDatabase.AssetPathToGUID(assetPath),
+                    captureUI = item.captureUI,
                 });
                 EditorPrefs.SetString(CameraRtBindingsPrefKey, JsonUtility.ToJson(list));
 
@@ -122,9 +124,13 @@ namespace Unity.MultiTimelineRecorder
                         $"[MultiTimelineRecorder] Target Camera の解決に失敗 (camera='{binding.cameraName}', rt={binding.rtGuid})");
                     continue;
                 }
+                // フィールド設定前に OnEnable が走るため、設定後に有効化し直して束縛させる
                 var binder = go.AddComponent<CameraTargetTextureBinder>();
+                binder.enabled = false;
                 binder.targetCamera = camera;
                 binder.renderTexture = rt;
+                binder.captureUI = binding.captureUI;
+                binder.enabled = true;
                 wired++;
             }
             MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Target Camera バインドを {wired} 件作成しました");
