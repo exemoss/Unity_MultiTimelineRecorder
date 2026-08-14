@@ -7,6 +7,16 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [2.1.0] - 2026-08-06
+
+### Added
+- "Capture UI" option for Target Camera recordings. Screen Space - Overlay
+  canvases draw straight to the display and never pass through a camera, so
+  UI that is visible on screen was missing from the recorded file. With the
+  option on, canvases on the same display as the target camera are switched
+  to Screen Space - Camera for the duration of the recording (and restored
+  afterwards), so they end up in the output. Off by default.
+
 ## [2.0.0] - 2026-08-06
 
 ### Fixed (breaking: output changes for existing Target Camera setups)
