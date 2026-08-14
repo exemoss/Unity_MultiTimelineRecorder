@@ -2167,6 +2167,9 @@ namespace Unity.MultiTimelineRecorder
                     // RT スケーリングプロキシの Blitter を作成(録画準備時に作られたペアがあれば)
                     CreateScaledRtBlittersInPlayMode();
 
+                    // Target Camera の描画先を一時 RT へ差し替える
+                    CreateCameraRtBindersInPlayMode();
+
                     // PlayModeTimelineRenderer GameObjectを作成
                     var rendererGO = new GameObject("[PlayModeTimelineRenderer]");
                     var renderer = rendererGO.AddComponent<PlayModeTimelineRenderer>();
@@ -3622,6 +3625,9 @@ namespace Unity.MultiTimelineRecorder
 
             // クリーンアップ: RT スケーリングプロキシ(Blitter GO + 一時 RT アセット)
             CleanupScaledRtProxies();
+
+            // クリーンアップ: Target Camera の描画先復元 + 一時 RT アセット削除
+            CleanupCameraRtBindings();
             
             // EditorPrefsのクリーンアップ
             EditorPrefs.DeleteKey("STR_DirectorName");

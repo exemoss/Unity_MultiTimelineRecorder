@@ -7,6 +7,28 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [2.0.0] - 2026-08-06
+
+### Fixed (breaking: output changes for existing Target Camera setups)
+- "Target Camera" now actually records the camera you selected. It never did:
+  `CameraInputSettings` has no way to point at a specific camera (only
+  ActiveCamera / MainCamera / TaggedCamera), and the old code tried to assign a
+  non-existent `Camera` property by reflection, silently failed, and recorded
+  Unity Recorder's default camera instead. Any existing recorder using Target
+  Camera was producing footage from a different camera than the one shown in the
+  UI — hence the MAJOR bump, even though this is a fix.
+- The camera is now recorded by temporarily redirecting its output into a
+  managed RenderTexture and recording that. This works for cameras rendering to
+  any display, so a switcher Program camera on Display 2 can finally be
+  recorded. The camera's original `targetTexture` is restored when recording
+  ends, and the temporary RenderTexture asset is deleted.
+- Output resolution follows the recorder's Resolution setting (the RT is created
+  at that size), and the existing scaling/alpha/BT.709 paths apply as usual.
+
+> Distributed rendering (Worker) still cannot target a specific camera —
+> Unity Recorder offers no API for it there. The shared builder now warns
+> explicitly instead of pretending the camera was applied.
+
 ## [1.8.0] - 2026-08-06
 
 ### Added

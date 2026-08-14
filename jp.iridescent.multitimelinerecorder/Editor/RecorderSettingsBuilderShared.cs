@@ -431,14 +431,16 @@ namespace Unity.MultiTimelineRecorder
                             FlipFinalOutput = false,
                             CaptureUI       = false
                         };
-                        var cameraProp = camInput.GetType().GetProperty("Camera")
-                                      ?? camInput.GetType().GetProperty("camera");
-                        if (cameraProp != null && cameraProp.CanWrite)
-                            cameraProp.SetValue(camInput, resolvedCamera);
-                        else
-                            Debug.LogWarning(
-                                $"{logPrefix} CameraInputSettings.Camera property not found. " +
-                                "The camera may not be set correctly.");
+                        // Recorder の CameraInputSettings は ActiveCamera / MainCamera /
+                        // TaggedCamera しか選べず、任意のカメラを指定する API が無い。
+                        // ローカル録画経路（MultiTimelineRecorder）は、この後に
+                        // 対象カメラを描画させる一時 RT の入力へ差し替えることで実現している。
+                        // 差し替えが行われない経路（分散 Worker 等）では対象カメラは反映されず、
+                        // Recorder 既定のカメラが録画される点に注意。
+                        Debug.LogWarning(
+                            $"{logPrefix} Unity Recorder はカメラを直接指定できないため、" +
+                            $"この入力だけでは '{resolvedCamera.name}' は録画されません" +
+                            "（ローカル録画経路では一時 RT へ差し替えて対応します）。");
                         return camInput;
                     }
                     else

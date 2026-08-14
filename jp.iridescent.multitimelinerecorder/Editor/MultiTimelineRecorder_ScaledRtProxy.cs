@@ -19,6 +19,8 @@ namespace Unity.MultiTimelineRecorder
         private const string ScaledRtProxyFolder = "Assets/MultiTimelineRecorder/Temp/ScaledRT";
         private const string ScaledRtPairsPrefKey = "STR_ScaledRtProxyPairs";
         private const string ScaledRtBlitterGoName = "[MTR ScaledRtBlitter]";
+        private const string CameraRtBindingsPrefKey = "STR_CameraRtBindings";
+        private const string CameraRtBinderGoName = "[MTR CameraRtBinder]";
 
         [Serializable]
         private class ScaledRtPair
@@ -31,6 +33,138 @@ namespace Unity.MultiTimelineRecorder
         private class ScaledRtPairList
         {
             public List<ScaledRtPair> pairs = new List<ScaledRtPair>();
+        }
+
+        [Serializable]
+        private class CameraRtBinding
+        {
+            /// <summary>カメラの GameObject 名（PlayMode 側で名前解決する）</summary>
+            public string cameraName;
+            public string rtGuid;
+        }
+
+        [Serializable]
+        private class CameraRtBindingList
+        {
+            public List<CameraRtBinding> bindings = new List<CameraRtBinding>();
+        }
+
+        /// <summary>
+        /// Target Camera ソースの録画で Recorder に渡す RenderTexture を用意する。
+        ///
+        /// Unity Recorder の CameraInputSettings は ActiveCamera / MainCamera / TaggedCamera しか
+        /// 選べず、任意のカメラを指定する手段が無い（MTR の従来実装は存在しない
+        /// "Camera" プロパティへリフレクション代入しようとして黙って失敗し、
+        /// 実際には MainCamera が録画されていた）。
+        /// そこで対象カメラの描画先を一時 RT に差し替え、その RT を録画する。
+        /// targetDisplay が Display 2 以降のカメラ（スイッチャーの Program 出力等）も録れる。
+        /// </summary>
+        private RenderTexture ResolveCameraRenderTextureForRecording(MultiRecorderConfig.RecorderConfigItem item)
+        {
+            var camera = item.imageTargetCamera;
+            if (item.imageSourceType != ImageRecorderSourceType.TargetCamera || camera == null)
+                return null;
+
+            int width = Mathf.Max(2, item.width) & ~1;
+            int height = Mathf.Max(2, item.height) & ~1;
+
+            try
+            {
+                EnsureScaledRtProxyFolder();
+
+                // カメラの描画先なのでデプスバッファが要る（Blit 用プロキシと違う点）
+                var rt = new RenderTexture(width, height, 24, UnityEngine.Experimental.Rendering.GraphicsFormat.R8G8B8A8_SRGB);
+                rt.name = $"{camera.name}_cam_{width}x{height}";
+                string assetPath = AssetDatabase.GenerateUniqueAssetPath(
+                    $"{ScaledRtProxyFolder}/{rt.name}.renderTexture");
+                AssetDatabase.CreateAsset(rt, assetPath);
+
+                var list = LoadCameraRtBindings();
+                list.bindings.Add(new CameraRtBinding
+                {
+                    cameraName = camera.name,
+                    rtGuid = AssetDatabase.AssetPathToGUID(assetPath),
+                });
+                EditorPrefs.SetString(CameraRtBindingsPrefKey, JsonUtility.ToJson(list));
+
+                MultiTimelineRecorderLogger.Log(
+                    $"[MultiTimelineRecorder] Target Camera '{camera.name}' (Display {camera.targetDisplay + 1}) を " +
+                    $"{width}x{height} の一時 RT へ描画して録画します");
+                return rt;
+            }
+            catch (Exception ex)
+            {
+                MultiTimelineRecorderLogger.LogWarning(
+                    $"[MultiTimelineRecorder] Target Camera 用 RT の作成に失敗しました: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// PlayMode 突入後に呼ぶ。登録済みのカメラ→RT 割り当てを実行する。
+        /// </summary>
+        private static void CreateCameraRtBindersInPlayMode()
+        {
+            var list = LoadCameraRtBindings();
+            if (list.bindings.Count == 0)
+                return;
+
+            var go = new GameObject(CameraRtBinderGoName);
+            int wired = 0;
+            foreach (var binding in list.bindings)
+            {
+                var rt = AssetDatabase.LoadAssetAtPath<RenderTexture>(AssetDatabase.GUIDToAssetPath(binding.rtGuid));
+                var cameraGo = GameObject.Find(binding.cameraName);
+                var camera = cameraGo != null ? cameraGo.GetComponent<Camera>() : null;
+                if (camera == null || rt == null)
+                {
+                    MultiTimelineRecorderLogger.LogWarning(
+                        $"[MultiTimelineRecorder] Target Camera の解決に失敗 (camera='{binding.cameraName}', rt={binding.rtGuid})");
+                    continue;
+                }
+                var binder = go.AddComponent<CameraTargetTextureBinder>();
+                binder.targetCamera = camera;
+                binder.renderTexture = rt;
+                wired++;
+            }
+            MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Target Camera バインドを {wired} 件作成しました");
+        }
+
+        /// <summary>
+        /// カメラ→RT 割り当ての後始末（Binder GameObject が元の targetTexture を復元する）。
+        /// </summary>
+        private static void CleanupCameraRtBindings()
+        {
+            var binderGo = GameObject.Find(CameraRtBinderGoName);
+            if (binderGo != null)
+                DestroyImmediate(binderGo); // OnDisable/OnDestroy で targetTexture が戻る
+
+            var list = LoadCameraRtBindings();
+            foreach (var binding in list.bindings)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(binding.rtGuid);
+                if (!string.IsNullOrEmpty(path))
+                    AssetDatabase.DeleteAsset(path);
+            }
+            EditorPrefs.DeleteKey(CameraRtBindingsPrefKey);
+        }
+
+        private static CameraRtBindingList LoadCameraRtBindings()
+        {
+            string json = EditorPrefs.GetString(CameraRtBindingsPrefKey, string.Empty);
+            if (string.IsNullOrEmpty(json))
+                return new CameraRtBindingList();
+            try
+            {
+                var list = JsonUtility.FromJson<CameraRtBindingList>(json);
+                if (list == null) return new CameraRtBindingList();
+                list.bindings ??= new List<CameraRtBinding>();
+                return list;
+            }
+            catch
+            {
+                return new CameraRtBindingList();
+            }
         }
 
         /// <summary>

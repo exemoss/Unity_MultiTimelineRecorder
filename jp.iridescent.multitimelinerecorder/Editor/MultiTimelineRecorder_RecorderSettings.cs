@@ -327,6 +327,27 @@ namespace Unity.MultiTimelineRecorder
                 outputFile,
                 fallbackToGameViewOnMissingRef: true);
 
+            // Target Camera は Recorder 側に任意カメラを渡す手段が無いため、
+            // 共有ビルダーが作った CameraInputSettings を、対象カメラを描画させる
+            // 一時 RT の入力へ差し替える（Movie 経路と同じ方式）
+            if (config.imageSourceType == ImageRecorderSourceType.TargetCamera && config.imageTargetCamera != null)
+            {
+                var cameraRt = ResolveCameraRenderTextureForRecording(config);
+                if (cameraRt != null)
+                {
+                    settings.imageInputSettings = new RenderTextureInputSettings
+                    {
+                        RenderTexture = cameraRt,
+                        FlipFinalOutput = false
+                    };
+                }
+                else
+                {
+                    MultiTimelineRecorderLogger.LogWarning(
+                        $"[MultiTimelineRecorder] Target camera '{config.imageTargetCamera.name}' 用の RT を用意できませんでした（'{config.name}'）");
+                }
+            }
+
             settings.name = "ImageRecorderSettings";
             return settings;
         }
@@ -371,20 +392,27 @@ namespace Unity.MultiTimelineRecorder
                     case ImageRecorderSourceType.TargetCamera:
                         if (config.imageTargetCamera != null)
                         {
-                            var cameraInputSettings = new CameraInputSettings
+                            // Recorder の CameraInputSettings は任意カメラを指定できないため、
+                            // 対象カメラの描画先を一時 RT に差し替えて、その RT を録画する
+                            // （Display 2 以降のカメラも録れる。詳細は ResolveCameraRenderTextureForRecording）
+                            var cameraRt = ResolveCameraRenderTextureForRecording(config);
+                            if (cameraRt != null)
                             {
-                                OutputWidth = config.width,
-                                OutputHeight = config.height,
-                                FlipFinalOutput = false,
-                                CaptureUI = false
-                            };
-                            // Set the camera using the appropriate method or property
-                            var cameraProperty = cameraInputSettings.GetType().GetProperty("Camera") ?? cameraInputSettings.GetType().GetProperty("camera");
-                            if (cameraProperty != null)
-                            {
-                                cameraProperty.SetValue(cameraInputSettings, config.imageTargetCamera);
+                                settings.ImageInputSettings = new RenderTextureInputSettings
+                                {
+                                    RenderTexture = cameraRt,
+                                    FlipFinalOutput = false
+                                };
                             }
-                            settings.ImageInputSettings = cameraInputSettings;
+                            else
+                            {
+                                MultiTimelineRecorderLogger.LogWarning($"[MultiTimelineRecorder] Target camera '{config.imageTargetCamera.name}' 用の RT を用意できませんでした。Game View にフォールバックします。");
+                                settings.ImageInputSettings = new GameViewInputSettings
+                                {
+                                    OutputWidth = config.width,
+                                    OutputHeight = config.height
+                                };
+                            }
                         }
                         else
                         {
