@@ -7,6 +7,36 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [2.1.1] - 2026-08-14
+
+### Fixed
+- "Capture UI" now actually captures dynamically generated overlay UI. The
+  canvas scan used `FindObjectsByType`, which silently skips objects marked
+  `HideFlags.DontSave` — the standard flag for runtime-generated overlay UI —
+  so exactly the canvases the option was built for were never switched to
+  camera space and never appeared in the output. The scan now uses
+  `Resources.FindObjectsOfTypeAll` filtered to loaded-scene objects.
+- "Capture UI" text no longer degenerates into solid rectangles on telephoto
+  cameras. Hanging a Screen Space - Camera canvas off a camera with a
+  few-degree FOV shrinks the canvas to a ~1e-5 world scale, which breaks
+  TextMeshPro SDF rendering (images survive, text becomes filled boxes;
+  reproduced at 2.2° FOV, fine at 60°). Captured canvases are now rendered by
+  a dedicated normal-FOV camera into a transparent RT on a free unnamed layer
+  (excluded from the target camera and restored afterwards), then
+  alpha-composited onto the recording RT after frame rendering — the same
+  end-of-frame timing ScaledRenderTextureBlitter uses. URP's camera stack was
+  tried first but overlay cameras do not composite into a base camera's
+  RenderTexture output (verified empirically). With no free layer the old
+  direct binding is kept as a fallback.
+- `CameraTargetTextureBinder` no longer binds in Edit Mode. Binding before
+  entering Play Mode baked the redirected `targetTexture` into the scene's
+  play-mode snapshot; after the domain reload the binder re-captured that RT
+  as the "original" value, so cleanup restored the camera to a RenderTexture
+  that was then deleted — leaving the camera pointing at a dead RT and its
+  display (e.g. a Display 2 program monitor) black until the scene was
+  rebuilt. Binders created in Edit Mode now stay inert and only the play-mode
+  copy binds, so the camera's true original target is restored.
+
 ## [2.1.0] - 2026-08-06
 
 ### Added
