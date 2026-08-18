@@ -227,7 +227,22 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
             // Close FFmpeg subprocess.
             _subprocess.StandardInput.Close();
-            _subprocess.WaitForExit(_timeoutValue);
+
+            // ffmpeg は stdin の EOF を受けてからコンテナの終端処理（Matroska の cues 書き出し等）
+            // を行う。この所要時間は出力サイズに比例し、フレーム投入用の _timeoutValue(0.5 秒)
+            // ではまったく足りない（実測: VP9 7488x1344 / 3.85GB の webm で超過）。
+            // ここで待ち切らずに抜けると、Process.Close()/Dispose() は .NET 側のハンドルを
+            // 離すだけなので ffmpeg は出力ファイルを掴んだまま生き残る。すると後段の音声多重化
+            // (MtrFFmpegEncoder.PostProcessAudioRemuxing) が「ロックされている」と判断して諦め、
+            // 映像だけのファイルと音声だけの中間ファイルが残る（= 納品物に音が入らない）。
+            // 終端処理は進捗を観測できないため、パイプ用の短いタイムアウトとは分けて、
+            // 実用上の上限としての長い専用値で待つ。
+            if (!_subprocess.WaitForExit(_exitTimeoutValue))
+            {
+                Debug.LogWarning(
+                    $"ffmpeg が {_exitTimeoutValue / 1000} 秒以内に終了しませんでした。" +
+                    "出力ファイルが未完成、または音声の多重化に失敗する可能性があります。");
+            }
 
             _subprocess.Close();
             _subprocess.Dispose();
@@ -287,6 +302,11 @@ namespace Unity.MultiTimelineRecorder.Encoders
         Queue<byte[]> _pipeQueue = new Queue<byte[]>();
         Queue<byte[]> _freeBuffer = new Queue<byte[]>();
         int _timeoutValue = 500; // .5 sec
+
+        // ffmpeg プロセスの終了待ち専用の上限。_timeoutValue(0.5 秒)はフレーム投入の
+        // ping/pong 用で、コンテナ終端処理の待ちには短すぎるため分離している
+        // （通常は待たずに返るので、実質「異常時の最終安全弁」）
+        int _exitTimeoutValue = 600000; // 10 min
         // SyncFrameData() 1回あたりの累計待ち時間の上限（ffmpegが生きたまま異常に遅い/
         // 詰まっているケースの恒久ハング防止。mtr-nvenc-encoder イテレーション3で追加）。
         int _syncStallTimeoutMs = 60000; // 60 sec

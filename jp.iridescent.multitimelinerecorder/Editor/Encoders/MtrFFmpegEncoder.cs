@@ -179,9 +179,17 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
             Log($"Remux: video={videoFileName} audio={audioFileName} temp={backupFileName}");
 
-            if (IsFileLocked(videoFileName))
+            // ffmpeg の終了待ちは MtrFFmpegPipe 側で完了しているはずだが、OS のファイル
+            // ハンドル解放やウイルス対策ソフトのスキャンで一瞬掴まれ続けることがある。
+            // 単発判定で諦めると音声が入らないまま完了扱いになるので、少し待ち直す。
+            if (!WaitUntilFileUnlocked(videoFileName, RemuxUnlockTimeoutMs))
             {
-                Debug.LogError(videoFileName + " is locked can't mux audio");
+                // 音声は失われていない（audioFileName に分離保存されている）ので、
+                // 手作業で復旧できるだけの情報を必ず出す
+                Debug.LogError(
+                    $"{videoFileName} is locked can't mux audio（{RemuxUnlockTimeoutMs / 1000} 秒待機）。" +
+                    $"音声は {audioFileName} に分離保存されています。次のコマンドで再エンコードなしに結合できます:" +
+                    $" ffmpeg -i \"{videoFileName}\" -i \"{audioFileName}\" -c copy -map 0:v:0 -map 1:a:0 出力先");
                 return;
             }
 
@@ -240,6 +248,34 @@ namespace Unity.MultiTimelineRecorder.Encoders
 #if MTR_FFMPEG_ENCODER_TRACE_ENABLED
             Debug.Log("[MtrFFmpegEncoder]: " + log);
 #endif
+        }
+
+        // 出力ファイルのロックが外れるのを待つ上限とポーリング間隔。
+        // 上限は「Unity のメインスレッドを止めてよい実用的な長さ」で決めている
+        // （録画終了処理は元から同期実行なので、待ち自体は既存の挙動と同質）
+        const int RemuxUnlockTimeoutMs = 30000;
+        const int RemuxUnlockPollMs = 250;
+
+        /// <summary>
+        /// ファイルのロックが外れるまで待つ。外れたら true、上限に達したら false。
+        /// </summary>
+        static bool WaitUntilFileUnlocked(string path, int timeoutMs)
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            while (true)
+            {
+                if (!IsFileLocked(path))
+                {
+                    return true;
+                }
+
+                if (stopwatch.ElapsedMilliseconds >= timeoutMs)
+                {
+                    return false;
+                }
+
+                System.Threading.Thread.Sleep(RemuxUnlockPollMs);
+            }
         }
 
         static bool IsFileLocked(string path)
