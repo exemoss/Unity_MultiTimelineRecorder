@@ -7,6 +7,26 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [2.1.2] - 2026-08-18
+
+### Fixed
+- Audio is no longer dropped from large recordings. The FFmpeg encoder writes
+  video and audio to separate files and muxes them at the end, but
+  `MtrFFmpegPipe.CloseAndGetOutput` waited only 0.5 s for ffmpeg to exit
+  (`_timeoutValue`, the frame-pipe ping/pong timeout) and ignored the return
+  value. `Process.Close()`/`Dispose()` only release the .NET handle, so ffmpeg
+  stayed alive holding the output file while it finalized the container
+  (Matroska cue writing, which scales with output size). The following
+  `PostProcessAudioRemuxing` checked `IsFileLocked` exactly once, saw the lock
+  and returned, so the mux was skipped entirely: the delivered file contained
+  video only and the audio was left behind as a stray `.mkv`. Reproduced with a
+  3.85 GB VP9 7488x1344 webm; a 392 MB NVENC MP4 from the same session muxed
+  fine, so the failure only shows up on long or high-resolution takes. Exit is
+  now awaited with a dedicated `_exitTimeoutValue` (10 min, warning on
+  overrun), and the lock check retries for up to 30 s at 250 ms intervals. When
+  it still fails the error names the audio file and prints the `-c copy`
+  command that recovers the take, since the audio itself is never lost.
+
 ## [2.1.1] - 2026-08-14
 
 ### Fixed
