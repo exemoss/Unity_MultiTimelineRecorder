@@ -7,6 +7,44 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [3.0.0] - 2026-08-19
+
+### Changed
+- **Ranged recordings with audio are no longer out of sync — and their output
+  changes, hence the major bump.** Unity Recorder pulls audio a few frames
+  ahead whenever an audio clip is already active at (or before) the moment
+  recording starts. Full-length recordings avoid this by authoring audio
+  clips slightly after the timeline head, but a Recording Range /
+  SignalEmitter range starting past 0 structurally begins mid-song, so every
+  such take with audio drifted. Sections containing an audio-capturing Movie
+  recorder with a range starting past 0 now reserve an audio safe gap
+  (default 3 frames) in front of nested playback and pull that recorder's
+  clip forward to the section head, so recording starts before any nested
+  audio clip activates. Compared to 2.x, the same settings now produce:
+  - FFmpeg encoders (NVENC / VP9 / ProRes): the pulled-forward head
+    (gap + pre-roll + lead-in / skipped lead) is trimmed frame- and
+    sample-accurately before encoding, so the file is exactly the requested
+    range with audio in sync (previously the audio ran ahead).
+  - Built-in CoreEncoder (no trim hook): the file keeps the pulled-forward
+    head as extra leading frames showing the pre-playback picture (audio in
+    sync); a preflight dialog warns with the exact frame count before
+    recording starts.
+  - Full-length recordings and ranges starting at frame 0 are laid out
+    identically to 2.1.2 — their output is unchanged.
+
+### Added
+- "Audio Sync Gap" in Global Settings (default 3 frames, 0 disables)
+  controls how far the recorder start is pulled ahead of nested playback.
+- Recording Range support in the headless pass:
+  `DistributedWorkerBridge.StartHeadlessRender` gains an overload taking a
+  `RecorderConfigItem` as the range source plus the audio safe gap, giving
+  EditorWindow-free callers (e.g. the project-side RecSet batch) the same
+  range semantics as the local MTR path, including the audio fix. The
+  existing 5-arg overload keeps full-length behavior, so the distributed
+  Worker path is unchanged (ranged distributed jobs remain unsupported).
+- `MtrFFmpegEncoderSettings.HeadTrimFrames`: drops the first N video frames
+  and the matching span of audio samples before they reach the ffmpeg pipes.
+
 ## [2.1.2] - 2026-08-18
 
 ### Fixed
