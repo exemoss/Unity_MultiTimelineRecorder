@@ -29,10 +29,34 @@ namespace Unity.MultiTimelineRecorder.Encoders
         string _rawAudioFilename;
         bool _hasAudio;
 
+        // 音ズレ対策の頭落とし（MtrFFmpegEncoderSettings.HeadTrimFrames）。
+        // 残り分をカウントダウンし、0 になるまで受信フレーム/サンプルをパイプへ流さず捨てる。
+        int _videoFramesToSkip;
+        long _audioFloatsToSkip; // interleaved float 数（サンプル数 x チャンネル数）
+
         public void OpenStream(IEncoderSettings settings, RecordingContext ctx)
         {
             var ffmpegSettings = settings as MtrFFmpegEncoderSettings;
             _hasAudio = ctx.doCaptureAudio;
+
+            // 頭落とし量を確定する。音声は映像と同じ実時間分を float 数へ換算して捨てる
+            // （音声パイプは常にステレオ -ac 2 のため x2）。ブロック境界とは無関係に
+            // サンプル数で管理するので、AddAudioFrame の呼び出し粒度に依存しない。
+            _videoFramesToSkip = Math.Max(0, ffmpegSettings.HeadTrimFrames);
+            _audioFloatsToSkip = 0;
+            if (_hasAudio && _videoFramesToSkip > 0)
+            {
+                double fps = DoubleFromRational(ctx.fps);
+                if (fps > 0)
+                {
+                    _audioFloatsToSkip = (long)Math.Round(
+                        _videoFramesToSkip * (double)AudioSettings.outputSampleRate / fps) * 2;
+                }
+            }
+            if (_videoFramesToSkip > 0)
+            {
+                Log($"HeadTrim: video {_videoFramesToSkip} frames, audio {_audioFloatsToSkip} floats");
+            }
 
             try
             {
@@ -146,6 +170,14 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 Debug.LogError("The MTR FFmpeg encoder has already been disposed, ignoring this data.");
                 return;
             }
+
+            // 音ズレ対策の頭落とし: 前倒しで録れた冒頭フレームをパイプへ流さず捨てる
+            if (_videoFramesToSkip > 0)
+            {
+                _videoFramesToSkip--;
+                return;
+            }
+
             _ffmpegVideoPipe.PushFrameData(bytes);
             _ffmpegVideoPipe.SyncFrameData();
         }
@@ -156,6 +188,21 @@ namespace Unity.MultiTimelineRecorder.Encoders
             {
                 Debug.LogError("The MTR FFmpeg encoder has already been disposed, ignoring this data.");
                 return;
+            }
+
+            // 音ズレ対策の頭落とし: 映像と同じ実時間分の音声サンプルを捨てる。
+            // ブロック途中で境界が来た場合は残りだけを流す（GetSubArray はビューで、
+            // PushFrameData(NativeArray<float>) 側が即時コピーするため安全）
+            if (_audioFloatsToSkip > 0)
+            {
+                if (interleavedSamples.Length <= _audioFloatsToSkip)
+                {
+                    _audioFloatsToSkip -= interleavedSamples.Length;
+                    return;
+                }
+                interleavedSamples = interleavedSamples.GetSubArray(
+                    (int)_audioFloatsToSkip, interleavedSamples.Length - (int)_audioFloatsToSkip);
+                _audioFloatsToSkip = 0;
             }
 
             _ffmpegAudioPipe.PushFrameData(interleavedSamples);

@@ -111,6 +111,21 @@ namespace Unity.MultiTimelineRecorder.Encoders
         }
         [SerializeField] int scaleHeight;
 
+        /// <summary>
+        /// 録画セッション先頭から切り捨てるフレーム数（音ズレ対策の頭落とし。0 = 無効）。
+        /// 範囲録画では「録画開始と同時か前に有効化された音声が数フレーム先行する」
+        /// Unity Recorder の挙動を避けるため、RecorderClip をセクション再生開始より
+        /// 手前から開始する（AudioSafeGapPolicy 参照）。その前倒し分をエンコード前に
+        /// 映像フレームと対応する音声サンプルごと捨てて、出力を指定範囲ちょうどに戻す。
+        /// パイプへ流す前に捨てるためエンコードコストは増えない。
+        /// </summary>
+        public int HeadTrimFrames
+        {
+            get => headTrimFrames;
+            set => headTrimFrames = Mathf.Max(0, value);
+        }
+        [SerializeField] int headTrimFrames;
+
         /// <inheritdoc/>
         string IEncoderSettings.Extension =>
             Format == OutputFormat.Vp9Webm ? "webm"
@@ -245,7 +260,8 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 && qp == other.qp
                 && bitrateKbps == other.bitrateKbps
                 && scaleWidth == other.scaleWidth
-                && scaleHeight == other.scaleHeight;
+                && scaleHeight == other.scaleHeight
+                && headTrimFrames == other.headTrimFrames;
         }
 
         public override bool Equals(object obj)
@@ -255,7 +271,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
         public override int GetHashCode()
         {
-            return HashCode.Combine((int)outputFormat, ffmpegPath, qp, bitrateKbps, scaleWidth, scaleHeight);
+            return HashCode.Combine((int)outputFormat, ffmpegPath, qp, bitrateKbps, scaleWidth, scaleHeight, headTrimFrames);
         }
     }
 }
