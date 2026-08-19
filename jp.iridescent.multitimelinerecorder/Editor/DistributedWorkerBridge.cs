@@ -17,6 +17,7 @@ using DistributedRecorder.Worker;
 using UnityEngine;
 using UnityEngine.Playables;
 using UnityEngine.Timeline;
+using Unity.MultiTimelineRecorder.Utilities;
 
 #if UNITY_RECORDER
 using UnityEditor;
@@ -422,6 +423,34 @@ namespace Unity.MultiTimelineRecorder
             double                                 frameRate,
             out string                             errorMessage)
         {
+            return StartHeadlessRender(
+                director, settings, timelineDuration, frameRate,
+                rangeSource: null, audioSafeGapFrames: 0, out errorMessage);
+        }
+
+        /// <summary>
+        /// 尺範囲（Recording Range）と音ズレ対策ギャップに対応したヘッドレスパス起動。
+        ///
+        /// <paramref name="rangeSource"/> は範囲・助走の宣言元（MTR と同形式の
+        /// <see cref="MultiRecorderConfig.RecorderConfigItem"/>。書き出しセットの
+        /// 出力プロファイル等）。null または useCustomRange=false なら従来どおり全尺。
+        /// レイアウトは MTR ローカル経路の単一セクション版と同じ:
+        ///  - 再生窓は <see cref="MultiRecorderConfig.ResolvePlaybackWindow"/> で解決
+        ///    （前尺スキップ + 助走。スキップ無しなら全尺再生し RecorderClip だけ範囲へ寄せる）
+        ///  - 音声を録る Movie で範囲開始が 0 より後ろなら、再生開始前に
+        ///    <paramref name="audioSafeGapFrames"/> のギャップを空け、RecorderClip を
+        ///    0 秒まで前倒しして前倒し分を FFmpeg エンコーダの頭落としで相殺する
+        ///    （<see cref="AudioSafeGapPolicy"/> 参照。SignalEmitter 範囲は本経路では非対応）。
+        /// </summary>
+        public static string StartHeadlessRender(
+            UnityEngine.Playables.PlayableDirector director,
+            RecorderSettings                       settings,
+            double                                 timelineDuration,
+            double                                 frameRate,
+            MultiRecorderConfig.RecorderConfigItem rangeSource,
+            int                                    audioSafeGapFrames,
+            out string                             errorMessage)
+        {
             errorMessage = string.Empty;
 
             if (director == null)
@@ -479,6 +508,19 @@ namespace Unity.MultiTimelineRecorder
             }
 
             float oneFrameDuration = (float)(1.0 / (frameRate > 0 ? frameRate : 24.0));
+
+            // 尺範囲と再生窓・音ズレ対策ギャップを解決する（MTR ローカル経路と同じヘルパー）。
+            // rangeSource が null / 範囲なしなら window = 全尺・gapTime = 0 で従来と同一レイアウト
+            var window = MultiRecorderConfig.ResolvePlaybackWindow(
+                rangeSource != null ? new[] { rangeSource } : null,
+                timelineDuration + oneFrameDuration,
+                frameRate);
+            var range = rangeSource != null ? rangeSource.ResolveRange(timelineDuration, frameRate) : null;
+            float gapTime = rangeSource != null
+                ? AudioSafeGapPolicy.ResolveSectionGapTime(
+                    new[] { rangeSource }, null, timelineDuration, audioSafeGapFrames, frameRate)
+                : 0f;
+
             var controlClip = controlTrack.CreateClip<UnityEngine.Timeline.ControlPlayableAsset>();
             if (controlClip == null)
             {
@@ -488,8 +530,9 @@ namespace Unity.MultiTimelineRecorder
             }
 
             controlClip.displayName = director.gameObject.name;
-            controlClip.start       = 0.0;
-            controlClip.duration    = timelineDuration + oneFrameDuration; // +1 frame to include last frame
+            controlClip.start       = gapTime;
+            controlClip.clipIn      = window.clipIn;
+            controlClip.duration    = window.duration; // 全尺時は timelineDuration + 1 frame
 
             var controlAsset = controlClip.asset as UnityEngine.Timeline.ControlPlayableAsset;
             // sourceGameObject.defaultValue: persist the GameObject ref so it survives the Play Mode boundary
@@ -519,8 +562,20 @@ namespace Unity.MultiTimelineRecorder
                 return null;
             }
 
-            timelineClip.start    = 0.0;
-            timelineClip.duration = timelineDuration + oneFrameDuration;
+            timelineClip.start    = gapTime;
+            timelineClip.duration = window.duration;
+            if (range.HasValue)
+            {
+                // 範囲指定あり: RecorderClip を再生窓内の範囲位置へ寄せる
+                // （前尺スキップ時は窓先頭からの相対位置。MTR ローカル経路と同じ式）
+                double offsetInWindow = System.Math.Max(0.0, range.Value.StartTime(frameRate) - window.clipIn);
+                timelineClip.start    = gapTime + offsetInWindow;
+                timelineClip.duration = range.Value.Duration(frameRate);
+                UnityEngine.Debug.Log(
+                    $"[DistributedWorkerBridge] 尺範囲: frames {range.Value.startFrame}-{range.Value.endFrame}" +
+                    $" (Start={timelineClip.start:F2}s, Duration={timelineClip.duration:F2}s" +
+                    (window.skippedLeadIn ? $", 前尺スキップ・再生窓 {window.clipIn:F2}s 起点)" : ")"));
+            }
 
             // Embed settings as persistent sub-asset before assigning to clip
             // (required to survive Play Mode boundary – same as WorkerRenderTimelineFactory)
@@ -536,6 +591,20 @@ namespace Unity.MultiTimelineRecorder
                 return null;
             }
             recorderClip.settings = settings;
+
+            // 音ズレ対策: 音声を録る Movie で範囲開始が 0 より後ろなら、RecorderClip を
+            // セクション先頭（0 秒 = 再生開始のギャップ手前）まで前倒しし、前倒し分を
+            // FFmpeg エンコーダの頭落としで相殺する（AudioSafeGapPolicy 参照）
+            if (gapTime > 0f)
+            {
+                double effectiveRangeStart = AudioSafeGapPolicy.GetEffectiveRangeStart(
+                    rangeSource, null, timelineDuration, frameRate);
+                if (AudioSafeGapPolicy.IsAudioDesyncRisk(rangeSource, effectiveRangeStart))
+                {
+                    AudioSafeGapPolicy.ApplyHeadStart(
+                        timelineClip, settings, 0.0, frameRate, director.gameObject.name);
+                }
+            }
 
             EditorUtility.SetDirty(timeline);
             AssetDatabase.SaveAssets();

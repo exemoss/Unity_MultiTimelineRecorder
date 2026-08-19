@@ -325,44 +325,13 @@ namespace Unity.MultiTimelineRecorder
         }
 
         /// <summary>
-        /// 音ズレ対策: 音声を録る Movie の RecorderClip を sectionOrigin（セクション窓の
-        /// 先頭 = 再生開始のギャップ手前）まで前倒しし、録画終了位置は変えずに
-        /// 前倒し分を FFmpeg エンコーダの頭落としフレーム数として設定する。
-        /// 「音クリップの有効化は RecorderClip 開始より必ず後」という条件を作ることで、
-        /// 録画開始と同時か前から鳴っている音声が数フレーム先行して取り込まれる
-        /// Unity Recorder の挙動（音ズレ）を回避する。内蔵 CoreEncoder はトリム手段が
-        /// 無いため、前倒し分（再生開始前の絵）が出力の頭に残る（録画前チェックで警告済み）。
+        /// 音ズレ対策の前倒し（実体は <see cref="AudioSafeGapPolicy.ApplyHeadStart"/>。
+        /// ヘッドレス経路と共有するため、ここはウィンドウの frameRate を渡すだけの薄い委譲）。
         /// </summary>
         private void ApplyAudioSafeHeadStart(
             TimelineClip recorderClip, RecorderSettings recorderSettings, double sectionOrigin, string contextName)
         {
-            double headTime = recorderClip.start - sectionOrigin;
-            if (headTime <= 0.0)
-                return;
-
-            int headTrimFrames = (int)Math.Round(headTime * frameRate);
-            recorderClip.start = sectionOrigin;
-            recorderClip.duration += headTime;
-
-            if (recorderSettings is MovieRecorderSettings movieSettings
-                && movieSettings.EncoderSettings is MtrFFmpegEncoderSettings ffmpegSettings)
-            {
-                ffmpegSettings.HeadTrimFrames = headTrimFrames;
-                // 録画は PlayMode で一時 Timeline アセットを読み直して行われるため、
-                // サブアセット（MovieRecorderSettings）を dirty にして SaveAssets で
-                // HeadTrimFrames が確実にシリアライズされるようにする
-                EditorUtility.SetDirty(movieSettings);
-                MultiTimelineRecorderLogger.Log(
-                    $"[MultiTimelineRecorder] 音ズレ対策: {contextName} の RecorderClip を {headTrimFrames}f 前倒しし、" +
-                    $"FFmpeg エンコーダで頭落としします (Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s)");
-            }
-            else
-            {
-                MultiTimelineRecorderLogger.LogWarning(
-                    $"[MultiTimelineRecorder] 音ズレ対策: {contextName} は内蔵エンコーダのため頭落としできません。" +
-                    $"出力の先頭に前倒し分 {headTrimFrames} フレーム（再生開始前の絵）が残ります。" +
-                    $"FFmpeg 系エンコーダなら自動でトリムされます");
-            }
+            AudioSafeGapPolicy.ApplyHeadStart(recorderClip, recorderSettings, sectionOrigin, frameRate, contextName);
         }
 
         private TimelineAsset CreateRecorderTracksForMultipleTimelines(TimelineAsset timeline, List<PlayableDirector> directors, float preRollTime, float oneFrameDuration)

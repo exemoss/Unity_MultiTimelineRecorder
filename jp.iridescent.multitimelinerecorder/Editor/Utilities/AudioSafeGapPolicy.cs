@@ -1,5 +1,9 @@
 using System;
 using System.Collections.Generic;
+using UnityEditor;
+using UnityEditor.Recorder;
+using UnityEngine.Timeline;
+using Unity.MultiTimelineRecorder.Encoders;
 
 namespace Unity.MultiTimelineRecorder.Utilities
 {
@@ -94,6 +98,56 @@ namespace Unity.MultiTimelineRecorder.Utilities
             }
 
             return 0f;
+        }
+
+        /// <summary>
+        /// 音ズレ対策の前倒しを RecorderClip に適用する。クリップを sectionOrigin
+        /// （セクション窓の先頭 = 再生開始のギャップ手前）まで前倒しし、録画終了位置は
+        /// 変えずに前倒し分を FFmpeg エンコーダの頭落としフレーム数として設定する。
+        /// 「音クリップの有効化は RecorderClip 開始より必ず後」という条件を作ることで、
+        /// 録画開始と同時か前から鳴っている音声が数フレーム先行して取り込まれる
+        /// Unity Recorder の挙動（音ズレ）を回避する。内蔵 CoreEncoder はトリム手段が
+        /// 無いため、前倒し分（再生開始前の絵）が出力の頭に残る（警告ログを出す）。
+        /// MTR ローカル経路（CreateRecorderTrack 等）とヘッドレス経路
+        /// （DistributedWorkerBridge.StartHeadlessRender）の共有実装。
+        /// </summary>
+        public static void ApplyHeadStart(
+            TimelineClip recorderClip,
+            RecorderSettings recorderSettings,
+            double sectionOrigin,
+            double frameRate,
+            string contextName)
+        {
+            if (recorderClip == null || frameRate <= 0)
+                return;
+
+            double headTime = recorderClip.start - sectionOrigin;
+            if (headTime <= 0.0)
+                return;
+
+            int headTrimFrames = (int)Math.Round(headTime * frameRate);
+            recorderClip.start = sectionOrigin;
+            recorderClip.duration += headTime;
+
+            if (recorderSettings is MovieRecorderSettings movieSettings
+                && movieSettings.EncoderSettings is MtrFFmpegEncoderSettings ffmpegSettings)
+            {
+                ffmpegSettings.HeadTrimFrames = headTrimFrames;
+                // 録画は PlayMode で一時 Timeline アセットを読み直して行われるため、
+                // サブアセット（MovieRecorderSettings）を dirty にして SaveAssets で
+                // HeadTrimFrames が確実にシリアライズされるようにする
+                EditorUtility.SetDirty(movieSettings);
+                MultiTimelineRecorderLogger.Log(
+                    $"[MultiTimelineRecorder] 音ズレ対策: {contextName} の RecorderClip を {headTrimFrames}f 前倒しし、" +
+                    $"FFmpeg エンコーダで頭落としします (Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s)");
+            }
+            else
+            {
+                MultiTimelineRecorderLogger.LogWarning(
+                    $"[MultiTimelineRecorder] 音ズレ対策: {contextName} は内蔵エンコーダのため頭落としできません。" +
+                    $"出力の先頭に前倒し分 {headTrimFrames} フレーム（再生開始前の絵）が残ります。" +
+                    $"FFmpeg 系エンコーダなら自動でトリムされます");
+            }
         }
     }
 }
