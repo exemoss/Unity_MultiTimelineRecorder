@@ -12,6 +12,7 @@ using UnityEditor.Recorder.Input;
 using UnityEditor.Recorder.Timeline;
 using UnityEditor.Recorder.Encoder;
 using Unity.EditorCoroutines.Editor;
+using Unity.MultiTimelineRecorder.Encoders;
 using Unity.MultiTimelineRecorder.Utilities;
 using System.IO;
 
@@ -141,6 +142,14 @@ namespace Unity.MultiTimelineRecorder
 
                     // 再生窓（Pre-roll と本クリップの両方がこの窓を基準にする）
                     var playbackWindow = ResolveSectionPlaybackWindow(director, originalTimeline, signalEmitterRange, oneFrameDuration);
+
+                    // 音ズレ対策ギャップ: 対象アイテムがあるセクションは再生開始を
+                    // ギャップ分だけ後ろへずらし、音声を録る RecorderClip を再生開始より
+                    // 手前（sectionWindowStart）から開始できる余白を作る。
+                    // RecorderClip 側のループ（CreateRecorderTracksForMultipleTimelines）と
+                    // 必ず同じ値を積むこと（ズレると録画位置が破綻する）
+                    float audioGapTime = ResolveSectionAudioGapTime(director, originalTimeline, signalEmitterRange);
+                    currentStartTime += audioGapTime;
 
                     // Add pre-roll for each timeline if enabled
                     if (preRollFrames > 0)
@@ -294,6 +303,64 @@ namespace Unity.MultiTimelineRecorder
                 signalEmitterRange?.duration);
         }
 
+        /// <summary>
+        /// このセクションに必要な音ズレ対策ギャップ（秒）を解決する。
+        /// ControlClip を作る側と RecorderClip を作る側の両方から呼ばれ、
+        /// 2 つのループが同一のギャップを前提にすることを保証する
+        /// （ズレると録画位置が破綻する）。判定は AudioSafeGapPolicy 参照。
+        /// </summary>
+        private float ResolveSectionAudioGapTime(
+            PlayableDirector director, TimelineAsset originalTimeline, RecordingRange? signalEmitterRange)
+        {
+            int timelineIndex = recordingQueueDirectors.IndexOf(director);
+            var config = timelineIndex >= 0 ? GetTimelineRecorderConfig(timelineIndex) : null;
+            var enabledItems = config != null ? config.GetEnabledRecorders() : null;
+
+            return AudioSafeGapPolicy.ResolveSectionGapTime(
+                enabledItems,
+                signalEmitterRange?.startTime,
+                originalTimeline.duration,
+                audioSafeGapFrames,
+                frameRate);
+        }
+
+        /// <summary>
+        /// 音ズレ対策: 音声を録る Movie の RecorderClip を sectionOrigin（セクション窓の
+        /// 先頭 = 再生開始のギャップ手前）まで前倒しし、録画終了位置は変えずに
+        /// 前倒し分を FFmpeg エンコーダの頭落としフレーム数として設定する。
+        /// 「音クリップの有効化は RecorderClip 開始より必ず後」という条件を作ることで、
+        /// 録画開始と同時か前から鳴っている音声が数フレーム先行して取り込まれる
+        /// Unity Recorder の挙動（音ズレ）を回避する。内蔵 CoreEncoder はトリム手段が
+        /// 無いため、前倒し分（再生開始前の絵）が出力の頭に残る（録画前チェックで警告済み）。
+        /// </summary>
+        private void ApplyAudioSafeHeadStart(
+            TimelineClip recorderClip, RecorderSettings recorderSettings, double sectionOrigin, string contextName)
+        {
+            double headTime = recorderClip.start - sectionOrigin;
+            if (headTime <= 0.0)
+                return;
+
+            int headTrimFrames = (int)Math.Round(headTime * frameRate);
+            recorderClip.start = sectionOrigin;
+            recorderClip.duration += headTime;
+
+            if (recorderSettings is MovieRecorderSettings movieSettings
+                && movieSettings.EncoderSettings is MtrFFmpegEncoderSettings ffmpegSettings)
+            {
+                ffmpegSettings.HeadTrimFrames = headTrimFrames;
+                MultiTimelineRecorderLogger.Log(
+                    $"[MultiTimelineRecorder] 音ズレ対策: {contextName} の RecorderClip を {headTrimFrames}f 前倒しし、" +
+                    $"FFmpeg エンコーダで頭落としします (Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s)");
+            }
+            else
+            {
+                MultiTimelineRecorderLogger.LogWarning(
+                    $"[MultiTimelineRecorder] 音ズレ対策: {contextName} は内蔵エンコーダのため頭落としできません。" +
+                    $"出力の先頭に前倒し分 {headTrimFrames} フレーム（再生開始前の絵）が残ります。" +
+                    $"FFmpeg 系エンコーダなら自動でトリムされます");
+            }
+        }
+
         private TimelineAsset CreateRecorderTracksForMultipleTimelines(TimelineAsset timeline, List<PlayableDirector> directors, float preRollTime, float oneFrameDuration)
         {
             // Create recorder tracks for each timeline segment
@@ -324,6 +391,13 @@ namespace Unity.MultiTimelineRecorder
                     }
                 }
                 
+                // 音ズレ対策ギャップ: ControlClip 側のループと同じ値を同じ位置で積む。
+                // sectionOrigin（ギャップ手前 = セクション窓の先頭）が、音声を録る
+                // RecorderClip の前倒し先になる
+                float sectionOrigin = currentStartTime;
+                float audioGapTime = ResolveSectionAudioGapTime(director, originalTimeline, signalEmitterRange);
+                currentStartTime += audioGapTime;
+
                 // Pre-rollを考慮した開始時間を計算
                 // Control Trackでは、Pre-rollクリップの後にメインクリップが配置される
                 float actualRecordingStartTime = currentStartTime;
@@ -453,6 +527,19 @@ namespace Unity.MultiTimelineRecorder
                         else
                         {
                             recorderClip.duration = timelineDuration;
+                        }
+
+                        // 音ズレ対策: 対象の Movie はセクション窓の先頭まで前倒しし、
+                        // 前倒し分をエンコーダの頭落としで相殺する
+                        if (audioGapTime > 0f)
+                        {
+                            double effectiveRangeStart = AudioSafeGapPolicy.GetEffectiveRangeStart(
+                                recorderItem, signalEmitterRange?.startTime, originalTimeline.duration, frameRate);
+                            if (AudioSafeGapPolicy.IsAudioDesyncRisk(recorderItem, effectiveRangeStart))
+                            {
+                                ApplyAudioSafeHeadStart(recorderClip, recorderSettings, sectionOrigin,
+                                    $"{director.gameObject.name} / {recorderItem.name}");
+                            }
                         }
 
                         var recorderAsset = recorderClip.asset as UnityEditor.Recorder.Timeline.RecorderClip;
@@ -894,11 +981,28 @@ namespace Unity.MultiTimelineRecorder
                         signalEmitterRange = recordingRange;
                     }
                 }
-                
+
+                // Multi-recorder 設定をここで解決する（音ズレ対策ギャップの判定に
+                // 有効レコーダー一覧が必要なため、クリップ配置より前に行う）
+                int timelineIndex = recordingQueueDirectors.IndexOf(originalDirector);
+                if (timelineIndex < 0)
+                {
+                    MultiTimelineRecorderLogger.LogError($"[MultiTimelineRecorder] Director {originalDirector.gameObject.name} not found in recordingQueueDirectors");
+                    return null;
+                }
+
+                var timelineRecorderConfig = GetTimelineRecorderConfig(timelineIndex);
+                var enabledRecorders = timelineRecorderConfig.GetEnabledRecorders();
+
+                // 音ズレ対策ギャップ: 対象アイテムがある場合、セクション全体をギャップ分だけ
+                // 後ろへずらし、音声を録る RecorderClip を再生開始より手前（0秒）から
+                // 開始できる余白を作る（AudioSafeGapPolicy 参照）
+                float audioGapTime = ResolveSectionAudioGapTime(originalDirector, originalTimeline, signalEmitterRange);
+
                 if (preRollFrames > 0)
                 {
                     MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Creating pre-roll clip for {preRollFrames} frames ({preRollTime:F2} seconds)");
-                    
+
                     // Create pre-roll clip (holds at frame 0)
                     var preRollClip = controlTrack.CreateClip<ControlPlayableAsset>();
                     if (preRollClip == null)
@@ -906,9 +1010,9 @@ namespace Unity.MultiTimelineRecorder
                         MultiTimelineRecorderLogger.LogError("[MultiTimelineRecorder] Failed to create pre-roll ControlClip");
                         return null;
                     }
-                    
+
                     preRollClip.displayName = $"{originalDirector.gameObject.name} (Pre-roll)";
-                    preRollClip.start = 0;
+                    preRollClip.start = audioGapTime;
                     preRollClip.duration = preRollTime;
                     
                     var preRollAsset = preRollClip.asset as ControlPlayableAsset;
@@ -948,7 +1052,7 @@ namespace Unity.MultiTimelineRecorder
                 }
                 MultiTimelineRecorderLogger.LogVerbose("[MultiTimelineRecorder] Main ControlClip created successfully");
                 controlClip.displayName = originalDirector.gameObject.name;
-                controlClip.start = preRollTime;
+                controlClip.start = audioGapTime + preRollTime;
                 
                 // Add one frame to ensure the last frame is included
                 float oneFrameDuration = 1.0f / frameRate;
@@ -993,47 +1097,28 @@ namespace Unity.MultiTimelineRecorder
                 // 単体Timelineレンダリングでもバッチと同じ排他制御をかけ、
                 // 「親prefabがOFFだと結果が出ない」症状を単体レンダリングでも解消する。
                 var exclusiveRoot = ResolveExclusiveRoot(originalDirector);
-                float sectionWindowDuration = preRollTime + (float)controlClip.duration;
+                float sectionWindowDuration = audioGapTime + preRollTime + (float)controlClip.duration;
                 CreateExclusiveRootActivationTrack(timeline, new List<(GameObject root, float start, float duration)>
                 {
                     (exclusiveRoot, 0f, sectionWindowDuration)
                 });
 
                 // Important: We'll set the bindings on the PlayableDirector after creating it
-                
+
                 // Always use multi-recorder mode
-                // Get the recorder config for this timeline
-                // Find which selected timeline this director corresponds to
-                int timelineIndex = -1;
-                for (int i = 0; i < recordingQueueDirectors.Count; i++)
-                {
-                    if (recordingQueueDirectors[i] == originalDirector)
-                    {
-                        timelineIndex = i;
-                        break;
-                    }
-                }
-                
-                if (timelineIndex < 0)
-                {
-                    MultiTimelineRecorderLogger.LogError($"[MultiTimelineRecorder] Director {originalDirector.gameObject.name} not found in recordingQueueDirectors");
-                    return null;
-                }
-                
-                var timelineRecorderConfig = GetTimelineRecorderConfig(timelineIndex);
-                var enabledRecorders = timelineRecorderConfig.GetEnabledRecorders();
-                
+                // （timelineIndex / enabledRecorders は音ズレ対策ギャップの判定のため
+                //  クリップ配置前に解決済み）
                 MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] === Multi-Recorder Mode: Creating {enabledRecorders.Count} recorder tracks ===");
-                
+
                 if (enabledRecorders.Count == 0)
                 {
                     MultiTimelineRecorderLogger.LogError("[MultiTimelineRecorder] No enabled recorders in timeline config");
                     return null;
                 }
-                
+
                 foreach (var recorderItem in enabledRecorders)
                 {
-                    CreateRecorderTrack(timeline, recorderItem, originalDirector, originalTimeline, preRollTime, oneFrameDuration, timelineIndex);
+                    CreateRecorderTrack(timeline, recorderItem, originalDirector, originalTimeline, preRollTime, oneFrameDuration, timelineIndex, audioGapTime);
                 }
                 
                 // Save asset after all tracks are created
@@ -1085,8 +1170,9 @@ namespace Unity.MultiTimelineRecorder
         
         // Removed CreateRenderTimelineSingleRecorder - always use multi-recorder mode
         
-        private void CreateRecorderTrack(TimelineAsset timeline, MultiRecorderConfig.RecorderConfigItem recorderItem, 
-            PlayableDirector originalDirector, TimelineAsset originalTimeline, float preRollTime, float oneFrameDuration, int timelineIndex)
+        private void CreateRecorderTrack(TimelineAsset timeline, MultiRecorderConfig.RecorderConfigItem recorderItem,
+            PlayableDirector originalDirector, TimelineAsset originalTimeline, float preRollTime, float oneFrameDuration, int timelineIndex,
+            float audioGapTime = 0f)
         {
             // Get timeline-specific config (using first timeline)
             var timelineConfig = GetTimelineRecorderConfig(0);
@@ -1223,24 +1309,26 @@ namespace Unity.MultiTimelineRecorder
             }
             
             recorderClip.displayName = $"Record {recorderItem.recorderType}";
-            recorderClip.start = preRollTime;
+            recorderClip.start = audioGapTime + preRollTime;
+
+            // SignalEmitter 範囲は customRange との優先判定と音ズレ対策の両方で使うため
+            // ここで一度だけ解決する（ControlClip 側と同条件）
+            RecordingRange? signalRange = null;
+            if (useSignalEmitterTiming)
+            {
+                var r = SignalEmitterRecordControl.GetRecordingRangeFromSignalsWithFallback(
+                    originalTimeline, startTimingName, endTimingName, true);
+                if (r.isValid) signalRange = r;
+            }
 
             // レコーダー個別の尺範囲（Recording Range）。指定があれば SignalEmitter より優先する
             var customRange = recorderItem.ResolveRange(originalTimeline.duration, frameRate);
             if (customRange.HasValue)
             {
                 // ControlClip と同じ窓を基準に、窓先頭からの相対位置へ直す
-                // （SignalEmitter 範囲も ControlClip 側と同条件で解決する）
-                RecordingRange? windowSignalRange = null;
-                if (useSignalEmitterTiming)
-                {
-                    var r = SignalEmitterRecordControl.GetRecordingRangeFromSignalsWithFallback(
-                        originalTimeline, startTimingName, endTimingName, true);
-                    if (r.isValid) windowSignalRange = r;
-                }
-                var window = ResolveSectionPlaybackWindow(originalDirector, originalTimeline, windowSignalRange, oneFrameDuration);
+                var window = ResolveSectionPlaybackWindow(originalDirector, originalTimeline, signalRange, oneFrameDuration);
                 double offsetInWindow = customRange.Value.StartTime(frameRate) - window.clipIn;
-                recorderClip.start = preRollTime + System.Math.Max(0.0, offsetInWindow);
+                recorderClip.start = audioGapTime + preRollTime + System.Math.Max(0.0, offsetInWindow);
                 recorderClip.duration = customRange.Value.Duration(frameRate);
                 MultiTimelineRecorderLogger.Log(
                     $"[MultiTimelineRecorder] RecorderClip for {recorderItem.name} uses custom range: " +
@@ -1251,15 +1339,12 @@ namespace Unity.MultiTimelineRecorder
             // SignalEmitter設定によるRecorderClipの同期 (TODO-282)
             else if (useSignalEmitterTiming)
             {
-                var recordingRange = SignalEmitterRecordControl.GetRecordingRangeFromSignalsWithFallback(
-                    originalTimeline, startTimingName, endTimingName, true);
-
-                if (recordingRange.isValid)
+                if (signalRange.HasValue)
                 {
                     // RecorderClipは実際のRecording区間のみをカバー
                     // PreRollは含まない（Control Clipで処理されるため）
-                    recorderClip.start = preRollTime;
-                    recorderClip.duration = recordingRange.duration;
+                    recorderClip.start = audioGapTime + preRollTime;
+                    recorderClip.duration = signalRange.Value.duration;
 
                     MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] RecorderClip synchronized to SignalEmitter range: Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s");
                 }
@@ -1273,6 +1358,19 @@ namespace Unity.MultiTimelineRecorder
             else
             {
                 recorderClip.duration = originalTimeline.duration + oneFrameDuration;
+            }
+
+            // 音ズレ対策: 対象の Movie はセクション先頭（再生開始のギャップ手前 = 0秒）まで
+            // 前倒しし、前倒し分をエンコーダの頭落としで相殺する
+            if (audioGapTime > 0f)
+            {
+                double effectiveRangeStart = AudioSafeGapPolicy.GetEffectiveRangeStart(
+                    recorderItem, signalRange?.startTime, originalTimeline.duration, frameRate);
+                if (AudioSafeGapPolicy.IsAudioDesyncRisk(recorderItem, effectiveRangeStart))
+                {
+                    ApplyAudioSafeHeadStart(recorderClip, recorderSettings, 0.0,
+                        $"{originalDirector.gameObject.name} / {recorderItem.name}");
+                }
             }
 
             var recorderAsset = recorderClip.asset as UnityEditor.Recorder.Timeline.RecorderClip;

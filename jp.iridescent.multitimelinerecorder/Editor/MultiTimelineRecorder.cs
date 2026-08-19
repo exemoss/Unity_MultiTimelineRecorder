@@ -230,6 +230,12 @@ namespace Unity.MultiTimelineRecorder
         public OutputPathSettings globalOutputPath = new OutputPathSettings(); // Global output path settings
         public int takeNumber = 1;
         public int preRollFrames = 0; // Pre-roll frames for simulation warm-up
+
+        // 音ズレ対策ギャップ（フレーム）。範囲録画（尺範囲 / SignalEmitter）で音声を録る
+        // Movie の録画開始をセクション再生開始より手前に前倒しする量。前倒し分は
+        // FFmpeg 系エンコーダで自動的に頭落としされ、出力は指定範囲ちょうどになる。
+        // 0 で無効（従来どおり音ズレし得る）。詳細は AudioSafeGapPolicy 参照
+        public int audioSafeGapFrames = Utilities.AudioSafeGapPolicy.DefaultGapFrames;
         public string cameraTag = "MainCamera";
         public OutputResolution outputResolution = OutputResolution.HD1080p;
 
@@ -545,9 +551,20 @@ namespace Unity.MultiTimelineRecorder
             EditorGUILayout.LabelField("Timeline Margin:", GUILayout.Width(100));
             timelineMarginFrames = EditorGUILayout.IntField(timelineMarginFrames, GUILayout.Width(60));
             EditorGUILayout.LabelField("frames", GUILayout.Width(50));
-            
+
+            EditorGUILayout.Space(20);
+
+            // Audio Sync Gap（音ズレ対策）
+            EditorGUILayout.LabelField(new GUIContent("Audio Sync Gap:",
+                "音ズレ対策。尺範囲 / SignalEmitter 範囲の録画で、音声を録る Movie の録画開始を" +
+                "セクション再生開始より何フレーム手前に前倒しするか。前倒し分は FFmpeg 系エンコーダで" +
+                "自動的に頭落としされ、出力は指定範囲ちょうどになる（内蔵エンコーダはトリム不可のため" +
+                "頭に余剰フレームが残る）。0 で無効"), GUILayout.Width(100));
+            audioSafeGapFrames = Mathf.Max(0, EditorGUILayout.IntField(audioSafeGapFrames, GUILayout.Width(60)));
+            EditorGUILayout.LabelField("frames", GUILayout.Width(50));
+
             GUILayout.FlexibleSpace(); // Push everything to the left
-            
+
             EditorGUILayout.EndHorizontal();
             
             // SignalEmitter設定 (TODO-282)
@@ -3329,6 +3346,7 @@ namespace Unity.MultiTimelineRecorder
             var h264OverLimitItems = new List<MultiRecorderConfig.RecorderConfigItem>();
             var h264OverLimitLines = new List<string>();
             var hardErrorLines = new List<string>();
+            var coreEncoderTrimLines = new List<string>();
 
             for (int timelineIndex = 0; timelineIndex < recordingQueueDirectors.Count; timelineIndex++)
             {
@@ -3339,6 +3357,16 @@ namespace Unity.MultiTimelineRecorder
                 var timelineConfig = GetTimelineRecorderConfig(timelineIndex);
                 if (timelineConfig == null)
                     continue;
+
+                // 音ズレ対策の判定に使う SignalEmitter 範囲（タイムラインごとに一度だけ解決）
+                var timelineAsset = director.playableAsset as TimelineAsset;
+                RecordingRange? signalRange = null;
+                if (useSignalEmitterTiming && timelineAsset != null)
+                {
+                    var r = SignalEmitterRecordControl.GetRecordingRangeFromSignalsWithFallback(
+                        timelineAsset, startTimingName, endTimingName, true);
+                    if (r.isValid) signalRange = r;
+                }
 
                 foreach (var item in timelineConfig.GetEnabledRecorders())
                 {
@@ -3377,6 +3405,29 @@ namespace Unity.MultiTimelineRecorder
                     {
                         hardErrorLines.Add($"・{director.gameObject.name} / {item.name}: {validateError}");
                     }
+
+                    // 音ズレ対策: 内蔵エンコーダは頭落としトリム不可のため、範囲録画＋
+                    // 音声キャプチャの対象アイテムは出力の先頭に前倒し分の余剰フレームが
+                    // 残ることを録画前に知らせる（AudioSafeGapPolicy 参照）
+                    if (audioSafeGapFrames > 0
+                        && item.movieConfig.encoderType == MovieEncoderType.CoreEncoder
+                        && timelineAsset != null)
+                    {
+                        double effectiveRangeStart = AudioSafeGapPolicy.GetEffectiveRangeStart(
+                            item, signalRange?.startTime, timelineAsset.duration, frameRate);
+                        if (AudioSafeGapPolicy.IsAudioDesyncRisk(item, effectiveRangeStart))
+                        {
+                            var window = MultiRecorderConfig.ResolvePlaybackWindow(
+                                timelineConfig.GetEnabledRecorders(),
+                                timelineAsset.duration + 1.0 / frameRate,
+                                frameRate,
+                                signalRange?.startTime,
+                                signalRange?.duration);
+                            int extraFrames = audioSafeGapFrames + preRollFrames
+                                + (int)System.Math.Round(System.Math.Max(0.0, effectiveRangeStart - window.clipIn) * frameRate);
+                            coreEncoderTrimLines.Add($"・{director.gameObject.name} / {item.name}: 先頭に約 {extraFrames} フレームの余剰");
+                        }
+                    }
                 }
             }
 
@@ -3389,6 +3440,21 @@ namespace Unity.MultiTimelineRecorder
                     "\n\n設定を修正してから録画を開始してください。",
                     "OK");
                 return false;
+            }
+
+            if (coreEncoderTrimLines.Count > 0)
+            {
+                bool proceed = EditorUtility.DisplayDialog(
+                    "音ズレ対策の頭落としができません（内蔵エンコーダ）",
+                    "以下の Movie レコーダーは範囲録画＋音声キャプチャのため、音ズレ対策として録画開始を前倒しします。\n" +
+                    "内蔵エンコーダ (CoreEncoder) では前倒し分をトリムできないため、出力の先頭に\n" +
+                    "「再生開始前の絵」が余剰フレームとして残ります（音声は同期します）:\n\n" +
+                    string.Join("\n", coreEncoderTrimLines) +
+                    "\n\nFFmpeg 系エンコーダに切り替えると余剰フレームは自動でトリムされます。\n" +
+                    "このまま続行しますか?",
+                    "続行", "キャンセル");
+                if (!proceed)
+                    return false;
             }
 
             if (h264OverLimitItems.Count == 0)
@@ -4471,6 +4537,7 @@ namespace Unity.MultiTimelineRecorder
             globalOutputPath = settings.globalOutputPath;
             takeNumber = settings.takeNumber;
             preRollFrames = settings.preRollFrames;
+            audioSafeGapFrames = settings.audioSafeGapFrames;
             cameraTag = settings.cameraTag;
             outputResolution = settings.outputResolution;
             enableReadbackBackpressure = settings.enableReadbackBackpressure;
@@ -4634,6 +4701,7 @@ namespace Unity.MultiTimelineRecorder
             settings.globalOutputPath = globalOutputPath;
             settings.takeNumber = takeNumber;
             settings.preRollFrames = preRollFrames;
+            settings.audioSafeGapFrames = audioSafeGapFrames;
             settings.cameraTag = cameraTag;
             settings.outputResolution = outputResolution;
             settings.enableReadbackBackpressure = enableReadbackBackpressure;

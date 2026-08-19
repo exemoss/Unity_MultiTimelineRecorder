@@ -20,6 +20,10 @@ namespace Unity.MultiTimelineRecorder
         public OutputPathSettings globalOutputPath = new OutputPathSettings();
         public int takeNumber = 1;
         public int preRollFrames = 0;
+
+        // 音ズレ対策ギャップ（フレーム）。範囲録画で音声を録る Movie の録画開始を
+        // セクション再生開始より手前に前倒しする量（AudioSafeGapPolicy 参照）。0 = 無効
+        public int audioSafeGapFrames = Utilities.AudioSafeGapPolicy.DefaultGapFrames;
         public string cameraTag = "MainCamera";
         public OutputResolution outputResolution = OutputResolution.HD1080p;
 
