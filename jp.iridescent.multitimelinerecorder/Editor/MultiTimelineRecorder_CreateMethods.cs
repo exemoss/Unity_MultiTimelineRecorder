@@ -348,6 +348,10 @@ namespace Unity.MultiTimelineRecorder
                 && movieSettings.EncoderSettings is MtrFFmpegEncoderSettings ffmpegSettings)
             {
                 ffmpegSettings.HeadTrimFrames = headTrimFrames;
+                // 録画は PlayMode で一時 Timeline アセットを読み直して行われるため、
+                // サブアセット（MovieRecorderSettings）を dirty にして SaveAssets で
+                // HeadTrimFrames が確実にシリアライズされるようにする
+                EditorUtility.SetDirty(movieSettings);
                 MultiTimelineRecorderLogger.Log(
                     $"[MultiTimelineRecorder] 音ズレ対策: {contextName} の RecorderClip を {headTrimFrames}f 前倒しし、" +
                     $"FFmpeg エンコーダで頭落としします (Start={recorderClip.start:F2}s, Duration={recorderClip.duration:F2}s)");
