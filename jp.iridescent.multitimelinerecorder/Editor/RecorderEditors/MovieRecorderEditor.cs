@@ -245,12 +245,32 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     host.movieFfmpegPath = found;
                     GUI.changed = true;
                 }
+                else if (Unity.MultiTimelineRecorder.Encoders.FfmpegInstaller.IsWingetAvailable())
+                {
+                    // 未検出はほぼ「未導入」なので、その場で winget セットアップへ誘導する
+                    if (EditorUtility.DisplayDialog("ffmpeg 自動検出",
+                        "ffmpeg.exe が見つかりませんでした。\n" +
+                        "winget でいまセットアップしますか？(ネットワーク経由のダウンロードを含みます)",
+                        "セットアップする", "閉じる"))
+                    {
+                        StartFfmpegSetup();
+                    }
+                }
                 else
                 {
                     EditorUtility.DisplayDialog("ffmpeg 自動検出",
                         "ffmpeg.exe が見つかりませんでした。\n" +
                         "PATH への追加、または winget install Gyan.FFmpeg 等で導入してから再試行してください。",
                         "OK");
+                }
+            }
+            using (new EditorGUI.DisabledScope(Unity.MultiTimelineRecorder.Encoders.FfmpegInstaller.IsRunning))
+            {
+                if (GUILayout.Button(new GUIContent("セットアップ",
+                    "winget (Windows 標準のパッケージマネージャ) で ffmpeg をこの PC に導入し、パスを自動設定します"),
+                    GUILayout.Width(80)))
+                {
+                    StartFfmpegSetup();
                 }
             }
             if (GUILayout.Button("...", GUILayout.Width(28)))
@@ -284,6 +304,26 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             EditorGUILayout.HelpBox("FFmpeg エンコーダを選択した場合、上の Quality / Bitrate (Mbps) は使用されません(内蔵エンコーダ専用の設定です)。", MessageType.Info);
 
             EditorGUI.indentLevel--;
+        }
+
+        /// <summary>
+        /// winget による ffmpeg セットアップを開始し、完了時にパスを設定へ反映する。
+        /// 完了は OnGUI の変更検知の外（非同期コールバック）なので、値の書き込み後に
+        /// MTR 系ウィンドウを明示的に再描画する（保存は以降の通常の GUI 操作に乗る）。
+        /// </summary>
+        private void StartFfmpegSetup()
+        {
+            Unity.MultiTimelineRecorder.Encoders.FfmpegInstaller.InstallAsync(found =>
+            {
+                if (string.IsNullOrEmpty(found))
+                    return;
+                host.movieFfmpegPath = found;
+                foreach (var window in Resources.FindObjectsOfTypeAll<EditorWindow>())
+                {
+                    if (window.GetType().Assembly == typeof(MovieRecorderEditor).Assembly)
+                        window.Repaint();
+                }
+            });
         }
 
         protected override string GetFileExtension()
