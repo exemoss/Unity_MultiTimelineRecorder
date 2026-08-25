@@ -7,6 +7,17 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [3.1.1] - 2026-08-25
+
+### Fixed
+- The ffmpeg setup flow now gives explicit dialog feedback: a confirmation
+  dialog before starting (naming the pinned version and warning about the
+  download; skipped when the caller already confirmed, e.g. the auto-detect
+  failure dialog), a completion dialog with the detected path, and an
+  "already installed" dialog instead of silently doing nothing.
+  `FfmpegInstaller.InstallAsync` gains an optional `confirm` parameter
+  (default true).
+
 ## [3.1.0] - 2026-08-25
 
 ### Added
