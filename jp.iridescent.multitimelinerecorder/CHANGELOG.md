@@ -7,6 +7,32 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [3.1.0] - 2026-08-25
+
+### Added
+- New Movie encoder option "FFmpeg NVENC HEVC 10bit"
+  (`MovieEncoderType.FFmpegNvencHevc10Bit` /
+  `MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc10Bit`): encodes HEVC with
+  the Main10 profile (`-profile:v main10 -pix_fmt p010le`, swscale converts
+  the 8-bit RGB frames to 10-bit `p010le`). Even from an 8-bit source,
+  10-bit quantization visibly reduces gradient banding at similar file size
+  and speed. Requires an NVENC GPU with 10-bit HEVC support (Pascal /
+  GTX 10-series or later). Container, rate control (QP / target bitrate),
+  BT.709 tagging, scaling and audio behavior are identical to the existing
+  8-bit HEVC NVENC path, whose output is unchanged (hence MINOR).
+- One-click ffmpeg setup (`FfmpegInstaller`): a "セットアップ" button next to
+  the existing auto-detect button (and an offer in the auto-detect failure
+  dialog) installs ffmpeg via winget (`winget install Gyan.FFmpeg`,
+  cancelable progress bar, async — the editor is not blocked). Downloading
+  and verification are delegated to winget; this package still contains no
+  code that talks to external hosts directly. The install lands where
+  `FfmpegLocator` already searches, so auto-detection picks it up
+  immediately and the path is filled in on completion. The version is
+  pinned to 8.0.1: ffmpeg 8.1+/9.0 builds require NVENC API 13.1 (NVIDIA
+  driver 610+) and fail on all NVENC encoding with older drivers, while
+  8.0.1 works from API 13.0 (driver 570 range; verified on RTX 4070 Ti /
+  driver 591.86 including the new 10-bit HEVC path).
+
 ## [3.0.0] - 2026-08-19
 
 ### Changed
