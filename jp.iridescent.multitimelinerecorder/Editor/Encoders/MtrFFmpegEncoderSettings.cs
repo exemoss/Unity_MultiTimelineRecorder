@@ -43,6 +43,10 @@ namespace Unity.MultiTimelineRecorder.Encoders
         /// 「H.264 / HEVC NVENC を必須、AV1 は任意」のため NVENC 2種類に絞っていた。
         /// Vp9Webm は WebM コンテナ + BT.709 タグ付きの納品要件向けに追加
         /// （NVENC は VP9 エンコードに非対応のため libvpx-vp9 のソフトウェアエンコード）。
+        /// HevcNvenc10Bit は Main10 プロファイルの 10bit エンコード。入力フレームは 8bit RGB の
+        /// ままだが、量子化を 10bit 精度で行うためグラデーションのバンディングが軽減される
+        /// （NVENC の 10bit HEVC は Pascal 世代 = GTX 10 系以降の GPU が必要）。
+        /// 既存値のシリアライズ互換のため、新しい値は必ず末尾に追加すること。
         /// </summary>
         public enum OutputFormat
         {
@@ -51,6 +55,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
             [InspectorName("VP9 (WebM, ソフトウェア)")] Vp9Webm,
             [InspectorName("ProRes 4444 (MOV, アルファ対応)")] ProRes4444Mov,
             [InspectorName("ProRes 422 HQ (MOV)")] ProRes422HqMov,
+            [InspectorName("H.265 HEVC NVENC 10bit")] HevcNvenc10Bit,
         }
 
         /// <summary>この Format がアルファチャンネルを保持できるか(ProRes 422 系は非対応)。</summary>
@@ -201,19 +206,27 @@ namespace Unity.MultiTimelineRecorder.Encoders
                        + GetColorAndScaleArgs("yuv422p10le");
             }
 
-            string codec = Format == OutputFormat.HevcNvenc ? "hevc_nvenc" : "h264_nvenc";
+            bool isHevc = Format == OutputFormat.HevcNvenc || Format == OutputFormat.HevcNvenc10Bit;
+            string codec = isHevc ? "hevc_nvenc" : "h264_nvenc";
 
             // レート制御引数(constqp の qmin/qmax、または vbr の b:v/maxrate/bufsize)は
             // h264_nvenc / hevc_nvenc の両方に適用する(サンプルの HevcNvidia はプリセット指定
             // のみでレート制御を欠いていたため、移植時に H.264 と揃えた。NOTICE.md 参照)。
             // profile:v high は HEVC では無効な値のため H.264 のときのみ付与する。
+            // 10bit は Main10 プロファイル + p010le(10bit 4:2:0)。8bit RGB 入力でも swscale が
+            // 10bit へ変換し、10bit 精度の量子化でバンディングが軽減される
+            // (参考: https://zenn.dev/mitene/articles/56c1669bc75890 と同趣旨。NVENC では
+            // libx265 のようなビルド時ビット深度指定は不要で、p010le 入力 + main10 指定で足りる)。
             string rateControl = bitrateKbps > 0
                 ? $"-rc vbr -b:v {bitrateKbps}k -maxrate {bitrateKbps * 3 / 2}k -bufsize {bitrateKbps * 2}k"
                 : $"-rc constqp -qmin 17 -qmax 51 -qp {qp}";
-            string profileArg = Format == OutputFormat.H264Nvenc ? " -profile:v high" : "";
+            string profileArg = Format == OutputFormat.H264Nvenc ? " -profile:v high"
+                : Format == OutputFormat.HevcNvenc10Bit ? " -profile:v main10"
+                : "";
+            string encodePixelFormat = Format == OutputFormat.HevcNvenc10Bit ? "p010le" : "yuv420p";
 
-            return $"-c:v {codec} -pix_fmt yuv420p {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
-                   + GetColorAndScaleArgs("yuv420p");
+            return $"-c:v {codec} -pix_fmt {encodePixelFormat} {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
+                   + GetColorAndScaleArgs(encodePixelFormat);
         }
 
         /// <summary>

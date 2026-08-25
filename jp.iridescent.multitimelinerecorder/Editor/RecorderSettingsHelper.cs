@@ -316,6 +316,9 @@ namespace Unity.MultiTimelineRecorder
                         case Encoders.MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc:
                             encoderType = MovieEncoderType.FFmpegNvencHevc;
                             break;
+                        case Encoders.MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc10Bit:
+                            encoderType = MovieEncoderType.FFmpegNvencHevc10Bit;
+                            break;
                         case Encoders.MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm:
                             encoderType = MovieEncoderType.FFmpegVp9;
                             break;

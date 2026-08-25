@@ -208,6 +208,15 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     MessageType.Info);
             }
 
+            if (host.movieEncoderType == MovieEncoderType.FFmpegNvencHevc10Bit)
+            {
+                EditorGUILayout.HelpBox(
+                    "HEVC 10bit (Main10): 入力フレームは 8bit のまま、量子化を 10bit 精度で行うことで" +
+                    "グラデーションのバンディングを軽減します。ファイルサイズ・速度は 8bit HEVC とほぼ同等。" +
+                    "NVENC の 10bit HEVC は GTX 10 系(Pascal)以降の GPU が必要です。",
+                    MessageType.Info);
+            }
+
             if (host.imageSourceType == ImageRecorderSourceType.RenderTexture)
             {
                 EditorGUILayout.HelpBox(

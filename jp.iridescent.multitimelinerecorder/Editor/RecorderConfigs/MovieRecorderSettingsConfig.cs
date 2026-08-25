@@ -32,6 +32,8 @@ namespace Unity.MultiTimelineRecorder
         [InspectorName("FFmpeg VP9 (WebM, BT.709)")] FFmpegVp9,
         [InspectorName("FFmpeg ProRes 4444 (MOV, BT.709)")] FFmpegProRes4444,
         [InspectorName("FFmpeg ProRes 422 HQ (MOV, BT.709)")] FFmpegProRes422Hq,
+        // 既存アセットのシリアライズ互換のため、新しい値は必ず末尾に追加すること
+        [InspectorName("FFmpeg NVENC HEVC 10bit")] FFmpegNvencHevc10Bit,
     }
 
     /// <summary>
@@ -165,6 +167,9 @@ namespace Unity.MultiTimelineRecorder
                     case MovieEncoderType.FFmpegNvencHevc:
                         ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc;
                         break;
+                    case MovieEncoderType.FFmpegNvencHevc10Bit:
+                        ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc10Bit;
+                        break;
                     case MovieEncoderType.FFmpegVp9:
                         ffmpegFormat = MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm;
                         break;
@@ -220,7 +225,8 @@ namespace Unity.MultiTimelineRecorder
         {
             if (IsH264(outputFormat, encoderType))
                 return MaxDimensionH264;
-            if (encoderType == MovieEncoderType.FFmpegNvencHevc)
+            if (encoderType == MovieEncoderType.FFmpegNvencHevc ||
+                encoderType == MovieEncoderType.FFmpegNvencHevc10Bit)
                 return MaxDimensionHevc;
 
             switch (outputFormat)
@@ -317,7 +323,8 @@ namespace Unity.MultiTimelineRecorder
                 }
 
                 if (encoderType == MovieEncoderType.FFmpegNvencH264 ||
-                    encoderType == MovieEncoderType.FFmpegNvencHevc)
+                    encoderType == MovieEncoderType.FFmpegNvencHevc ||
+                    encoderType == MovieEncoderType.FFmpegNvencHevc10Bit)
                 {
                     errorMessage = "FFmpeg NVENC エンコーダはアルファチャンネルに対応していません。VP9(WebM) / ProRes 4444 または内蔵エンコーダを使用してください。";
                     return false;
