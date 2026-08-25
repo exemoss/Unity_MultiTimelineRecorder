@@ -49,8 +49,10 @@ namespace Unity.MultiTimelineRecorder.Encoders
         /// winget で ffmpeg のインストールを開始する。完了時に <paramref name="completed"/> が
         /// メインスレッドで呼ばれる（引数は検出された ffmpeg.exe の絶対パス、失敗時は null）。
         /// 既にインストール済みなら winget を起動せず即座に完了する。実行中の多重呼び出しは無視。
+        /// <paramref name="confirm"/> が true のとき、開始前に内容の確認ダイアログを出す
+        /// （呼び出し側が直前に独自の確認を済ませている場合は false で二重確認を避ける）。
         /// </summary>
-        public static void InstallAsync(Action<string> completed)
+        public static void InstallAsync(Action<string> completed, bool confirm = true)
         {
             if (IsRunning)
             {
@@ -58,12 +60,25 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 return;
             }
 
-            // 既に導入済みならインストール不要（「セットアップ」ボタン連打の正常系）
+            // 既に導入済みならインストール不要（「セットアップ」ボタン連打の正常系）。
+            // ユーザーの明示操作に対して無反応だと「何も起きない」ように見えるためダイアログで知らせる
             var existing = FfmpegLocator.TryFindFfmpeg();
             if (!string.IsNullOrEmpty(existing))
             {
                 Debug.Log($"[FfmpegInstaller] ffmpeg は導入済みです: {existing}");
+                EditorUtility.DisplayDialog("ffmpeg セットアップ",
+                    $"ffmpeg は導入済みです:\n{existing}", "OK");
                 completed?.Invoke(existing);
+                return;
+            }
+
+            if (confirm && !EditorUtility.DisplayDialog("ffmpeg セットアップ",
+                    $"winget で ffmpeg {PinnedVersion} (Gyan.FFmpeg) をこの PC に導入します。\n" +
+                    "ネットワーク経由のダウンロードを含みます（数百 MB・数分かかることがあります）。\n\n" +
+                    "実行しますか？",
+                    "実行", "キャンセル"))
+            {
+                completed?.Invoke(null);
                 return;
             }
 
@@ -181,6 +196,8 @@ namespace Unity.MultiTimelineRecorder.Encoders
             if (!string.IsNullOrEmpty(found))
             {
                 Debug.Log($"[FfmpegInstaller] ffmpeg をセットアップしました: {found}");
+                EditorUtility.DisplayDialog("ffmpeg セットアップ",
+                    $"セットアップが完了しました:\n{found}", "OK");
             }
             else
             {

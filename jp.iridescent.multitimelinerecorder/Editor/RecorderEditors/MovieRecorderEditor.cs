@@ -253,7 +253,8 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                         "winget でいまセットアップしますか？(ネットワーク経由のダウンロードを含みます)",
                         "セットアップする", "閉じる"))
                     {
-                        StartFfmpegSetup();
+                        // このダイアログで確認済みのため、インストーラ側の確認はスキップする
+                        StartFfmpegSetup(confirm: false);
                     }
                 }
                 else
@@ -311,7 +312,7 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
         /// 完了は OnGUI の変更検知の外（非同期コールバック）なので、値の書き込み後に
         /// MTR 系ウィンドウを明示的に再描画する（保存は以降の通常の GUI 操作に乗る）。
         /// </summary>
-        private void StartFfmpegSetup()
+        private void StartFfmpegSetup(bool confirm = true)
         {
             Unity.MultiTimelineRecorder.Encoders.FfmpegInstaller.InstallAsync(found =>
             {
@@ -323,7 +324,7 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     if (window.GetType().Assembly == typeof(MovieRecorderEditor).Assembly)
                         window.Repaint();
                 }
-            });
+            }, confirm);
         }
 
         protected override string GetFileExtension()
