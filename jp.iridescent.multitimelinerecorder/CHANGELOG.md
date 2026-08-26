@@ -7,6 +7,21 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.0.0] - 2026-08-26
+
+### Changed
+- **HEVC NVENC 10bit now reads frames from Unity at 16 bits per channel**
+  (`GetTextureFormat` returns `RGBA64`, so the Recorder core issues a 16-bit
+  `AsyncGPUReadback`, piped to ffmpeg as `rgba64le`) instead of 8-bit
+  `rgb24`. With a high-precision source (e.g. a 16-bit RenderTexture),
+  smooth dark gradients such as volumetric light cones keep real 10-bit
+  gradation: banding visibly decreases compared to 3.x, which quantized
+  every frame to 8 bits before encoding. Same settings now produce
+  different (better) pixels, hence MAJOR. 8-bit sources (e.g. Game View
+  capture) still yield effectively 8-bit gradation, and every other
+  encoder format is byte-identical to 3.1.1. Recording speed and file
+  size are essentially unchanged (measured on a 7488x1344 RT source).
+
 ## [3.1.1] - 2026-08-25
 
 ### Fixed
