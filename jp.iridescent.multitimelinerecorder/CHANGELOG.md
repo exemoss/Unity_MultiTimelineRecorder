@@ -7,6 +7,22 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.1.1] - 2026-08-26
+
+### Fixed
+- Recording to an **absolute path outside the project** (e.g. `D:\RecSetBatch`)
+  silently wrote the file into the project root instead. Unity Recorder's
+  `OutputPath.FromPath` stores an absolute directory only in `m_Leaf`; the
+  `m_AbsolutePath` backing field stays `null` and `GetFullPath` falls back to
+  the leaf — but a `null` string becomes an **empty** string after a
+  serialization roundtrip (the temp-asset reload used for Play Mode
+  recording), so the fallback check (`!= null`) passed and the directory
+  collapsed to the bare file name, which ffmpeg then resolved against its
+  working directory (the project root). `ConfigureOutputPath` now also
+  writes the directory into `m_AbsolutePath` (via reflection; the Recorder
+  package itself stays unmodified) so both fields agree after the roundtrip.
+  Project-relative outputs (`Recordings/...`) were never affected.
+
 ## [4.1.0] - 2026-08-26
 
 ### Added
