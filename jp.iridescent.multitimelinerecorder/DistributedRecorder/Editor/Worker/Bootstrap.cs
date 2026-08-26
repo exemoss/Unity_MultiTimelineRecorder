@@ -207,6 +207,10 @@ namespace DistributedRecorder.Worker
             // thread (PackageManager API is main-thread-only).
             _ = VersionChecker.RecorderVersion;
 
+            // Same reason for the MTR package's own version (project-job-hook v4.2.0):
+            // HandleHealth reports it from a listener thread and must hit the cache.
+            _ = VersionChecker.MtrPackageVersion;
+
             // Load shared key — resolution order:
             //   1. -distRecorderPassword CLI argument (highest priority)
             //   2. SharedKeyLoader.TryLoad() which tries EditorPrefs password first,

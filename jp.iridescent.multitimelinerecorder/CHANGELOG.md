@@ -7,6 +7,33 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.2.0] - 2026-08-27
+
+### Added
+- **Project-job hook** for the distributed recorder: a `JobRequest` whose new
+  `projectJobKind` field is non-empty delegates the ENTIRE job execution —
+  scene preparation, any number of Play Mode recording passes, cleanup — to a
+  handler the Unity *project* registers via the new
+  `DistributedRecorder.Worker.ProjectJobHandlerRegistry`
+  (Start / Poll / Cancel delegates, registered from an
+  `[InitializeOnLoadMethod]`). The package contributes only what it already
+  owns — transport, HMAC auth, queueing, progress forwarding (`Poll` unit
+  counts are surfaced as currentFrame/totalFrames), result bookkeeping, the
+  N-job restart cycle and disk-quota sweep. During a project job the Worker
+  keeps `PlayModeReloadGuard` enabled for the whole job so the listener, the
+  runner and the handler registration survive every Play Mode entry. The
+  opaque `projectJobPayloadJson` (≤ 1 MB) travels verbatim to the handler.
+  Designed for project-side batch systems (e.g. a song-bundle render batch
+  that must rebuild scene content on the Worker before recording).
+- `WorkerHealth.mtrVersion`: Workers now report this package's own version in
+  GET /health. `JobDispatcher.DispatchAsync` uses it as a hard capability gate
+  for project jobs (`ProjectJobSupport.IsSupported`, minimum 4.2.0, NOT
+  skippable via `skipVersionCheck`): a pre-4.2.0 Worker would silently drop
+  the unknown fields (JsonUtility) and mis-run the job as a legacy MTR job.
+- Wire compatibility: all new fields are additive with empty defaults —
+  existing MTR / legacy jobs, old Masters and old Workers are byte-identical
+  in behavior (hence MINOR).
+
 ## [4.1.1] - 2026-08-26
 
 ### Fixed

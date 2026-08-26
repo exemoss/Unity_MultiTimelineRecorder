@@ -272,6 +272,11 @@ namespace DistributedRecorder.Worker
                 jobsProcessed   = _store.CompletedJobCount,
                 gitBranch       = gitBranch,
                 gitCommitShort  = gitCommitShort,
+                // project-job-hook (v4.2.0): capability advertisement for the Master's
+                // project-job dispatch gate. Warmed on the main thread in Bootstrap
+                // (PackageManager APIs are main-thread-only; this handler runs on a
+                // listener thread and reads the cached value).
+                mtrVersion      = VersionChecker.MtrPackageVersion,
             };
             RespondJson(ctx, 200, ProtocolSerializer.Serialize(health));
         }

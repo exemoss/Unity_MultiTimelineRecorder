@@ -36,6 +36,10 @@ namespace DistributedRecorder.Shared
         // worker-recording-fix: dispatchTimestamp
         private const int DispatchTimestampLength = 14; // yyyyMMddHHmmss
 
+        // project-job-hook (v4.2.0)
+        private const int MaxProjectJobKindLength   = 64;
+        private const int MaxProjectJobPayloadBytes = 1024 * 1024; // 1 MB (same cap as metaJson)
+
         // RecorderJobConfig range constraints
         private const int    MinResolution  = 1;
         private const int    MaxResolution  = 16384;
@@ -67,12 +71,48 @@ namespace DistributedRecorder.Shared
                 return false;
             }
 
+            // projectJobKind / projectJobPayloadJson (project-job-hook, v4.2.0)
+            // Both optional; kind identifies a project-registered handler that owns the
+            // whole job execution. Validate FIRST because the presence of a kind relaxes
+            // the recording-target and scenePath requirements below.
+            bool isProjectJob = !string.IsNullOrEmpty(request.projectJobKind);
+            if (isProjectJob)
+            {
+                if (request.projectJobKind.Length > MaxProjectJobKindLength)
+                {
+                    reason = $"projectJobKind exceeds maximum length of {MaxProjectJobKindLength}.";
+                    return false;
+                }
+                if (!IsProjectJobKindToken(request.projectJobKind))
+                {
+                    reason = "projectJobKind contains disallowed characters " +
+                             "(alphanumeric, '.', '_' and '-' only).";
+                    return false;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(request.projectJobPayloadJson))
+            {
+                if (!isProjectJob)
+                {
+                    reason = "projectJobPayloadJson requires a non-empty projectJobKind.";
+                    return false;
+                }
+                if (Encoding.UTF8.GetByteCount(request.projectJobPayloadJson) > MaxProjectJobPayloadBytes)
+                {
+                    reason = "projectJobPayloadJson exceeds the 1 MB limit.";
+                    return false;
+                }
+            }
+
             // recorderSettingsAssetPath
             // Optional on the MTR path (recorderConfig is used instead).
             // - When non-empty: must be a valid relative path (backward compat with legacy Masters).
             // - When empty: allowed only when recorderConfig is provided (MTR path).
             //   If both recorderSettingsAssetPath AND recorderConfig.timelineAssetPath are absent,
             //   the recording target is unknown — reject.
+            //   Exception: project jobs (projectJobKind non-empty) carry their target in the
+            //   opaque payload; the registered handler owns it, so neither field is required.
             if (!string.IsNullOrEmpty(request.recorderSettingsAssetPath))
             {
                 if (request.recorderSettingsAssetPath.Length > MaxAssetPathLength)
@@ -89,8 +129,9 @@ namespace DistributedRecorder.Shared
             else
             {
                 // recorderSettingsAssetPath is empty: require timelineAssetPath (MTR path) to be
-                // non-empty so we know the recording target.
-                if (string.IsNullOrEmpty(request.timelineAssetPath))
+                // non-empty so we know the recording target — unless this is a project job
+                // (the registered handler owns the target; see projectJobKind above).
+                if (string.IsNullOrEmpty(request.timelineAssetPath) && !isProjectJob)
                 {
                     reason = "Either 'recorderSettingsAssetPath' or 'timelineAssetPath' must be provided — recording target is unknown.";
                     return false;
@@ -98,12 +139,18 @@ namespace DistributedRecorder.Shared
             }
 
             // scenePath
-            if (!ValidateRequiredString(request.scenePath, "scenePath", MaxAssetPathLength, out reason))
-                return false;
-            if (!IsRelativeSafePath(request.scenePath))
+            // Required for MTR / legacy jobs. Optional for project jobs (the handler may
+            // open scenes itself); still validated when provided so it cannot be used as
+            // a traversal vector.
+            if (!isProjectJob || !string.IsNullOrEmpty(request.scenePath))
             {
-                reason = "scenePath must be a relative path inside the project and must not contain '..'.";
-                return false;
+                if (!ValidateRequiredString(request.scenePath, "scenePath", MaxAssetPathLength, out reason))
+                    return false;
+                if (!IsRelativeSafePath(request.scenePath))
+                {
+                    reason = "scenePath must be a relative path inside the project and must not contain '..'.";
+                    return false;
+                }
             }
 
             // gitCommit – optional 7–64 hex (git HEAD SHA); validated only when non-empty.
@@ -601,6 +648,25 @@ namespace DistributedRecorder.Shared
 
         private static bool IsAlphanumericOrHyphen(string s)
             => IsAlphanumericOrHyphenStatic(s);
+
+        /// <summary>
+        /// Returns true when <paramref name="s"/> is a valid project-job kind token:
+        /// letters, digits, '.', '_' and '-' only (no path separators, no whitespace,
+        /// no control characters). Added in project-job-hook (v4.2.0).
+        /// </summary>
+        private static bool IsProjectJobKindToken(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            foreach (char c in s)
+            {
+                bool ok = (c >= 'a' && c <= 'z')
+                       || (c >= 'A' && c <= 'Z')
+                       || (c >= '0' && c <= '9')
+                       || c == '.' || c == '_' || c == '-';
+                if (!ok) return false;
+            }
+            return true;
+        }
 
         /// <summary>
         /// Returns true when <paramref name="s"/> contains only letters, digits, hyphens,

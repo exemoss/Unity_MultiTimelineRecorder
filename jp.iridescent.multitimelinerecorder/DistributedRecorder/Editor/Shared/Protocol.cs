@@ -317,6 +317,39 @@ namespace DistributedRecorder.Shared
         /// Validated: relative path, no "..", max 512 chars.
         /// </summary>
         public string resolvedOutputRelativePath = string.Empty;
+
+        // -----------------------------------------------------------------------
+        // Project-job fields (added in project-job-hook, v4.2.0)
+        //
+        // A "project job" delegates the ENTIRE job execution (scene preparation,
+        // Play Mode recording passes, cleanup) to a handler registered by the
+        // Unity PROJECT's own editor code via
+        // <see cref="DistributedRecorder.Worker.ProjectJobHandlerRegistry"/>.
+        // The package provides only transport / auth / queueing / progress; it
+        // knows nothing about the job's semantics.
+        //
+        // Wire compatibility: JsonUtility on pre-4.2.0 Workers silently drops the
+        // unknown fields and would mis-run the job as a legacy MTR job. The Master
+        // therefore MUST gate dispatch on <see cref="WorkerHealth.mtrVersion"/>
+        // (see JobDispatcher — the gate is NOT skippable via skipVersionCheck).
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Handler kind ID for a project-defined job (e.g. "recset").
+        /// Empty (default) = normal MTR / legacy job; the fields below are ignored.
+        /// Non-empty = the Worker routes the job to the project-side handler
+        /// registered under this kind, and fails the job when none is registered.
+        /// Validated: max 64 chars, charset [A-Za-z0-9._-].
+        /// </summary>
+        public string projectJobKind = string.Empty;
+
+        /// <summary>
+        /// Opaque payload for the project-side handler, serialized by the Master's
+        /// project code (typically JsonUtility JSON). The package never interprets
+        /// this value — it is passed verbatim to the registered handler.
+        /// Validated: max 1 MB UTF-8; requires <see cref="projectJobKind"/> non-empty.
+        /// </summary>
+        public string projectJobPayloadJson = string.Empty;
     }
 
     /// <summary>
@@ -390,6 +423,12 @@ namespace DistributedRecorder.Shared
         public string gitBranch         = string.Empty;
         /// <summary>Short (8-char) HEAD commit SHA on this Worker.  Empty when unavailable.</summary>
         public string gitCommitShort    = string.Empty;
+
+        // project-job-hook (v4.2.0): this package's own version, so the Master can gate
+        // project-job dispatch on Worker capability. Pre-4.2.0 Workers never send this
+        // field → empty on the Master = "does not support project jobs".
+        /// <summary>MTR package version on this Worker (package.json "version"). Empty when unresolvable or pre-4.2.0.</summary>
+        public string mtrVersion        = string.Empty;
     }
 
     // ---------------------------------------------------------------------------

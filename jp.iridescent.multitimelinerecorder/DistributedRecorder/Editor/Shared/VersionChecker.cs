@@ -56,6 +56,33 @@ namespace DistributedRecorder.Shared
         /// </summary>
         public static void InvalidateCache() => _cachedRecorderVersion = null;
 
+        // Cached after first successful lookup (same non-empty-only caching rule as
+        // _cachedRecorderVersion — see the F9 bug note on RecorderVersion).
+        private static string _cachedMtrVersion;
+
+        /// <summary>
+        /// Returns this MTR package's own version (package.json "version"), resolved
+        /// synchronously via <c>PackageInfo.FindForAssembly</c> on this assembly.
+        /// Empty string when the assembly is not resolved to a UPM package (loose
+        /// Assets-folder install — MTR does not use one, but defend anyway).
+        ///
+        /// Sent in <see cref="WorkerHealth.mtrVersion"/> so the Master can gate
+        /// project-job dispatch on Worker capability (project-job-hook, v4.2.0).
+        /// </summary>
+        public static string MtrPackageVersion
+        {
+            get
+            {
+                if (!string.IsNullOrEmpty(_cachedMtrVersion))
+                    return _cachedMtrVersion;
+
+                string resolved = ResolveMtrVersion();
+                if (!string.IsNullOrEmpty(resolved))
+                    _cachedMtrVersion = resolved;
+                return resolved;
+            }
+        }
+
         /// <summary>
         /// Compares <paramref name="remoteUnityVersion"/> and
         /// <paramref name="remoteRecorderVersion"/> against the local values.
@@ -123,6 +150,25 @@ namespace DistributedRecorder.Shared
             }
 #endif
             return string.Empty;
+        }
+
+        private static string ResolveMtrVersion()
+        {
+#if UNITY_EDITOR
+            try
+            {
+                var pkgInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(
+                    typeof(VersionChecker).Assembly);
+                return pkgInfo != null ? pkgInfo.version : string.Empty;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[VersionChecker] Failed to resolve MTR package version: {ex.Message}");
+                return string.Empty;
+            }
+#else
+            return string.Empty;
+#endif
         }
     }
 }

@@ -76,6 +76,7 @@ namespace DistributedRecorder.Worker
             WaitingForPlayMode,    // EnterPlaymode() called; waiting for isPlaying
             DirectorPlayback,      // Play Mode active; director playing; recording in progress
             WaitingForEditMode,    // ExitPlaymode() called; waiting for Edit Mode
+            ProjectJob,            // project-job-hook: registered handler owns execution; we poll it
         }
 
         private RecordingPhase _phase             = RecordingPhase.Idle;
@@ -123,6 +124,22 @@ namespace DistributedRecorder.Worker
         // Saved so we can restore in cleanup regardless of success/failure.
         private Dictionary<PlayableDirector, bool> _savedPlayOnAwakeValues;
         private List<(TrackAsset track, bool wasMuted)> _savedRecorderTrackMutes;
+
+        // ---- project-job-hook (v4.2.0) state ----
+
+        // Handler kind of the running project job (null when the current job is not one).
+        // Used by HandleProjectJob to re-resolve the handler each poll (registration is
+        // stable for the whole job because PlayModeReloadGuard suppresses domain reloads).
+        private string _projectJobKind;
+
+        // Last progress values pushed to the Master, so we only push on change
+        // (plus a periodic heartbeat) instead of every editor update.
+        private int    _projectJobLastUnit = -1;
+        private string _projectJobLastMessage;
+        private long   _projectJobLastPushUtc;
+
+        // Heartbeat interval for unchanged project-job progress (seconds).
+        private const long ProjectJobHeartbeatSeconds = 5;
 
         // ------------------------------------------------------------------
         // Constructor
@@ -217,6 +234,23 @@ namespace DistributedRecorder.Worker
 
             Debug.Log($"[JobRunner] ジョブ '{jobId}' のキャンセルを開始します。");
 
+            // project-job-hook: let the registered handler start its own wind-down
+            // (stop requests, restores) BEFORE the generic interruption below. The
+            // handler keeps winding down after we mark the job Cancelled; it must
+            // reject a new Start while that is still in progress (registry contract).
+            if (_phase == RecordingPhase.ProjectJob &&
+                ProjectJobHandlerRegistry.TryGet(_projectJobKind, out var projectHandler))
+            {
+                try
+                {
+                    projectHandler.Cancel(jobId);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogException(ex);
+                }
+            }
+
             // Unsubscribe update/state-change callbacks first to prevent
             // the normal completion path from racing with cancel.
             UnsubscribeAll();
@@ -296,6 +330,15 @@ namespace DistributedRecorder.Worker
                     "Recorder 5.1 Known Issue: batchmode ではグラフィックスパイプラインが" +
                     "初期化されないためフレームのキャプチャが行われません。" +
                     "GUI Editor（非 batchmode）で Worker を起動してください。");
+                return;
+            }
+
+            // ----- Project job path (project-job-hook, v4.2.0) --------------
+            // A non-empty projectJobKind delegates the whole execution to the
+            // project-registered handler. None of the MTR preflight below applies.
+            if (!string.IsNullOrEmpty(request.projectJobKind))
+            {
+                StartProjectJob(request);
                 return;
             }
 
@@ -671,6 +714,184 @@ namespace DistributedRecorder.Worker
         }
 
         // ------------------------------------------------------------------
+        // Project job execution (project-job-hook, v4.2.0)
+        // ------------------------------------------------------------------
+
+#if UNITY_RECORDER
+        /// <summary>
+        /// Starts a project job: resolves the registered handler, optionally opens
+        /// <see cref="JobRequest.scenePath"/>, enables <see cref="PlayModeReloadGuard"/>
+        /// for the whole job (the handler enters/exits Play Mode any number of times;
+        /// the Worker listener and this runner must survive every entry), then hands
+        /// execution to the handler and transitions to polling
+        /// (<see cref="HandleProjectJob"/>).
+        /// </summary>
+        private void StartProjectJob(JobRequest request)
+        {
+            if (!ProjectJobHandlerRegistry.TryGet(request.projectJobKind, out var handler))
+            {
+                FailJob(request.jobId,
+                    $"[P1] projectJobKind '{request.projectJobKind}' のハンドラが未登録です。" +
+                    "プロジェクト側の登録コード（[InitializeOnLoadMethod]）がこの Worker の" +
+                    "プロジェクトに存在するか、コンパイルエラーで死んでいないか確認してください。");
+                return;
+            }
+
+            // Optional scene open — same semantics as the MTR path. Single mode gives the
+            // handler a clean slate (a previously built scene state is discarded on purpose).
+            if (!string.IsNullOrEmpty(request.scenePath))
+            {
+                var openResult = EditorSceneManager.OpenScene(
+                    request.scenePath, OpenSceneMode.Single);
+
+                if (!openResult.IsValid())
+                {
+                    FailJob(request.jobId,
+                        $"シーンのオープンに失敗しました: '{request.scenePath}' " +
+                        "パスが正しいか、プロジェクトが同期されているか確認してください。");
+                    return;
+                }
+
+                AppendE2ELog($"[JobRunner] シーンを開きました: {request.scenePath}");
+            }
+
+            // Keep the Worker infrastructure (HTTP listener, this runner, the handler
+            // registration) alive across every Play Mode entry of the job.
+            // Restored by ResetState() on every terminal path (complete/fail/cancel).
+            PlayModeReloadGuard.Enable();
+
+            _projectJobKind        = request.projectJobKind;
+            _projectJobLastUnit    = -1;
+            _projectJobLastMessage = null;
+            _projectJobLastPushUtc = 0;
+
+            bool   started;
+            string startError;
+            try
+            {
+                started = handler.Start(request, out startError);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex);
+                started    = false;
+                startError = $"ハンドラが例外を投げました: {ex.Message}";
+            }
+
+            if (!started)
+            {
+                FailJob(request.jobId,
+                    $"[P2] プロジェクトジョブの開始に失敗しました " +
+                    $"(kind='{request.projectJobKind}'): {startError}");
+                return;
+            }
+
+            _phase = RecordingPhase.ProjectJob;
+            EditorApplication.update += OnUpdate;
+
+            Debug.Log($"[JobRunner] プロジェクトジョブ開始: '{request.jobId}' (kind='{request.projectJobKind}')");
+            AppendE2ELog($"[JobRunner] プロジェクトジョブ開始 (kind='{request.projectJobKind}')。ハンドラをポーリングします。");
+        }
+
+        /// <summary>
+        /// Polls the project-job handler once and forwards progress / finalization.
+        /// Called from <see cref="OnUpdate"/> while in <see cref="RecordingPhase.ProjectJob"/>;
+        /// exposed internal so hermetic EditMode tests can drive the poll without the
+        /// editor update pump.
+        /// </summary>
+        internal void PollProjectJobOnce()
+        {
+            ProjectJobHandlerRegistry.PollStatus status = null;
+            string pollError = null;
+
+            if (!ProjectJobHandlerRegistry.TryGet(_projectJobKind, out var handler))
+            {
+                pollError = $"ハンドラ '{_projectJobKind}' が登録から消えました。";
+            }
+            else
+            {
+                try
+                {
+                    status = handler.Poll(_runningJobId);
+                    if (status == null)
+                        pollError = "ハンドラの Poll が null を返しました（ジョブを見失った状態）。";
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogException(ex);
+                    pollError = $"ハンドラの Poll が例外を投げました: {ex.Message}";
+                }
+            }
+
+            if (status == null)
+            {
+                UnsubscribeAll();
+                FailJob(_runningJobId, $"[P3] プロジェクトジョブの監視に失敗しました: {pollError}");
+                return;
+            }
+
+            if (status.finished)
+            {
+                UnsubscribeAll();
+
+                if (status.success)
+                {
+                    // Record the final unit counts before the generic finalization
+                    // (FinalizeCompletedJob only flips the state).
+                    _store.UpdateStatus(_runningJobId, s =>
+                    {
+                        s.currentFrame = status.currentUnit;
+                        s.totalFrames  = status.totalUnits;
+                        if (!string.IsNullOrEmpty(status.message))
+                            s.message = status.message;
+                    });
+                    AppendE2ELog($"[JobRunner] プロジェクトジョブ完了: {status.message}");
+                    FinalizeCompletedJob(_runningJobId);
+                }
+                else
+                {
+                    string error = string.IsNullOrEmpty(status.message)
+                        ? "プロジェクトジョブが失敗しました（ハンドラからの詳細なし）。"
+                        : status.message;
+                    FailJob(_runningJobId, $"[P4] {error}");
+                }
+                return;
+            }
+
+            // ----- Progress forwarding (on change + periodic heartbeat) -----
+            long nowUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            bool changed = status.currentUnit != _projectJobLastUnit
+                        || !string.Equals(status.message, _projectJobLastMessage, StringComparison.Ordinal);
+            bool heartbeatDue = nowUtc - _projectJobLastPushUtc >= ProjectJobHeartbeatSeconds;
+
+            if (!changed && !heartbeatDue)
+                return;
+
+            _projectJobLastUnit    = status.currentUnit;
+            _projectJobLastMessage = status.message;
+            _projectJobLastPushUtc = nowUtc;
+
+            _store.UpdateStatus(_runningJobId, s =>
+            {
+                s.state        = JobState.Running;
+                s.currentFrame = status.currentUnit;
+                s.totalFrames  = status.totalUnits;
+                s.message      = status.message ?? string.Empty;
+            });
+
+            _progress.Push(new ProgressEvent
+            {
+                jobId        = _runningJobId,
+                state        = JobState.Running,
+                currentFrame = status.currentUnit,
+                totalFrames  = status.totalUnits,
+                message      = status.message ?? string.Empty,
+                timestampUtc = nowUtc
+            });
+        }
+#endif
+
+        // ------------------------------------------------------------------
         // Play Mode state change handler
         // ------------------------------------------------------------------
 
@@ -809,6 +1030,10 @@ namespace DistributedRecorder.Worker
 
                 case RecordingPhase.WaitingForEditMode:
                     HandleWaitingForEditMode();
+                    break;
+
+                case RecordingPhase.ProjectJob:
+                    PollProjectJobOnce();
                     break;
             }
 #endif
@@ -1316,6 +1541,12 @@ namespace DistributedRecorder.Worker
             _preflightDirectorName = null;
             _tempTimelineAssetPath = null;
             _isHeadlessPath        = false;
+
+            // project-job-hook state
+            _projectJobKind        = null;
+            _projectJobLastUnit    = -1;
+            _projectJobLastMessage = null;
+            _projectJobLastPushUtc = 0;
 #if UNITY_RECORDER
             if (_director != null)
             {

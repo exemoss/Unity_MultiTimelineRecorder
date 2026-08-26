@@ -517,6 +517,16 @@ namespace DistributedRecorder.Master
                     $"Worker '{worker.displayName}' did not respond within {HealthTimeout.TotalSeconds}s: {ex.Message}");
             }
 
+            // 1b. Project-job capability gate (project-job-hook, v4.2.0).
+            // A pre-4.2.0 Worker silently drops the projectJob* fields (JsonUtility)
+            // and would mis-run the job as a legacy MTR job, so this gate is a hard
+            // capability check — intentionally NOT skippable via skipVersionCheck.
+            if (!string.IsNullOrEmpty(request.projectJobKind) &&
+                !ProjectJobSupport.IsSupported(health.mtrVersion, out string supportReason))
+            {
+                return DispatchResult.Fail(request.jobId, DispatchFailReason.VersionMismatch, supportReason);
+            }
+
             // 2. Version check (MVP-A3).
             // Skipped when the user has approved the override via the UI dialog.
             if (!skipVersionCheck &&
