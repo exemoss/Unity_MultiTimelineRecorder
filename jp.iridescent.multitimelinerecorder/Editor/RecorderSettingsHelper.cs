@@ -232,8 +232,54 @@ namespace Unity.MultiTimelineRecorder
                     }
                     break;
             }
+
+            FixAbsoluteOutputPathSerialization(settings);
         }
-        
+
+        /// <summary>
+        /// プロジェクト外の絶対パス出力がシリアライズ往復で壊れる Unity Recorder 本体の
+        /// 潜在バグへの対症。OutputPath は Absolute ルートの実体を m_AbsolutePath に持つが、
+        /// OutputFile セッター（OutputPath.FromPath）は m_Leaf にしか書かない。
+        /// m_AbsolutePath が null の間は GetFullPath が leaf へフォールバックして動くものの、
+        /// null 文字列はシリアライズ往復で空文字になるためフォールバック判定
+        /// （absolutePath != null）が真になり、一時アセット経由の PlayMode 録画では
+        /// 「ディレクトリ空 + ファイル名のみ」となって ffmpeg の作業ディレクトリ
+        /// （プロジェクト直下）へ書かれる（実事故 2026-08-26: D:\RecSetBatch 指定）。
+        /// 絶対パス指定時は m_AbsolutePath にもディレクトリを書き込み、往復後も一致させる。
+        /// Recorder 本体は無改変ポリシーのため内部メンバへはリフレクションで書く。
+        /// </summary>
+        static void FixAbsoluteOutputPathSerialization(RecorderSettings settings)
+        {
+            var generator = settings != null ? settings.FileNameGenerator : null;
+            if (generator == null || generator.Root != OutputPath.Root.Absolute)
+            {
+                return;
+            }
+
+            var pathField = typeof(FileNameGenerator).GetField(
+                "m_Path",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var outputPath = pathField != null ? pathField.GetValue(generator) : null;
+            var absoluteProperty = outputPath != null
+                ? outputPath.GetType().GetProperty(
+                    "absolutePath",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Public)
+                : null;
+            if (absoluteProperty == null || !absoluteProperty.CanWrite)
+            {
+                MultiTimelineRecorderLogger.LogWarning(
+                    "[RecorderSettingsHelper] OutputPath.absolutePath をリフレクションで解決できませんでした" +
+                    "（Recorder パッケージの内部構造変更の可能性）。プロジェクト外の絶対パス出力が" +
+                    "プロジェクト直下へ化ける場合はこの経路を見直してください");
+                return;
+            }
+
+            // Absolute ルートでは Leaf にディレクトリの絶対パスが入っている（FromPath の挙動）
+            absoluteProperty.SetValue(outputPath, generator.Leaf);
+        }
+
         /// <summary>
         /// Validate RecorderSettings configuration
         /// </summary>
