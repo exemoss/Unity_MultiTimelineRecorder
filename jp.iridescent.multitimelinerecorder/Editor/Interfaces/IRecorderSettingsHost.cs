@@ -61,6 +61,7 @@ namespace Unity.MultiTimelineRecorder
         string movieFfmpegPath { get; set; }
         int movieFfmpegQp { get; set; }
         int movieFfmpegBitrateKbps { get; set; }
+        bool movieFfmpegDeband { get; set; }
         
         // AOV settings
         AOVType selectedAOVTypes { get; set; }

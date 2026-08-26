@@ -252,6 +252,11 @@ namespace Unity.MultiTimelineRecorder.RecorderConfigEditors
                 {
                     movieConfig.ffmpegQp = EditorGUILayout.IntSlider("QP", movieConfig.ffmpegQp, 0, 51);
                 }
+
+                if (movieConfig.encoderType == MovieEncoderType.FFmpegNvencHevc10Bit)
+                {
+                    movieConfig.ffmpegDeband = EditorGUILayout.Toggle("Deband", movieConfig.ffmpegDeband);
+                }
             }
         }
         

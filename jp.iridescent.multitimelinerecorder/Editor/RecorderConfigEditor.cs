@@ -263,6 +263,7 @@ namespace Unity.MultiTimelineRecorder
             public string movieFfmpegPath { get => config.movieFfmpegPath; set => config.movieFfmpegPath = value; }
             public int movieFfmpegQp { get => config.movieFfmpegQp; set => config.movieFfmpegQp = value; }
             public int movieFfmpegBitrateKbps { get => config.movieFfmpegBitrateKbps; set => config.movieFfmpegBitrateKbps = value; }
+            public bool movieFfmpegDeband { get => config.movieFfmpegDeband; set => config.movieFfmpegDeband = value; }
 
             // AOV settings
             public AOVType selectedAOVTypes { get => config.selectedAOVTypes; set => config.selectedAOVTypes = value; }

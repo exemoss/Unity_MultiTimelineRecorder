@@ -117,6 +117,29 @@ namespace Unity.MultiTimelineRecorder.Encoders
         [SerializeField] int scaleHeight;
 
         /// <summary>
+        /// HEVC 10bit のみ: 量子化前に deband フィルタで帯状段差を均すか（既定 false）。
+        /// なだらかな暗部グラデーション（照明ボリューム等）は 10bit 量子化で 1 コード刻みの
+        /// 等高線状の縞になる。±1 コードのディザは NVENC の平坦ブロック量子化に消される
+        /// （QP0 でも実測で消失）が、deband は「実際に異なるコードの滑らかな空間分布」を
+        /// 作るためエンコード後も効果が残る（2026-08-26 実測）。
+        /// しきい値は輝度差 1% 未満の平坦部にのみ作用する固定プリセット
+        /// （<see cref="DebandFilter"/>）。エッジ・ディテールはしきい値超えのため保持される。
+        /// </summary>
+        public bool Deband
+        {
+            get => deband;
+            set => deband = value;
+        }
+        [SerializeField] bool deband;
+
+        /// <summary>
+        /// deband の固定プリセット。1thr/2thr/3thr=0.01（輝度・色差とも差 1% までを帯とみなす）、
+        /// r=24（参照半径 24px。実測で縞幅 ≈15px をカバー）、b=1（参照点の平均で補間）。
+        /// S04 V_LED_L の実映像でチューニングした値（Recordings/GrainSamples 検証 2026-08-26）。
+        /// </summary>
+        internal const string DebandFilter = "deband=1thr=0.01:2thr=0.01:3thr=0.01:r=24:b=1";
+
+        /// <summary>
         /// 録画セッション先頭から切り捨てるフレーム数（音ズレ対策の頭落とし。0 = 無効）。
         /// 範囲録画では「録画開始と同時か前に有効化された音声が数フレーム先行する」
         /// Unity Recorder の挙動を避けるため、RecorderClip をセクション再生開始より
@@ -148,13 +171,16 @@ namespace Unity.MultiTimelineRecorder.Encoders
         /// (WebM の alpha_mode=1 として格納。RGBA デコード往復を確認済み)。
         /// <see cref="ScaleWidth"/> / <see cref="ScaleHeight"/> が設定されていれば
         /// 同じ scale フィルタで出力解像度へスケーリングする(lanczos)。
+        /// <paramref name="postFormatFilter"/> は format 変換直後（= 出力ビット深度へ量子化された後）
+        /// に挿入する追加フィルタ（deband 等。null = なし）。
         /// </summary>
-        internal string GetColorAndScaleArgs(string pixelFormat)
+        internal string GetColorAndScaleArgs(string pixelFormat, string postFormatFilter = null)
         {
             string scaleSize = scaleWidth > 1 && scaleHeight > 1
                 ? $"{scaleWidth & ~1}:{scaleHeight & ~1}:"
                 : "";
-            return $" -vf scale={scaleSize}out_color_matrix=bt709:out_range=tv:flags=lanczos,format={pixelFormat}," +
+            string post = string.IsNullOrEmpty(postFormatFilter) ? "" : "," + postFormatFilter;
+            return $" -vf scale={scaleSize}out_color_matrix=bt709:out_range=tv:flags=lanczos,format={pixelFormat}{post}," +
                    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709" +
                    " -color_range tv";
         }
@@ -225,6 +251,15 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 : "";
             string encodePixelFormat = Format == OutputFormat.HevcNvenc10Bit ? "p010le" : "yuv420p";
 
+            // deband(10bit のみ): フィルタが p010le(セミプレーナ)を受けないため、量子化を
+            // planar の yuv420p10le で行って deband を挟む。エンコーダへは -pix_fmt p010le の
+            // 自動変換(ビットシフトのみ・無損失)で渡るので出力は非 deband 時と同じ 10bit
+            if (Format == OutputFormat.HevcNvenc10Bit && deband)
+            {
+                return $"-c:v {codec} -pix_fmt p010le {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
+                       + GetColorAndScaleArgs("yuv420p10le", DebandFilter);
+            }
+
             return $"-c:v {codec} -pix_fmt {encodePixelFormat} {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
                    + GetColorAndScaleArgs(encodePixelFormat);
         }
@@ -285,7 +320,8 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 && bitrateKbps == other.bitrateKbps
                 && scaleWidth == other.scaleWidth
                 && scaleHeight == other.scaleHeight
-                && headTrimFrames == other.headTrimFrames;
+                && headTrimFrames == other.headTrimFrames
+                && deband == other.deband;
         }
 
         public override bool Equals(object obj)
@@ -295,7 +331,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
         public override int GetHashCode()
         {
-            return HashCode.Combine((int)outputFormat, ffmpegPath, qp, bitrateKbps, scaleWidth, scaleHeight, headTrimFrames);
+            return HashCode.Combine((int)outputFormat, ffmpegPath, qp, bitrateKbps, scaleWidth, scaleHeight, headTrimFrames, deband);
         }
     }
 }

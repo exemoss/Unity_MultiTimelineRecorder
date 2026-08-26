@@ -49,6 +49,7 @@ namespace Unity.MultiTimelineRecorder
         public string movieFfmpegPath = string.Empty;
         public int movieFfmpegQp = 24;
         public int movieFfmpegBitrateKbps = 0;
+        public bool movieFfmpegDeband = false;
         
         // AOV recorder settings
         public AOVType selectedAOVTypes = AOVType.Depth | AOVType.Normal | AOVType.Albedo;

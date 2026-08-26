@@ -4298,6 +4298,15 @@ namespace Unity.MultiTimelineRecorder
                     item.movieConfig.ffmpegTargetBitrateKbps = value;
                 }
             }
+            public bool movieFfmpegDeband
+            {
+                get => item.movieConfig?.ffmpegDeband ?? false;
+                set
+                {
+                    if (item.movieConfig == null) item.movieConfig = new MovieRecorderSettingsConfig();
+                    item.movieConfig.ffmpegDeband = value;
+                }
+            }
 
             // AOV settings
             public AOVType selectedAOVTypes 

@@ -211,10 +211,18 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             if (host.movieEncoderType == MovieEncoderType.FFmpegNvencHevc10Bit)
             {
                 EditorGUILayout.HelpBox(
-                    "HEVC 10bit (Main10): 入力フレームは 8bit のまま、量子化を 10bit 精度で行うことで" +
-                    "グラデーションのバンディングを軽減します。ファイルサイズ・速度は 8bit HEVC とほぼ同等。" +
+                    "HEVC 10bit (Main10): フレームを 16bit で受け取り 10bit 精度で量子化することで" +
+                    "グラデーションのバンディングを軽減します(v4.0.0 から真の 10bit 入力)。" +
+                    "ファイルサイズ・速度は 8bit HEVC とほぼ同等。" +
                     "NVENC の 10bit HEVC は GTX 10 系(Pascal)以降の GPU が必要です。",
                     MessageType.Info);
+
+                host.movieFfmpegDeband = EditorGUILayout.Toggle(
+                    new GUIContent("Deband",
+                        "量子化前に deband フィルタで帯状段差(なだらかな暗部グラデーションの縞)を均す。" +
+                        "照明ボリューム等のバンディング対策。エッジ・ディテールは保持(輝度差1%未満の平坦部にのみ作用)。" +
+                        "ファイルサイズは1割強増える。"),
+                    host.movieFfmpegDeband);
             }
 
             if (host.imageSourceType == ImageRecorderSourceType.RenderTexture)

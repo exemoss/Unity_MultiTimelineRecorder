@@ -61,6 +61,11 @@ namespace Unity.MultiTimelineRecorder
 
         [Tooltip("NVENC の目標ビットレート(kbps)。0の場合はQP固定モード(ffmpegQp)を使用する。0より大きい場合は可変ビットレートモードに切り替わる。")]
         public int ffmpegTargetBitrateKbps = 0;
+
+        [Tooltip("HEVC 10bit のみ: 量子化前に deband フィルタで帯状段差(なだらかな暗部グラデーションの縞)を均す。" +
+                 "照明ボリューム等のバンディング対策。エッジ・ディテールは保持される(輝度差1%未満の平坦部にのみ作用)。" +
+                 "ファイルサイズは1割強増える。他のエンコーダ選択時は無視される。")]
+        public bool ffmpegDeband = false;
         
         // Resolution settings
         public int width = 1920;
@@ -190,6 +195,7 @@ namespace Unity.MultiTimelineRecorder
                     FfmpegPath = ffmpegPath,
                     Qp = ffmpegQp,
                     BitrateKbps = ffmpegTargetBitrateKbps,
+                    Deband = ffmpegDeband,
                 };
             }
         }
@@ -477,7 +483,8 @@ namespace Unity.MultiTimelineRecorder
                 encoderType = this.encoderType,
                 ffmpegPath = this.ffmpegPath,
                 ffmpegQp = this.ffmpegQp,
-                ffmpegTargetBitrateKbps = this.ffmpegTargetBitrateKbps
+                ffmpegTargetBitrateKbps = this.ffmpegTargetBitrateKbps,
+                ffmpegDeband = this.ffmpegDeband
             };
             
             // Camera参照の深いコピー
