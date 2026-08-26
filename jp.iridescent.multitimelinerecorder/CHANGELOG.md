@@ -7,6 +7,25 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.1.0] - 2026-08-26
+
+### Added
+- Opt-in **Deband** toggle for HEVC NVENC 10bit
+  (`MovieRecorderSettingsConfig.ffmpegDeband` /
+  `MtrFFmpegEncoderSettings.Deband`, default **off** — existing settings
+  produce byte-identical output, hence MINOR): inserts ffmpeg's `deband`
+  filter right after the 10-bit quantization
+  (`format=yuv420p10le,deband=1thr=0.01:2thr=0.01:3thr=0.01:r=24:b=1`) to
+  smooth contour-like banding in gentle dark gradients (volumetric light
+  cones etc.). Sub-code dithering alone measurably does **not** survive
+  NVENC's flat-block quantization (killed even at QP 0), whereas deband's
+  spatial interpolation produces genuinely distinct codes and survives
+  encoding. Edges and detail are preserved (thresholds act only on flats
+  within ~1% luminance). File size grows roughly 10-25%. The fixed preset
+  was tuned on real 7488x1344 LED content. Ignored for all other encoder
+  formats. Also updates the 10bit help text that still claimed 8-bit
+  input (stale since 4.0.0).
+
 ## [4.0.0] - 2026-08-26
 
 ### Changed
