@@ -231,9 +231,14 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
         /// <summary>
         /// VP9(WebM) / ProRes 4444(MOV) はアルファ対応(rgba 入力)。NVENC 系は非対応のため常に rgb24。
+        /// HEVC 10bit は rgba64le(16bit/ch): ソースが 8bit RT のままでは 10bit エンコードしても
+        /// 実階調は 8bit で、なだらかなグラデーション(照明ボリューム等)のバンディングが残る。
+        /// 16bit で読み出し ffmpeg 側で p010le へ落とすことで、高精度 RT ソースの階調を
+        /// 10bit 出力まで通す(8bit ソースでも AsyncGPUReadback の変換で動作は変わらない)。
         /// </summary>
         public string GetPixelFormat(bool inputContainsAlpha) =>
-            FormatSupportsAlpha && inputContainsAlpha ? "rgba" : "rgb24";
+            Format == OutputFormat.HevcNvenc10Bit ? "rgba64le"
+            : FormatSupportsAlpha && inputContainsAlpha ? "rgba" : "rgb24";
 
         /// <inheritdoc/>
         bool IEncoderSettings.CanCaptureAlpha => FormatSupportsAlpha;
@@ -242,8 +247,14 @@ namespace Unity.MultiTimelineRecorder.Encoders
         bool IEncoderSettings.CanCaptureAudio => true;
 
         /// <inheritdoc/>
+        /// <remarks>
+        /// Recorder 本体はこの値から GraphicsFormat を導いて AsyncGPUReadback を発行する
+        /// (BaseTextureRecorder.ReadbackTextureFormat)。HEVC 10bit では RGBA64(R16G16B16A16_UNorm)
+        /// を返し、16bit 読み出しにする(<see cref="GetPixelFormat"/> の rgba64le と対)。
+        /// </remarks>
         TextureFormat IEncoderSettings.GetTextureFormat(bool inputContainsAlpha) =>
-            FormatSupportsAlpha && inputContainsAlpha ? TextureFormat.RGBA32 : TextureFormat.RGB24;
+            Format == OutputFormat.HevcNvenc10Bit ? TextureFormat.RGBA64
+            : FormatSupportsAlpha && inputContainsAlpha ? TextureFormat.RGBA32 : TextureFormat.RGB24;
 
         /// <inheritdoc/>
         void IEncoderSettings.ValidateRecording(RecordingContext ctx, List<string> errors, List<string> warnings)
