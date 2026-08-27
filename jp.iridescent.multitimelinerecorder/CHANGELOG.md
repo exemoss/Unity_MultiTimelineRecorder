@@ -7,6 +7,24 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.3.1] - 2026-08-27
+
+### Fixed
+- **Low-bitrate recordings no longer falsely abort with "Encoder output
+  stalled".** ffmpeg holds output in its internal buffer until it fills, so a
+  recording whose encoded bitrate is tiny (e.g. a mostly-black view — a
+  cast-focus pass of a song where the subject only appears near the end;
+  measured ~4 KB/s) left the .mp4 at its 44-byte header until process close.
+  The Encoder Output Stall Guard, which watches output file size, then killed
+  the healthy recording exactly at its timeout (122 s) every time — while all
+  actually-delivered frames only surfaced in the file via the shutdown flush.
+  All MtrFFmpeg codec paths (NVENC H.264/HEVC/HEVC 10-bit incl. deband,
+  ProRes) now pass `-flush_packets 1`, forcing a flush per packet so the file
+  grows continuously from the start of the recording; the VP9/WebM path
+  already did this for the same reason. Verified that the emitted bytes are
+  identical with and without the flag (only flush granularity changes), so
+  existing settings produce the same output (PATCH).
+
 ## [4.3.0] - 2026-08-27
 
 ### Added
