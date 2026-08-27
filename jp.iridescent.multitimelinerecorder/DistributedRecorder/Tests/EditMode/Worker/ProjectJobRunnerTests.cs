@@ -51,6 +51,8 @@ namespace DistributedRecorder.Tests.Worker
             // Safety net: a test that failed mid-job must not leave the domain-reload
             // guard active in the editor running the suite (Restore is idempotent).
             PlayModeReloadGuard.Restore();
+            // Reload-survival persist must not leak between tests (or into the editor).
+            UnityEditor.SessionState.EraseString(PersistKey);
         }
 
         private static JobRequest MakeProjectJobRequest(string jobId, string kind = "test-kind")
@@ -318,6 +320,106 @@ namespace DistributedRecorder.Tests.Worker
             Assert.AreEqual(JobState.Failed, entry.Status.state);
             StringAssert.Contains("[P4]", entry.Status.message);
             StringAssert.Contains("song switch failed", entry.Status.message);
+        }
+
+        // -----------------------------------------------------------------------
+        // JobRunner: reload survival (v4.2.1 — project jobs run without the guard)
+        // -----------------------------------------------------------------------
+
+        // Session key mirrored from JobRunner.ProjectJobSessionKey (private const).
+        private const string PersistKey = "DistRecorder.ActiveProjectJob";
+
+        [Test]
+        public void ProjectJob_Completion_ClearsSessionPersist()
+        {
+            if (Application.isBatchMode)
+                Assert.Ignore("batchmode: the GUI-editor guard fires before the project-job path.");
+
+            string root = TempProjectRoot;
+            var store   = new JobStore(root);
+            var runner  = new JobRunner(store, new RecordingProgressSink(), root);
+
+            ProjectJobHandlerRegistry.Register("test-kind",
+                (JobRequest r, out string e) => { e = string.Empty; return true; },
+                id => new ProjectJobHandlerRegistry.PollStatus { finished = true, success = true },
+                id => { });
+
+            var request = MakeProjectJobRequest("proj-persist");
+            store.Add(request);
+            runner.TryStartJob("proj-persist", out _);
+
+            Assert.IsNotEmpty(UnityEditor.SessionState.GetString(PersistKey, ""),
+                "Start must persist the active project job to SessionState.");
+
+            runner.PollProjectJobOnce(); // finished + success → terminal
+
+            Assert.IsEmpty(UnityEditor.SessionState.GetString(PersistKey, ""),
+                "Terminal paths must clear the SessionState persist.");
+        }
+
+        [Test]
+        public void TryResumeProjectJob_RestoresStoreEntryAndCompletes()
+        {
+            if (Application.isBatchMode)
+                Assert.Ignore("batchmode: the GUI-editor guard fires before the project-job path.");
+
+            string root = TempProjectRoot;
+            var store   = new JobStore(root);       // リロード後の空ストアを模す
+            var runner  = new JobRunner(store, new RecordingProgressSink(), root);
+
+            ProjectJobHandlerRegistry.Register("test-kind",
+                (JobRequest r, out string e) => { e = string.Empty; return true; },
+                id => new ProjectJobHandlerRegistry.PollStatus
+                    { finished = true, success = true, currentUnit = 2, totalUnits = 2, message = "resumed done" },
+                id => { });
+
+            // StartProjectJob が書くのと同じ形式の退避を直接書いて「リロード直後」を作る
+            //（DTO は private のため、JSON を手組みでエスケープして構築する）
+            var request = MakeProjectJobRequest("proj-resume");
+            string escaped = ProtocolSerializer.Serialize(request)
+                .Replace("\\", "\\\\").Replace("\"", "\\\"");
+            string persistJson =
+                "{\"jobId\":\"proj-resume\",\"kind\":\"test-kind\",\"requestJson\":\"" + escaped + "\"}";
+            UnityEditor.SessionState.SetString(PersistKey, persistJson);
+
+            bool resumed = runner.TryResumeProjectJob();
+
+            Assert.IsTrue(resumed, "A valid persist with a registered handler must resume.");
+            Assert.IsTrue(store.TryGetEntry("proj-resume", out var entry),
+                "Resume must restore the store entry from the persisted request.");
+            Assert.AreEqual(JobState.Running, entry.Status.state);
+
+            runner.PollProjectJobOnce();
+
+            store.TryGetEntry("proj-resume", out var completed);
+            Assert.AreEqual(JobState.Completed, completed.Status.state);
+            Assert.IsEmpty(UnityEditor.SessionState.GetString(PersistKey, ""),
+                "Completion after resume must clear the persist.");
+        }
+
+        [Test]
+        public void TryResumeProjectJob_NoPersist_ReturnsFalse()
+        {
+            string root = TempProjectRoot;
+            var runner  = new JobRunner(new JobStore(root), new RecordingProgressSink(), root);
+
+            UnityEditor.SessionState.EraseString(PersistKey);
+
+            Assert.IsFalse(runner.TryResumeProjectJob());
+        }
+
+        [Test]
+        public void TryResumeProjectJob_CorruptPersist_ErasesAndReturnsFalse()
+        {
+            string root = TempProjectRoot;
+            var runner  = new JobRunner(new JobStore(root), new RecordingProgressSink(), root);
+
+            UnityEditor.SessionState.SetString(PersistKey, "{\"jobId\":\"\",\"kind\":\"\"}");
+            LogAssert.Expect(LogType.Warning, new Regex("退避データが不正"));
+
+            Assert.IsFalse(runner.TryResumeProjectJob());
+            Assert.IsEmpty(UnityEditor.SessionState.GetString(PersistKey, ""),
+                "Corrupt persist must be erased so it cannot wedge future resumes.");
         }
 
         [Test]

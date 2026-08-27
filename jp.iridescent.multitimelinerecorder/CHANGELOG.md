@@ -7,6 +7,28 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.2.1] - 2026-08-27
+
+### Fixed
+- **Project jobs no longer suppress the Play Mode domain reload.** 4.2.0 kept
+  `PlayModeReloadGuard` (DisableDomainReload) enabled for the whole project
+  job so the Worker infrastructure survived Play Mode; but suppressing the
+  reload changed what the handler recorded — editor state that the reload
+  normally rebuilds leaked into Play Mode (real case: LTCGI character
+  lighting went dark in the consuming project's distributed renders while
+  local runs of the identical batch were correct; A/B-verified on one
+  machine with the guard as the only variable). Project jobs now run with
+  the reload enabled — the exact environment of a local run — and instead
+  survive it: the active job (id / kind / full request) is persisted to
+  `SessionState`, and `JobRunner.TryResumeProjectJob` (called from
+  Bootstrap on every WorkerAutoRecovery restart) restores the store entry
+  and resumes polling the re-registered handler. Handlers must keep their
+  own state in reload-surviving storage and re-register via
+  `[InitializeOnLoadMethod]` (the contract docs now say so). Master-side
+  progress polling simply sees the Worker offline during each pass and
+  recovers between passes. MTR (non-project) jobs keep using the guard,
+  unchanged.
+
 ## [4.2.0] - 2026-08-27
 
 ### Added

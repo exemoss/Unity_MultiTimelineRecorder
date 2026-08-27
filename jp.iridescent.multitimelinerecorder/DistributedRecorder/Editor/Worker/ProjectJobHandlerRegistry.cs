@@ -7,9 +7,12 @@
 // forwarding, and result bookkeeping.
 //
 // The project registers its handler from an [InitializeOnLoadMethod] so it is in
-// place before the Worker can accept jobs. During a project job, JobRunner keeps
-// PlayModeReloadGuard enabled (no domain reload on Play Mode entry), so a
-// registration made at editor load survives for the whole job.
+// place before the Worker can accept jobs — and again after EVERY domain reload:
+// project jobs run WITHOUT PlayModeReloadGuard (v4.2.1; suppressing the reload
+// changed recording output in the consuming project), so each Play Mode entry
+// reloads the domain exactly like a local run. The handler must therefore keep its
+// own state in reload-surviving storage (e.g. SessionState) — JobRunner re-attaches
+// via its persisted job record and polls the freshly re-registered handler.
 
 using System;
 using System.Collections.Generic;
@@ -24,11 +27,15 @@ namespace DistributedRecorder.Worker
     ///  1. <see cref="StartDelegate"/> is called once on the Unity main thread after the
     ///     optional <see cref="JobRequest.scenePath"/> has been opened. Returning false
     ///     fails the job immediately with <c>errorMessage</c>.
-    ///  2. <see cref="PollDelegate"/> is then called repeatedly (every editor update,
-    ///     across Play Mode entries/exits — domain reload is suppressed for the whole
-    ///     job). It must be cheap. Returning null, or a <see cref="PollStatus"/> for an
-    ///     unknown job, fails the job ("handler lost the job") — a handler must keep
-    ///     answering for a jobId it accepted until it reports <c>finished</c>.
+    ///  2. <see cref="PollDelegate"/> is then called repeatedly on editor updates. Play
+    ///     Mode entries/exits domain-reload the editor (the guard is NOT used, v4.2.1);
+    ///     polling pauses while the Worker is down mid-reload and resumes after
+    ///     WorkerAutoRecovery restarts it, so polls arrive in the edit-mode gaps between
+    ///     the handler's passes and after the job ends. It must be cheap. Returning
+    ///     null, or a <see cref="PollStatus"/> for an unknown job, fails the job
+    ///     ("handler lost the job") — a handler must keep answering for a jobId it
+    ///     accepted (across reloads, via its own persisted state) until it reports
+    ///     <c>finished</c>.
     ///  3. When <see cref="PollStatus.finished"/> is true the job is finalized as
     ///     Completed (<see cref="PollStatus.success"/> true) or Failed (false, with
     ///     <see cref="PollStatus.message"/> as the error).

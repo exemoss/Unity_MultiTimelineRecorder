@@ -128,9 +128,29 @@ namespace DistributedRecorder.Worker
         // ---- project-job-hook (v4.2.0) state ----
 
         // Handler kind of the running project job (null when the current job is not one).
-        // Used by HandleProjectJob to re-resolve the handler each poll (registration is
-        // stable for the whole job because PlayModeReloadGuard suppresses domain reloads).
+        // Used by HandleProjectJob to re-resolve the handler each poll (the handler
+        // re-registers itself via [InitializeOnLoadMethod] after every domain reload).
         private string _projectJobKind;
+
+        // SessionState key holding the active project job (jobId / kind / full request
+        // JSON). Project jobs run WITHOUT PlayModeReloadGuard (v4.2.1 — suppressing
+        // domain reloads changed recording output: LTCGI character lighting died in the
+        // consuming project because editor-mode state that normally gets rebuilt by the
+        // reload leaked into Play Mode). The domain reload wipes this runner instead,
+        // so the job is persisted here and re-attached by TryResumeProjectJob (called
+        // from Bootstrap when WorkerAutoRecovery restarts the Worker after each pass).
+        // SessionState survives domain reloads and dies with the editor — same safety
+        // semantics as a crashed job simply not resuming.
+        private const string ProjectJobSessionKey = "DistRecorder.ActiveProjectJob";
+
+        /// <summary>SessionState DTO for the active project job (reload survival).</summary>
+        [Serializable]
+        private sealed class ProjectJobPersist
+        {
+            public string jobId;
+            public string kind;
+            public string requestJson;
+        }
 
         // Last progress values pushed to the Master, so we only push on change
         // (plus a periodic heartbeat) instead of every editor update.
@@ -720,11 +740,13 @@ namespace DistributedRecorder.Worker
 #if UNITY_RECORDER
         /// <summary>
         /// Starts a project job: resolves the registered handler, optionally opens
-        /// <see cref="JobRequest.scenePath"/>, enables <see cref="PlayModeReloadGuard"/>
-        /// for the whole job (the handler enters/exits Play Mode any number of times;
-        /// the Worker listener and this runner must survive every entry), then hands
-        /// execution to the handler and transitions to polling
-        /// (<see cref="HandleProjectJob"/>).
+        /// <see cref="JobRequest.scenePath"/>, persists the job to SessionState (see
+        /// <see cref="ProjectJobSessionKey"/> — project jobs run WITHOUT
+        /// <see cref="PlayModeReloadGuard"/> so every Play Mode entry domain-reloads
+        /// exactly like a local run of the project's own batch; this runner dies with
+        /// the reload and is re-attached via <see cref="TryResumeProjectJob"/>), then
+        /// hands execution to the handler and transitions to polling
+        /// (<see cref="PollProjectJobOnce"/>).
         /// </summary>
         private void StartProjectJob(JobRequest request)
         {
@@ -755,10 +777,18 @@ namespace DistributedRecorder.Worker
                 AppendE2ELog($"[JobRunner] シーンを開きました: {request.scenePath}");
             }
 
-            // Keep the Worker infrastructure (HTTP listener, this runner, the handler
-            // registration) alive across every Play Mode entry of the job.
-            // Restored by ResetState() on every terminal path (complete/fail/cancel).
-            PlayModeReloadGuard.Enable();
+            // v4.2.1: PlayModeReloadGuard is deliberately NOT enabled here. Suppressing
+            // the domain reload changed what the handler recorded (edit-mode state that
+            // the reload normally rebuilds leaked into Play Mode — real case: LTCGI
+            // character lighting went dark in the consuming project). Instead the job is
+            // persisted to SessionState and this runner is re-attached after each reload
+            // by TryResumeProjectJob (Bootstrap → WorkerAutoRecovery restart cycle).
+            SessionState.SetString(ProjectJobSessionKey, JsonUtility.ToJson(new ProjectJobPersist
+            {
+                jobId       = request.jobId,
+                kind        = request.projectJobKind,
+                requestJson = ProtocolSerializer.Serialize(request),
+            }));
 
             _projectJobKind        = request.projectJobKind;
             _projectJobLastUnit    = -1;
@@ -890,6 +920,87 @@ namespace DistributedRecorder.Worker
             });
         }
 #endif
+
+        /// <summary>
+        /// Re-attaches a project job that was running before a domain reload (project
+        /// jobs run WITHOUT PlayModeReloadGuard — see <see cref="StartProjectJob"/>).
+        /// Called by Bootstrap after the store is created, i.e. every time
+        /// WorkerAutoRecovery restarts the Worker between the handler's Play Mode
+        /// passes. The handler itself survives via its own [InitializeOnLoadMethod]
+        /// re-registration and its own persisted state; this method only restores the
+        /// store entry and resumes polling. Returns true when a job was resumed.
+        /// </summary>
+        public bool TryResumeProjectJob()
+        {
+            var json = SessionState.GetString(ProjectJobSessionKey, string.Empty);
+            if (string.IsNullOrEmpty(json))
+            {
+                return false;
+            }
+
+            ProjectJobPersist persist = null;
+            try
+            {
+                persist = JsonUtility.FromJson<ProjectJobPersist>(json);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex);
+            }
+
+            if (persist == null || string.IsNullOrEmpty(persist.jobId) ||
+                string.IsNullOrEmpty(persist.kind))
+            {
+                Debug.LogWarning("[JobRunner] プロジェクトジョブの退避データが不正のため破棄します。");
+                SessionState.EraseString(ProjectJobSessionKey);
+                return false;
+            }
+
+            if (_phase != RecordingPhase.Idle || _store.HasActiveJob)
+            {
+                // 別ジョブが既に走っている異常系。退避は残さず破棄する
+                Debug.LogWarning($"[JobRunner] プロジェクトジョブ '{persist.jobId}' の再開をスキップします" +
+                                 $"（phase={_phase}, active='{_store.ActiveJobId}'）。");
+                SessionState.EraseString(ProjectJobSessionKey);
+                return false;
+            }
+
+            // ストアのエントリを復元する（リロードで in-memory ストアは空になっている）
+            if (!_store.TryGetEntry(persist.jobId, out _))
+            {
+                JobRequest request = null;
+                try
+                {
+                    request = ProtocolSerializer.Deserialize<JobRequest>(persist.requestJson);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogException(ex);
+                }
+
+                if (request == null || request.jobId != persist.jobId)
+                {
+                    Debug.LogWarning("[JobRunner] プロジェクトジョブの JobRequest 退避が復元できないため破棄します。");
+                    SessionState.EraseString(ProjectJobSessionKey);
+                    return false;
+                }
+
+                _store.Add(request);
+            }
+
+            _store.UpdateStatus(persist.jobId, s => s.state = JobState.Running);
+            _runningJobId   = persist.jobId;
+            _projectJobKind = persist.kind;
+#if UNITY_RECORDER
+            _phase = RecordingPhase.ProjectJob;
+            EditorApplication.update += OnUpdate;
+            Debug.Log($"[JobRunner] プロジェクトジョブを再開しました: '{persist.jobId}' (kind='{persist.kind}')");
+            return true;
+#else
+            FailJob(persist.jobId, "com.unity.recorder パッケージがインストールされていません。");
+            return false;
+#endif
+        }
 
         // ------------------------------------------------------------------
         // Play Mode state change handler
@@ -1542,11 +1653,14 @@ namespace DistributedRecorder.Worker
             _tempTimelineAssetPath = null;
             _isHeadlessPath        = false;
 
-            // project-job-hook state
+            // project-job-hook state. The SessionState persist is cleared on every
+            // terminal path (ResetState is only reached via Finalize / Fail / Cancel)
+            // so a finished job is never resumed after a later domain reload.
             _projectJobKind        = null;
             _projectJobLastUnit    = -1;
             _projectJobLastMessage = null;
             _projectJobLastPushUtc = 0;
+            SessionState.EraseString(ProjectJobSessionKey);
 #if UNITY_RECORDER
             if (_director != null)
             {

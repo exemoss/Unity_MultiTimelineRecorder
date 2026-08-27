@@ -335,6 +335,12 @@ namespace DistributedRecorder.Worker
                 : $"WorkerAutoRecovery will restart the listener after {config.MaxJobsBeforeRestart} jobs (interactive mode).";
             Debug.Log($"[Bootstrap] Worker ready on port {config.Port}. {restartNote}");
 
+            // project-job-hook v4.2.1: project jobs run WITHOUT PlayModeReloadGuard, so
+            // this whole Bootstrap (and the runner) dies on every Play Mode domain reload
+            // and is restarted here by WorkerAutoRecovery. Re-attach the persisted
+            // project job (no-op when none is active).
+            runner.TryResumeProjectJob();
+
             // Start UDP discovery listener so Master can locate this Worker.
             // keyBytes is guaranteed non-null here (loaded == true check above).
             _udpCts = new CancellationTokenSource();
