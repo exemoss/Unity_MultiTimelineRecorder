@@ -16,7 +16,12 @@ namespace DistributedRecorder.Shared
     ///    string concatenation into <c>Arguments</c>, so shell injection is impossible.
     ///  - External input (e.g. received <c>gitCommit</c>) is NEVER passed as a git argument.
     ///  - Branch names for TryFetch/TryResetHard are obtained from the local repository
-    ///    only (TryGetCurrentBranch) and are NEVER taken from network requests.
+    ///    only (TryGetCurrentBranch). git-sync-branch-switch (v4.3.0) adds ONE deliberate
+    ///    exception: <see cref="TryCheckoutBranch"/> (and the TryFetch preceding it) may
+    ///    receive a branch name originating from an HMAC-authenticated Master request,
+    ///    validated by <see cref="IsValidRefName"/> before use. The only reachable
+    ///    operation is <c>checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c> — no more
+    ///    destructive than the existing fetch + reset --hard.
     ///  - Branch name is validated by <see cref="IsValidRefName"/> before use.
     ///  - The git binary path is "git" (resolved from PATH); no arbitrary binary is invoked.
     ///  - stdout from git is validated by <see cref="IsValidCommitSha"/> before use.
@@ -322,6 +327,88 @@ namespace DistributedRecorder.Shared
             summary = hadDirty
                 ? $"reset --hard origin/{branch}: {newHeadShort}… (discarded local changes)"
                 : $"reset --hard origin/{branch}: {newHeadShort}… (working tree was clean)";
+
+            return true;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Branch checkout (git-sync-branch-switch, v4.3.0)
+        // ---------------------------------------------------------------------------
+
+        /// <summary>
+        /// Runs <c>git -C &lt;projectRoot&gt; checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c>,
+        /// switching the working tree to <paramref name="branch"/> positioned exactly at the
+        /// remote-tracking ref (creates or resets the local branch — a reset --hard is
+        /// therefore not needed afterwards).
+        ///
+        /// Callers MUST run <see cref="TryFetch"/> for the same branch first so
+        /// <c>origin/&lt;branch&gt;</c> exists and is current.
+        ///
+        /// Security (git-sync-branch-switch, v4.3.0 — the one deliberate exception to the
+        /// "branch never from network" rule):
+        ///  - <paramref name="branch"/> may originate from an HMAC-authenticated Master
+        ///    request (GitSyncRequest.targetBranch). It is validated by
+        ///    <see cref="IsValidRefName"/> before use; the remote ref is assembled in code
+        ///    by prepending the fixed string "origin/".
+        ///  - ArgumentList prevents shell injection; only the checkout operation is reachable.
+        ///  - Discards local changes by design — same destructive class as TryResetHard,
+        ///    which the endpoint already exposes.
+        /// </summary>
+        /// <param name="projectRoot">Absolute path of the Unity project root.</param>
+        /// <param name="branch">Branch name (must pass <see cref="IsValidRefName"/>).</param>
+        /// <param name="newHead">On success: the new HEAD commit SHA after checkout.</param>
+        /// <param name="summary">Human-readable summary of the switch and the new HEAD.</param>
+        /// <param name="error">Human-readable error when returning false.</param>
+        /// <returns>true when checkout succeeded.</returns>
+        public static bool TryCheckoutBranch(
+            string projectRoot, string branch,
+            out string newHead, out string summary, out string error)
+        {
+            newHead = string.Empty;
+            summary = string.Empty;
+            error   = string.Empty;
+
+            if (string.IsNullOrEmpty(projectRoot))
+            {
+                error = "projectRoot is null or empty.";
+                return false;
+            }
+
+            if (!IsValidRefName(branch))
+            {
+                error = $"Invalid branch name: '{branch}'";
+                return false;
+            }
+
+            // Capture pre-checkout state for the discard summary (same as TryResetHard).
+            string preStatus = string.Empty;
+            if (RunGit(new[] { "-C", projectRoot, "status", "--porcelain" },
+                       GitTimeout, out string preStatusStdout, out _))
+            {
+                preStatus = preStatusStdout.Trim();
+            }
+
+            // "origin/<branch>" is assembled in code; <branch> is validated above.
+            // checkout writes the whole changed working tree — use the generous ResetTimeout.
+            string remoteRef = "origin/" + branch;
+            if (!RunGit(new[] { "-C", projectRoot, "checkout", "-B", branch, remoteRef },
+                        ResetTimeout, out _, out error))
+                return false;
+
+            // Read new HEAD after checkout.
+            if (RunGit(new[] { "-C", projectRoot, "rev-parse", "HEAD" },
+                       GitTimeout, out string headStdout, out _))
+            {
+                string candidate = headStdout.Trim();
+                if (IsValidCommitSha(candidate))
+                    newHead = candidate;
+            }
+
+            bool hadDirty = !string.IsNullOrEmpty(preStatus);
+            string newHeadShort = newHead.Length >= 8 ? newHead.Substring(0, 8) : newHead;
+            summary = hadDirty
+                ? $"checkout -B {branch} origin/{branch}: {newHeadShort}… (discarded local changes)"
+                : $"checkout -B {branch} origin/{branch}: {newHeadShort}… (working tree was clean)";
 
             return true;
         }

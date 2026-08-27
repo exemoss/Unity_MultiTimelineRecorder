@@ -439,20 +439,38 @@ namespace DistributedRecorder.Shared
     /// Request sent by Master → Worker via POST /git-sync.
     ///
     /// Security design:
-    ///  - No branch name is included in this DTO. The Worker uses its own current branch
-    ///    (obtained via GitInfo.TryGetCurrentBranch), preventing branch injection.
+    ///  - By default no branch name is used from this DTO. The Worker uses its own current
+    ///    branch (obtained via GitInfo.TryGetCurrentBranch), preventing branch injection.
+    ///  - git-sync-branch-switch (v4.3.0): <see cref="targetBranch"/> optionally names a
+    ///    branch the Worker should switch to. This deliberately relaxes the original
+    ///    "never from the request" rule under strict conditions: the endpoint is
+    ///    HMAC-authenticated (only a Master holding the shared key can send it), the value
+    ///    is validated by GitInfo.IsValidRefName before touching any git argument, and the
+    ///    only operation it can select is <c>checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c>
+    ///    — content that already exists on origin, i.e. no more destructive than the
+    ///    existing fetch + reset --hard.
     ///  - Endpoint requires HMAC authentication.
     ///  - Wire-compat: Workers older than v1.4.11 return 404. Master handles 404 gracefully.
+    ///    Workers in [1.4.11, 4.3.0) silently IGNORE <see cref="targetBranch"/> (JsonUtility
+    ///    drops unknown fields) and would sync their current branch instead — the Master
+    ///    must therefore gate on <see cref="WorkerHealth.mtrVersion"/> via
+    ///    GitSyncBranchSupport before sending a non-empty targetBranch.
     ///
     /// Added in worker-git-sync (v1.4.11).
     /// </summary>
     [Serializable]
     public class GitSyncRequest
     {
-        // Intentionally empty: the Worker determines the branch from its own local state.
-        // A placeholder field is included for JsonUtility serialization compatibility.
         /// <summary>Ignored by Worker. Reserved for future extensibility.</summary>
         public string requestId = string.Empty;
+
+        /// <summary>
+        /// Branch the Worker should switch to before syncing (git-sync-branch-switch,
+        /// v4.3.0). Empty = legacy behavior: fetch + reset --hard on the Worker's own
+        /// current branch. Non-empty = the Worker validates the name, fetches it from
+        /// origin, and runs <c>git checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c>.
+        /// </summary>
+        public string targetBranch = string.Empty;
     }
 
     /// <summary>

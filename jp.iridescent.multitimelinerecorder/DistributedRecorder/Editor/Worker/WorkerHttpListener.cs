@@ -749,15 +749,24 @@ namespace DistributedRecorder.Worker
 
         /// <summary>
         /// Handles POST /git-sync — performs <c>git fetch origin &lt;branch&gt;</c> followed by
-        /// <c>git reset --hard origin/&lt;branch&gt;</c> on this Worker's current branch.
+        /// <c>git reset --hard origin/&lt;branch&gt;</c> on this Worker's current branch, or —
+        /// when the request carries a validated <c>targetBranch</c>
+        /// (git-sync-branch-switch, v4.3.0) —
+        /// <c>git checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c> to switch branches.
         ///
         /// Security requirements:
         ///  1. HMAC authentication (same pattern as /cancel, /align-recorder).
         ///  2. IP allowlist + ban check enforced in HandleRequest before this is called.
-        ///  3. No branch name is accepted from the request. The Worker obtains its current
-        ///     branch via <see cref="GitInfo.TryGetCurrentBranch"/> (injection impossible).
+        ///  3. By default no branch name is accepted from the request; the Worker obtains
+        ///     its current branch via <see cref="GitInfo.TryGetCurrentBranch"/>.
+        ///     git-sync-branch-switch (v4.3.0): a non-empty <c>targetBranch</c> from the
+        ///     authenticated request is honored ONLY after passing
+        ///     <see cref="GitInfo.IsValidRefName"/> (rejected with 400 otherwise), and can
+        ///     only select the checkout -B operation — no more destructive than the
+        ///     existing reset --hard.
         ///  4. Branch name is validated by <see cref="GitInfo.IsValidRefName"/>.
-        ///  5. Only <c>git fetch</c> and <c>git reset --hard</c> are executed.
+        ///  5. Only <c>git fetch</c>, <c>git reset --hard</c>, and
+        ///     <c>git checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c> are executed.
         ///     No arbitrary git commands are possible.
         ///  6. All git calls use <see cref="GitInfo"/> (ArgumentList, no shell).
         ///  7. Returns 202 immediately; actual git operations run synchronously on the main
@@ -765,6 +774,8 @@ namespace DistributedRecorder.Worker
         ///
         /// Wire-compat: Workers older than v1.4.11 do not have this route and return 404
         /// via the default "Not found" handler. The master handles 404 gracefully (skip + log).
+        /// Workers in [1.4.11, 4.3.0) ignore <c>targetBranch</c> — the Master gates on
+        /// mtrVersion via GitSyncBranchSupport before sending it.
         /// </summary>
         private void HandleGitSync(HttpListenerContext ctx, string remoteIp)
         {
@@ -785,8 +796,27 @@ namespace DistributedRecorder.Worker
             }
 
             // 2. Deserialize request (empty body is OK; requestId is a no-op placeholder).
-            // No branch name or git command is accepted from the request.
-            // (Deserialize failure is non-fatal: the request body carries no meaningful input.)
+            //    git-sync-branch-switch (v4.3.0): targetBranch optionally names a branch to
+            //    switch to. It is strictly validated here — an invalid name is rejected
+            //    before the 202 so the Master sees the failure synchronously.
+            GitSyncRequest syncReq = null;
+            try { syncReq = ProtocolSerializer.Deserialize<GitSyncRequest>(body); }
+            catch { /* legacy/empty body — fall through with no targetBranch */ }
+            string targetBranch = syncReq?.targetBranch ?? string.Empty;
+
+            if (!string.IsNullOrEmpty(targetBranch) &&
+                !DistributedRecorder.Shared.GitInfo.IsValidRefName(targetBranch))
+            {
+                Debug.LogWarning(
+                    $"[WorkerHttpListener] /git-sync rejected from {remoteIp}: invalid targetBranch.");
+                var invalidAck = new GitSyncAck
+                {
+                    accepted = false,
+                    reason   = "Invalid targetBranch (allowed: letters, digits, '.', '_', '-', '/')."
+                };
+                RespondJson(ctx, 400, ProtocolSerializer.Serialize(invalidAck));
+                return;
+            }
 
             // 3. Busy check: reject when a job is actively running (same guard as /align-recorder).
             if (_store.HasActiveJob)
@@ -805,11 +835,19 @@ namespace DistributedRecorder.Worker
                 return;
             }
 
-            // 4. Determine the current branch from the local repo (no network input used).
-            string capturedProjectRoot = _projectRoot;
+            // 4. Determine the current branch from the local repo (no network input used),
+            //    unless a validated targetBranch selects the branch-switch path below.
+            string capturedProjectRoot  = _projectRoot;
+            string capturedTargetBranch = targetBranch;
 
             // Respond 202 immediately; git operations run on the main thread.
-            var immediateAck = new GitSyncAck { accepted = true, reason = "Sync started." };
+            var immediateAck = new GitSyncAck
+            {
+                accepted = true,
+                reason   = string.IsNullOrEmpty(capturedTargetBranch)
+                    ? "Sync started."
+                    : $"Sync started (branch switch to '{capturedTargetBranch}')."
+            };
             RespondJson(ctx, 202, ProtocolSerializer.Serialize(immediateAck));
 
             // 5. Enqueue the actual git operations on the main thread.
@@ -818,6 +856,13 @@ namespace DistributedRecorder.Worker
             {
                 Debug.Log(
                     $"[WorkerHttpListener] /git-sync: main-thread dispatch requested by {remoteIp}");
+
+                // git-sync-branch-switch (v4.3.0): validated targetBranch → checkout -B path.
+                if (!string.IsNullOrEmpty(capturedTargetBranch))
+                {
+                    RunBranchSwitchSync(capturedProjectRoot, capturedTargetBranch);
+                    return;
+                }
 
                 // Step A: determine current branch (never from request).
                 if (!DistributedRecorder.Shared.GitInfo.TryGetCurrentBranch(
@@ -888,6 +933,67 @@ namespace DistributedRecorder.Worker
                     WorkerSceneReloadHelper.ReopenScenes(scenesToReopen);
                 }
             });
+        }
+
+        /// <summary>
+        /// Branch-switch sync path (git-sync-branch-switch, v4.3.0): fetch the requested
+        /// branch, then <c>git checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c> (which
+        /// positions the working tree exactly at the remote ref, so no separate reset is
+        /// needed), then Refresh. Mirrors the legacy path's scene close/reopen handling.
+        ///
+        /// <paramref name="branch"/> has already passed <see cref="GitInfo.IsValidRefName"/>
+        /// in HandleGitSync. Unlike the legacy path this works from a detached HEAD too
+        /// (checkout -B recovers it onto a real branch).
+        ///
+        /// Main-thread only (called from the git-sync MainThreadDispatcher lambda).
+        /// </summary>
+        private static void RunBranchSwitchSync(string projectRoot, string branch)
+        {
+            // Best-effort current branch for the log ("(detached)" is informational only).
+            DistributedRecorder.Shared.GitInfo.TryGetCurrentBranch(
+                projectRoot, out string currentBranch, out _);
+            Debug.Log(
+                $"[WorkerHttpListener] /git-sync: branch switch " +
+                $"'{(string.IsNullOrEmpty(currentBranch) ? "(detached)" : currentBranch)}' → '{branch}'. " +
+                $"Running git fetch origin {branch}…");
+
+            if (!DistributedRecorder.Shared.GitInfo.TryFetch(
+                    projectRoot, branch, out string fetchErr))
+            {
+                Debug.LogError(
+                    $"[WorkerHttpListener] /git-sync: git fetch origin {branch} failed " +
+                    $"(branch missing on origin?): {fetchErr}");
+                return;
+            }
+
+            // Same modal-avoidance pattern as the legacy path: close clean scenes before the
+            // working tree changes on disk, reopen after Refresh. After a branch switch a
+            // remembered scene may not exist anymore — ReopenScenes warns and skips it.
+            var scenesToReopen = WorkerSceneReloadHelper.CloseOpenScenesForSync();
+            try
+            {
+                if (!DistributedRecorder.Shared.GitInfo.TryCheckoutBranch(
+                        projectRoot, branch,
+                        out _, out string switchSummary, out string checkoutErr))
+                {
+                    Debug.LogError(
+                        $"[WorkerHttpListener] /git-sync: git checkout -B {branch} " +
+                        $"origin/{branch} failed: {checkoutErr}");
+                    return;
+                }
+
+                Debug.Log(
+                    $"[WorkerHttpListener] /git-sync: completed. {switchSummary}. " +
+                    "Triggering AssetDatabase.Refresh() so Unity picks up changed assets. " +
+                    "Code changes will trigger a domain reload.");
+                AssetDatabase.Refresh();
+            }
+            finally
+            {
+                // Always reopen (even if checkout failed) so the Worker is never left on
+                // the temporary empty scene we opened above.
+                WorkerSceneReloadHelper.ReopenScenes(scenesToReopen);
+            }
         }
 
         private void HandleGetJob(HttpListenerContext ctx, string remoteIp,

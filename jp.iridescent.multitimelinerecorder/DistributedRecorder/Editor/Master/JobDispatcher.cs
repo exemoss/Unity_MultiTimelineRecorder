@@ -434,23 +434,46 @@ namespace DistributedRecorder.Master
         }
 
         /// <summary>
-        /// Sends POST /git-sync to <paramref name="worker"/> requesting fetch + reset --hard.
+        /// Sends POST /git-sync to <paramref name="worker"/> requesting fetch + reset --hard,
+        /// or — with a non-empty <paramref name="targetBranch"/>
+        /// (git-sync-branch-switch, v4.3.0) — a switch to that branch via
+        /// <c>git checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c>.
         ///
-        /// Security: no branch name is sent in the request body.  The Worker determines the
-        /// branch from its own local git state, preventing injection.
+        /// Security: by default no branch name is sent in the request body (the Worker
+        /// determines the branch from its own local git state). A targetBranch is validated
+        /// with GitInfo.IsValidRefName both here and on the Worker.
+        ///
+        /// Capability gate (caller responsibility): Workers older than v4.3.0 silently
+        /// IGNORE targetBranch and sync their current branch instead — check the Worker's
+        /// /health mtrVersion with <c>GitSyncBranchSupport.IsSupported</c> BEFORE passing a
+        /// non-empty targetBranch.
         ///
         /// Wire-compat: Workers older than v1.4.11 return 404.  Returns <c>(false, "404…")</c>
         /// so the caller can log and skip gracefully.
         ///
         /// Must NOT use ConfigureAwait(false) when called from UI handlers (Unity main thread).
         /// </summary>
+        /// <param name="worker">Worker to sync.</param>
+        /// <param name="targetBranch">
+        /// Optional branch to switch the Worker to (null/empty = sync its current branch).
+        /// </param>
         /// <returns>(accepted, reasonOrSummary)</returns>
         public async Task<(bool accepted, string message, string summary)> SendGitSyncAsync(
-            WorkerInfo worker)
+            WorkerInfo worker, string targetBranch = null)
         {
             if (worker == null) throw new ArgumentNullException(nameof(worker));
 
-            var req = new GitSyncRequest { requestId = System.Guid.NewGuid().ToString("N") };
+            if (!string.IsNullOrEmpty(targetBranch) &&
+                !DistributedRecorder.Shared.GitInfo.IsValidRefName(targetBranch))
+            {
+                return (false, $"Invalid targetBranch: '{targetBranch}'", string.Empty);
+            }
+
+            var req = new GitSyncRequest
+            {
+                requestId    = System.Guid.NewGuid().ToString("N"),
+                targetBranch = targetBranch ?? string.Empty,
+            };
             string json = ProtocolSerializer.Serialize(req);
 
             try
