@@ -672,6 +672,15 @@ namespace DistributedRecorder.Master
             if (reason.IndexOf("Version mismatch", StringComparison.OrdinalIgnoreCase) >= 0)
                 return DispatchResult.Fail(jobId, DispatchFailReason.VersionMismatch, reason);
 
+            // Local-version-unresolvable, reported by the Worker: MatchesLocal builds
+            // "Version check failed: could not resolve the local com.unity.recorder
+            // version ..." when the Worker's own PackageManager query stays empty even
+            // after the cache-invalidated retry.  Classified as VersionMismatch so the
+            // UI offers the same re-dispatch path — a re-send re-runs the Worker-side
+            // resolution, which typically succeeds once PackageManager has recovered.
+            if (reason.IndexOf("Version check failed", StringComparison.OrdinalIgnoreCase) >= 0)
+                return DispatchResult.Fail(jobId, DispatchFailReason.VersionMismatch, reason);
+
             // Everything else (duplicate job-id, unknown errors, etc.) is a permanent rejection.
             // ErrorMessage is preserved in the result so the UI can display it (no silent failure).
             return DispatchResult.Fail(jobId, DispatchFailReason.WorkerRejected, reason);
