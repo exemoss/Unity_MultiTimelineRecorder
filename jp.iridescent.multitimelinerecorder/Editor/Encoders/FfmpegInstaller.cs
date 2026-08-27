@@ -45,14 +45,21 @@ namespace Unity.MultiTimelineRecorder.Encoders
         /// <summary>この環境で winget が使えるか（Windows 以外・winget 未導入では false）。</summary>
         public static bool IsWingetAvailable() => ResolveWingetPath() != null;
 
+        // ffmpeg-silent-install: サイレントモード中はダイアログを一切出さない（ログのみ）。
+        // 無人 Worker（分散レンダリング）での自動セットアップ用 — モーダルはメインスレッドを
+        // 塞ぎ、リスナーもバッチも止めてしまう。Tick の進捗バーは非モーダルなので出したまま
+        static bool silentMode;
+
         /// <summary>
         /// winget で ffmpeg のインストールを開始する。完了時に <paramref name="completed"/> が
         /// メインスレッドで呼ばれる（引数は検出された ffmpeg.exe の絶対パス、失敗時は null）。
         /// 既にインストール済みなら winget を起動せず即座に完了する。実行中の多重呼び出しは無視。
         /// <paramref name="confirm"/> が true のとき、開始前に内容の確認ダイアログを出す
         /// （呼び出し側が直前に独自の確認を済ませている場合は false で二重確認を避ける）。
+        /// <paramref name="silent"/> が true のとき、確認・完了・失敗を含む全ダイアログを
+        /// 出さずログのみにする（無人実行用。confirm は無視される）。
         /// </summary>
-        public static void InstallAsync(Action<string> completed, bool confirm = true)
+        public static void InstallAsync(Action<string> completed, bool confirm = true, bool silent = false)
         {
             if (IsRunning)
             {
@@ -60,19 +67,24 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 return;
             }
 
+            silentMode = silent;
+
             // 既に導入済みならインストール不要（「セットアップ」ボタン連打の正常系）。
             // ユーザーの明示操作に対して無反応だと「何も起きない」ように見えるためダイアログで知らせる
             var existing = FfmpegLocator.TryFindFfmpeg();
             if (!string.IsNullOrEmpty(existing))
             {
                 Debug.Log($"[FfmpegInstaller] ffmpeg は導入済みです: {existing}");
-                EditorUtility.DisplayDialog("ffmpeg セットアップ",
-                    $"ffmpeg は導入済みです:\n{existing}", "OK");
+                if (!silent)
+                {
+                    EditorUtility.DisplayDialog("ffmpeg セットアップ",
+                        $"ffmpeg は導入済みです:\n{existing}", "OK");
+                }
                 completed?.Invoke(existing);
                 return;
             }
 
-            if (confirm && !EditorUtility.DisplayDialog("ffmpeg セットアップ",
+            if (!silent && confirm && !EditorUtility.DisplayDialog("ffmpeg セットアップ",
                     $"winget で ffmpeg {PinnedVersion} (Gyan.FFmpeg) をこの PC に導入します。\n" +
                     "ネットワーク経由のダウンロードを含みます（数百 MB・数分かかることがあります）。\n\n" +
                     "実行しますか？",
@@ -85,12 +97,19 @@ namespace Unity.MultiTimelineRecorder.Encoders
             var winget = ResolveWingetPath();
             if (winget == null)
             {
-                EditorUtility.DisplayDialog("ffmpeg セットアップ",
+                const string wingetMissing =
                     "winget が見つかりません（Windows 10/11 の App Installer が必要です）。\n\n" +
                     "手動でセットアップする場合:\n" +
                     "  1. https://ffmpeg.org などから ffmpeg を導入\n" +
-                    "  2. FFmpeg Path 欄でパスを指定（または PATH に追加して自動検出）",
-                    "OK");
+                    "  2. FFmpeg Path 欄でパスを指定（または PATH に追加して自動検出）";
+                if (silent)
+                {
+                    Debug.LogError("[FfmpegInstaller] " + wingetMissing);
+                }
+                else
+                {
+                    EditorUtility.DisplayDialog("ffmpeg セットアップ", wingetMissing, "OK");
+                }
                 completed?.Invoke(null);
                 return;
             }
@@ -196,8 +215,11 @@ namespace Unity.MultiTimelineRecorder.Encoders
             if (!string.IsNullOrEmpty(found))
             {
                 Debug.Log($"[FfmpegInstaller] ffmpeg をセットアップしました: {found}");
-                EditorUtility.DisplayDialog("ffmpeg セットアップ",
-                    $"セットアップが完了しました:\n{found}", "OK");
+                if (!silentMode)
+                {
+                    EditorUtility.DisplayDialog("ffmpeg セットアップ",
+                        $"セットアップが完了しました:\n{found}", "OK");
+                }
             }
             else
             {
@@ -210,11 +232,14 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 Debug.LogError(
                     $"[FfmpegInstaller] winget が終了コード {exitCode} で終了しましたが、" +
                     $"ffmpeg.exe を検出できませんでした。winget の出力(末尾):\n{tail}");
-                EditorUtility.DisplayDialog("ffmpeg セットアップ",
-                    "セットアップに失敗しました。Console のログを確認してください。\n\n" +
-                    "手動でセットアップする場合はコマンドプロンプトで:\n" +
-                    $"  winget install {PackageId}",
-                    "OK");
+                if (!silentMode)
+                {
+                    EditorUtility.DisplayDialog("ffmpeg セットアップ",
+                        "セットアップに失敗しました。Console のログを確認してください。\n\n" +
+                        "手動でセットアップする場合はコマンドプロンプトで:\n" +
+                        $"  winget install {PackageId}",
+                        "OK");
+                }
             }
 
             FinishWith(found);
