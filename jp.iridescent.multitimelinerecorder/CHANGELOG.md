@@ -24,6 +24,25 @@ unchanged, PATCH for fixes.
   Refresh and invalidate the `VersionChecker` caches (which now also cover
   `mtrVersion`). Syncs that do not touch the package manifests behave
   exactly as before; recording output is unchanged (hence PATCH).
+- **Transient PackageManager failures no longer surface as a bogus version
+  mismatch.** When the local `com.unity.recorder` resolution (offline
+  `Client.List`) came back empty at dispatch time — observed right after
+  Editor startup on the Master — `VersionChecker.MatchesLocal` compared the
+  empty string as-is and dispatch failed with the misleading
+  "Version mismatch detected: Recorder: local=, remote=5.1.6" (the F9 fix
+  already kept the empty result out of the cache, but the in-flight
+  comparison still used it). `MatchesLocal` now retries once
+  (`InvalidateCache` + re-resolve) when the local value is empty and the
+  remote reports a real version; if the retry still comes back empty it
+  fails with a dedicated "Version check failed: could not resolve the local
+  com.unity.recorder version …" reason instead of a mismatch.
+  `JobDispatcher.ClassifyRejection` maps that reason (arriving as a Worker
+  409) to `DispatchFailReason.VersionMismatch` so the UI keeps offering the
+  re-dispatch path — a re-send re-runs the Worker-side resolution, which
+  typically succeeds once PackageManager has recovered. The empty-vs-empty
+  comparison (Recorder not installed on either side) is unchanged.
+  (Authored as 4.2.2 on `feature/project-job-hook`; ships here as part of
+  4.3.2 — no v4.2.2 tag exists.)
 
 ## [4.3.1] - 2026-08-27
 

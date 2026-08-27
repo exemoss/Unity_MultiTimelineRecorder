@@ -21,6 +21,12 @@ namespace DistributedRecorder.Shared
         // Cached after first lookup to avoid repeated package-manager queries.
         private static string _cachedRecorderVersion;
 
+        // Test seam (VersionCheckerMatchesLocalTests): when non-null, replaces the
+        // PackageManager query in ResolveRecorderVersion so EditMode tests can
+        // simulate transient resolution failures hermetically.  Same pattern as
+        // RenderHistory.fileOverrideForTests.
+        internal static Func<string> resolveRecorderOverrideForTests;
+
         /// <summary>
         /// Returns the Unity Editor version string, e.g. "6000.2.10f1".
         /// </summary>
@@ -103,8 +109,39 @@ namespace DistributedRecorder.Shared
         {
             reason = string.Empty;
 
-            bool unityMatch    = string.Equals(UnityVersion,     remoteUnityVersion,    StringComparison.Ordinal);
-            bool recorderMatch = string.Equals(RecorderVersion,  remoteRecorderVersion, StringComparison.Ordinal);
+            string localRecorder = RecorderVersion;
+
+            // Transient PackageManager failure (observed 2026-08-27): the offline
+            // Client.List query can come back empty right after Editor startup, in
+            // which case RecorderVersion returns "" (never cached — see the F9 note
+            // above).  Comparing that "" against a real remote version produced a
+            // bogus "Recorder: local=, remote=5.1.6" mismatch.  Give PM one more
+            // chance via an explicit InvalidateCache + re-read; if it is STILL
+            // empty, fail with a dedicated "could not resolve" reason instead of a
+            // mismatch the user cannot act on.  When the remote version is also
+            // empty the comparison below stays as before ("" == "" matches).
+            if (string.IsNullOrEmpty(localRecorder) && !string.IsNullOrEmpty(remoteRecorderVersion))
+            {
+                InvalidateCache();
+                localRecorder = RecorderVersion;
+
+                if (string.IsNullOrEmpty(localRecorder))
+                {
+                    var sbFail = new System.Text.StringBuilder();
+                    sbFail.Append($"Version check failed: could not resolve the local {RecorderPackageName} version ")
+                          .Append("(PackageManager returned no result, even after a cache-invalidated retry); ")
+                          .Append($"remote reports {remoteRecorderVersion}. ")
+                          .Append("This is a local resolution problem, not a confirmed version mismatch — ")
+                          .Append("dispatch again, or restart the Unity Editor if it persists.");
+                    if (!string.Equals(UnityVersion, remoteUnityVersion, StringComparison.Ordinal))
+                        sbFail.Append($"\n  Unity: local={UnityVersion}, remote={remoteUnityVersion}");
+                    reason = sbFail.ToString();
+                    return false;
+                }
+            }
+
+            bool unityMatch    = string.Equals(UnityVersion,   remoteUnityVersion,    StringComparison.Ordinal);
+            bool recorderMatch = string.Equals(localRecorder,  remoteRecorderVersion, StringComparison.Ordinal);
 
             if (unityMatch && recorderMatch)
                 return true;
@@ -113,7 +150,7 @@ namespace DistributedRecorder.Shared
             if (!unityMatch)
                 sb.Append($"\n  Unity: local={UnityVersion}, remote={remoteUnityVersion}");
             if (!recorderMatch)
-                sb.Append($"\n  Recorder: local={RecorderVersion}, remote={remoteRecorderVersion}");
+                sb.Append($"\n  Recorder: local={localRecorder}, remote={remoteRecorderVersion}");
 
             reason = sb.ToString();
             return false;
@@ -123,6 +160,8 @@ namespace DistributedRecorder.Shared
 
         private static string ResolveRecorderVersion()
         {
+            if (resolveRecorderOverrideForTests != null)
+                return resolveRecorderOverrideForTests();
 #if UNITY_EDITOR
             try
             {
