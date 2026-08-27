@@ -7,6 +7,24 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.4.1] - 2026-08-27
+
+### Fixed
+- **Temp-file cleanup after audio remuxing now retries and warns instead of
+  failing silently.** With audio enabled, the Movie pass writes raw video to
+  the output path, moves it to `<output>.tmp`, remuxes it with the `<output>.mkv`
+  audio into the final mp4, then deletes both temp files. On SMB shares the
+  delete can be rejected right after the remux because the server releases the
+  ffmpeg file handles late; the old code tried exactly once and logged
+  `IOException.Data` — an empty dictionary — so the temp files stayed behind
+  with no usable message even though the final mp4 was complete (observed
+  2026-08-27 on a distributed render: two of three S04 outputs kept their
+  `.tmp`/`.mkv` on the share, the third did not — timing dependent). Deletion
+  now retries up to 5 times at 0.5 s intervals, also catching
+  `UnauthorizedAccessException` (which Windows can throw for in-use files on
+  a share), and if the file still cannot be removed it logs a warning naming
+  the leftover path and stating that the final output itself is complete.
+
 ## [4.4.0] - 2026-08-27
 
 ### Added
