@@ -7,6 +7,32 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.3.0] - 2026-08-27
+
+### Added
+- **Remote branch switching via /git-sync** (git-sync-branch-switch): the
+  Master can now include a `targetBranch` in `GitSyncRequest`
+  (`JobDispatcher.SendGitSyncAsync(worker, targetBranch)`). The Worker
+  validates the name (`GitInfo.IsValidRefName`, rejected with 400 otherwise),
+  fetches it from origin and runs
+  `git checkout -B <branch> origin/<branch>` — positioning the working tree
+  exactly at the remote ref, so an unattended Worker can follow the Master
+  across a branch change (e.g. feature branch → main after a merge) without
+  anyone touching the Worker PC. Also recovers a detached-HEAD Worker onto a
+  real branch. This is the one deliberate, documented exception to the
+  "branch never from the request" rule: the endpoint is HMAC-authenticated,
+  the value is strictly validated, and the only reachable operation is no
+  more destructive than the existing fetch + reset --hard. Scene
+  close/reopen modal avoidance matches the legacy sync path.
+- `GitSyncBranchSupport` capability gate (minimum 4.3.0): Workers in
+  [1.4.11, 4.3.0) silently ignore the unknown `targetBranch` field
+  (JsonUtility) and would sync their current branch while acking success —
+  callers must check the Worker's /health `mtrVersion` before sending a
+  non-empty `targetBranch`. Same pattern as `ProjectJobSupport`.
+- Wire compatibility: the new field is additive with an empty default —
+  requests without `targetBranch` are byte-identical in behavior (hence
+  MINOR; output is unchanged).
+
 ## [4.2.1] - 2026-08-27
 
 ### Fixed
