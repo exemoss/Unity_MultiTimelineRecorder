@@ -7,6 +7,24 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.3.2] - 2026-08-27
+
+### Fixed
+- **POST /git-sync now re-resolves UPM packages when the sync changed
+  `Packages/manifest.json` or `Packages/packages-lock.json`.** The handler
+  already ran `AssetDatabase.Refresh()` after `git reset --hard` (and after
+  the v4.3.0 `checkout -B` branch-switch path), but Refresh does not trigger
+  a Package Manager resolve — so a sync that moved a git-URL package pin
+  (e.g. this package's own `#vX.Y.Z` reference) left the Worker running the
+  old package version until its Editor window was manually focused (observed
+  2026-08-27: `mtrVersion` stayed 4.2.0 after a sync that pinned 4.2.1,
+  blocking the project-job capability gate). Both sync paths now snapshot
+  the two files before the git operation and, when either changed, call
+  `UnityEditor.PackageManager.Client.Resolve()` on the main thread after the
+  Refresh and invalidate the `VersionChecker` caches (which now also cover
+  `mtrVersion`). Syncs that do not touch the package manifests behave
+  exactly as before; recording output is unchanged (hence PATCH).
+
 ## [4.3.1] - 2026-08-27
 
 ### Fixed

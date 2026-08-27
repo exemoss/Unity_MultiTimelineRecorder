@@ -1,5 +1,7 @@
 using System.Collections.Generic;
+using System.IO;
 using DistributedRecorder.Shared;
+using DistributedRecorder.Worker;
 using NUnit.Framework;
 
 namespace DistributedRecorder.Tests.Worker
@@ -7,7 +9,8 @@ namespace DistributedRecorder.Tests.Worker
     /// <summary>
     /// Hermetic EditMode tests for the worker-git-sync feature (v1.4.11).
     ///
-    /// All tests are pure-function (no Process.Start, no network).
+    /// All tests are pure-function (no Process.Start, no network); section F
+    /// (package-resolve-on-sync, v4.3.2) additionally uses temp-directory file I/O.
     /// Real git operations (TryFetch, TryResetHard) and real HTTP calls are
     /// delegated to live-machine verification as noted in the spec.
     /// </summary>
@@ -330,6 +333,179 @@ namespace DistributedRecorder.Tests.Worker
             bool shouldSkip = string.IsNullOrEmpty(workerGitBranch);
             Assert.IsTrue(shouldSkip,
                 "Empty gitBranch from old Worker should cause skip in branch-match logic.");
+        }
+
+        // -----------------------------------------------------------------------
+        // F. package-resolve-on-sync (v4.3.2) — manifest snapshot & comparison
+        //
+        // /git-sync must call Client.Resolve() when the sync (reset --hard or
+        // checkout -B) changed Packages/manifest.json or packages-lock.json.
+        // The decision logic (PackageManifestsChanged) is pure; ReadPackageManifests
+        // is exercised against a temp directory. The Client.Resolve() call itself
+        // is main-thread PackageManager API and is left to live-machine verification.
+        // -----------------------------------------------------------------------
+
+        private const string SampleManifest431 =
+            "{\"dependencies\":{\"jp.iridescent.multitimelinerecorder\":" +
+            "\"https://github.com/exemoss/Unity_MultiTimelineRecorder.git" +
+            "?path=/jp.iridescent.multitimelinerecorder#v4.3.1\"}}";
+
+        private const string SampleManifest430 =
+            "{\"dependencies\":{\"jp.iridescent.multitimelinerecorder\":" +
+            "\"https://github.com/exemoss/Unity_MultiTimelineRecorder.git" +
+            "?path=/jp.iridescent.multitimelinerecorder#v4.3.0\"}}";
+
+        [Test]
+        public void PackageManifestsChanged_IdenticalContent_ReturnsFalse()
+        {
+            var before = new[] { SampleManifest431, "{\"dependencies\":{}}" };
+            var after  = new[] { SampleManifest431, "{\"dependencies\":{}}" };
+            Assert.IsFalse(WorkerHttpListener.PackageManifestsChanged(before, after),
+                "Identical manifest + lock content must not trigger a resolve.");
+        }
+
+        [Test]
+        public void PackageManifestsChanged_GitUrlTagMoved_ReturnsTrue()
+        {
+            // The real-world case: the sync moves this package's git-URL pin
+            // to a new tag in manifest.json.
+            var before = new[] { SampleManifest430, null };
+            var after  = new[] { SampleManifest431, null };
+            Assert.IsTrue(WorkerHttpListener.PackageManifestsChanged(before, after),
+                "A git-URL tag change in manifest.json must trigger a resolve.");
+        }
+
+        [Test]
+        public void PackageManifestsChanged_LockFileOnlyChanged_ReturnsTrue()
+        {
+            // manifest.json unchanged (e.g. branch-pinned git URL) but the lock's
+            // resolved hash moved — the resolve must still run.
+            var before = new[] { SampleManifest431, "{\"hash\":\"aaaa\"}" };
+            var after  = new[] { SampleManifest431, "{\"hash\":\"bbbb\"}" };
+            Assert.IsTrue(WorkerHttpListener.PackageManifestsChanged(before, after),
+                "A packages-lock.json-only change must trigger a resolve.");
+        }
+
+        [Test]
+        public void PackageManifestsChanged_FileAppearedOrDisappeared_ReturnsTrue()
+        {
+            // null encodes "file missing/unreadable" in ReadPackageManifests.
+            var missing = new string[] { SampleManifest431, null };
+            var present = new string[] { SampleManifest431, "{}" };
+            Assert.IsTrue(WorkerHttpListener.PackageManifestsChanged(missing, present),
+                "packages-lock.json appearing across the sync must trigger a resolve.");
+            Assert.IsTrue(WorkerHttpListener.PackageManifestsChanged(present, missing),
+                "packages-lock.json disappearing across the sync must trigger a resolve.");
+        }
+
+        [Test]
+        public void PackageManifestsChanged_BothMissingBeforeAndAfter_ReturnsFalse()
+        {
+            var before = new string[] { null, null };
+            var after  = new string[] { null, null };
+            Assert.IsFalse(WorkerHttpListener.PackageManifestsChanged(before, after),
+                "Files missing on both sides must not trigger a resolve.");
+        }
+
+        [Test]
+        public void PackageManifestsChanged_NullSnapshot_ReturnsFalse()
+        {
+            // Defensive: a null snapshot (should not happen) must not resolve.
+            Assert.IsFalse(WorkerHttpListener.PackageManifestsChanged(null, new string[] { "{}", null }));
+            Assert.IsFalse(WorkerHttpListener.PackageManifestsChanged(new string[] { "{}", null }, null));
+        }
+
+        [Test]
+        public void PackageManifestsChanged_ComparisonIsOrdinalAndCaseSensitive()
+        {
+            // git writes files verbatim; any byte difference counts.
+            var before = new[] { "{\"a\":1}", null };
+            var after  = new[] { "{\"A\":1}", null };
+            Assert.IsTrue(WorkerHttpListener.PackageManifestsChanged(before, after),
+                "Comparison must be ordinal (case-sensitive).");
+        }
+
+        // --- ReadPackageManifests (temp-directory file I/O) --------------------
+
+        private string _tempProjectRoot;
+
+        [SetUp]
+        public void SetUpTempProjectRoot()
+        {
+            _tempProjectRoot = Path.Combine(
+                Path.GetTempPath(), "MtrGitSyncTests_" + Path.GetRandomFileName());
+        }
+
+        [TearDown]
+        public void TearDownTempProjectRoot()
+        {
+            if (Directory.Exists(_tempProjectRoot))
+                Directory.Delete(_tempProjectRoot, recursive: true);
+        }
+
+        [Test]
+        public void ReadPackageManifests_ReadsManifestAndLock()
+        {
+            Directory.CreateDirectory(Path.Combine(_tempProjectRoot, "Packages"));
+            File.WriteAllText(
+                Path.Combine(_tempProjectRoot, "Packages", "manifest.json"), SampleManifest431);
+            File.WriteAllText(
+                Path.Combine(_tempProjectRoot, "Packages", "packages-lock.json"), "{\"locked\":true}");
+
+            string[] snapshot = WorkerHttpListener.ReadPackageManifests(_tempProjectRoot);
+
+            Assert.AreEqual(2, snapshot.Length,
+                "Snapshot must cover manifest.json and packages-lock.json.");
+            Assert.AreEqual(SampleManifest431,    snapshot[0], "manifest.json content mismatch.");
+            Assert.AreEqual("{\"locked\":true}",  snapshot[1], "packages-lock.json content mismatch.");
+        }
+
+        [Test]
+        public void ReadPackageManifests_MissingLockFile_YieldsNullEntry()
+        {
+            Directory.CreateDirectory(Path.Combine(_tempProjectRoot, "Packages"));
+            File.WriteAllText(
+                Path.Combine(_tempProjectRoot, "Packages", "manifest.json"), SampleManifest431);
+
+            string[] snapshot = WorkerHttpListener.ReadPackageManifests(_tempProjectRoot);
+
+            Assert.AreEqual(SampleManifest431, snapshot[0]);
+            Assert.IsNull(snapshot[1],
+                "A missing packages-lock.json must be encoded as null (not empty string).");
+        }
+
+        [Test]
+        public void ReadPackageManifests_MissingPackagesDirectory_AllNull()
+        {
+            // Directory never created — e.g. projectRoot misconfigured. Must not throw.
+            string[] snapshot = WorkerHttpListener.ReadPackageManifests(_tempProjectRoot);
+
+            Assert.AreEqual(2, snapshot.Length);
+            Assert.IsNull(snapshot[0]);
+            Assert.IsNull(snapshot[1]);
+        }
+
+        [Test]
+        public void ReadPackageManifests_EditBetweenSnapshots_ChangeIsDetected()
+        {
+            // End-to-end over the two helpers: simulates the git-sync flow where
+            // reset --hard (or checkout -B) rewrites manifest.json between snapshots.
+            string packagesDir = Path.Combine(_tempProjectRoot, "Packages");
+            Directory.CreateDirectory(packagesDir);
+            string manifestPath = Path.Combine(packagesDir, "manifest.json");
+
+            File.WriteAllText(manifestPath, SampleManifest430);
+            string[] before = WorkerHttpListener.ReadPackageManifests(_tempProjectRoot);
+
+            Assert.IsFalse(WorkerHttpListener.PackageManifestsChanged(
+                before, WorkerHttpListener.ReadPackageManifests(_tempProjectRoot)),
+                "Unchanged files must not report a change.");
+
+            File.WriteAllText(manifestPath, SampleManifest431);
+            string[] after = WorkerHttpListener.ReadPackageManifests(_tempProjectRoot);
+
+            Assert.IsTrue(WorkerHttpListener.PackageManifestsChanged(before, after),
+                "Rewriting manifest.json between snapshots must report a change.");
         }
     }
 }

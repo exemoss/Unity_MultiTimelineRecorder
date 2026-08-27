@@ -51,10 +51,15 @@ namespace DistributedRecorder.Shared
         }
 
         /// <summary>
-        /// Invalidates the cached recorder version (useful in tests or after package
-        /// installation without an Editor restart).
+        /// Invalidates the cached recorder and MTR package versions (useful in tests
+        /// or after packages change without an Editor restart — /align-recorder, or a
+        /// /git-sync that changed Packages/manifest.json; package-resolve-on-sync v4.3.2).
         /// </summary>
-        public static void InvalidateCache() => _cachedRecorderVersion = null;
+        public static void InvalidateCache()
+        {
+            _cachedRecorderVersion = null;
+            _cachedMtrVersion      = null;
+        }
 
         // Cached after first successful lookup (same non-empty-only caching rule as
         // _cachedRecorderVersion — see the F9 bug note on RecorderVersion).

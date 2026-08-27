@@ -772,6 +772,11 @@ namespace DistributedRecorder.Worker
         ///  7. Returns 202 immediately; actual git operations run synchronously on the main
         ///     thread via MainThreadDispatcher (same pattern as /cancel).
         ///
+        /// package-resolve-on-sync (v4.3.2): when the sync (either path) changes
+        /// Packages/manifest.json or packages-lock.json, the handler additionally calls
+        /// <see cref="Client.Resolve"/> (main thread, after AssetDatabase.Refresh) so
+        /// package updates apply without waiting for the Editor to regain focus.
+        ///
         /// Wire-compat: Workers older than v1.4.11 do not have this route and return 404
         /// via the default "Not found" handler. The master handles 404 gracefully (skip + log).
         /// Workers in [1.4.11, 4.3.0) ignore <c>targetBranch</c> — the Master gates on
@@ -889,6 +894,11 @@ namespace DistributedRecorder.Worker
                 Debug.Log(
                     $"[WorkerHttpListener] /git-sync: fetch succeeded. Running git reset --hard origin/{branch}…");
 
+                // package-resolve-on-sync (v4.3.2): snapshot Packages/manifest.json and
+                // packages-lock.json BEFORE the reset so we can detect below whether the
+                // sync moved any package reference (e.g. this package's own git-URL pin).
+                string[] manifestsBefore = ReadPackageManifests(capturedProjectRoot);
+
                 // worker-git-sync-scene-modal (v1.5.5): close any open scene BEFORE the
                 // reset so the on-disk scene change + Refresh below cannot pop Unity's
                 // blocking "The open scene(s) have been modified externally — Reload?"
@@ -925,6 +935,10 @@ namespace DistributedRecorder.Worker
                     // standard compilation pipeline; Refresh() does not interfere with that.
                     // Main-thread call: this lambda is dispatched via MainThreadDispatcher.Enqueue.
                     AssetDatabase.Refresh();
+
+                    // package-resolve-on-sync (v4.3.2): Refresh() does NOT re-resolve UPM
+                    // packages — see ResolvePackagesIfManifestsChanged.
+                    ResolvePackagesIfManifestsChanged(capturedProjectRoot, manifestsBefore);
                 }
                 finally
                 {
@@ -966,6 +980,11 @@ namespace DistributedRecorder.Worker
                 return;
             }
 
+            // package-resolve-on-sync (v4.3.2): snapshot the package manifests before the
+            // checkout — switching branches is even more likely than a reset to move
+            // package references.
+            string[] manifestsBefore = ReadPackageManifests(projectRoot);
+
             // Same modal-avoidance pattern as the legacy path: close clean scenes before the
             // working tree changes on disk, reopen after Refresh. After a branch switch a
             // remembered scene may not exist anymore — ReopenScenes warns and skips it.
@@ -987,6 +1006,10 @@ namespace DistributedRecorder.Worker
                     "Triggering AssetDatabase.Refresh() so Unity picks up changed assets. " +
                     "Code changes will trigger a domain reload.");
                 AssetDatabase.Refresh();
+
+                // package-resolve-on-sync (v4.3.2): Refresh() does NOT re-resolve UPM
+                // packages — see ResolvePackagesIfManifestsChanged.
+                ResolvePackagesIfManifestsChanged(projectRoot, manifestsBefore);
             }
             finally
             {
@@ -994,6 +1017,91 @@ namespace DistributedRecorder.Worker
                 // the temporary empty scene we opened above.
                 WorkerSceneReloadHelper.ReopenScenes(scenesToReopen);
             }
+        }
+
+        // --- package-resolve-on-sync helpers (v4.3.2) ---------------------------
+
+        /// <summary>
+        /// Relative paths (from the project root) of the files that define the
+        /// project's UPM package set. When a sync (reset --hard or checkout -B)
+        /// changes either of them, the Worker must run <see cref="Client.Resolve"/> —
+        /// otherwise the resolve only happens when the Editor window regains focus.
+        /// </summary>
+        internal static readonly string[] PackageManifestRelativePaths =
+        {
+            Path.Combine("Packages", "manifest.json"),
+            Path.Combine("Packages", "packages-lock.json"),
+        };
+
+        /// <summary>
+        /// Reads the current contents of the package manifest files under
+        /// <paramref name="projectRoot"/>. A missing or unreadable file yields a
+        /// <c>null</c> entry, so a file appearing or disappearing across the sync
+        /// also counts as a change in <see cref="PackageManifestsChanged"/>.
+        /// </summary>
+        internal static string[] ReadPackageManifests(string projectRoot)
+        {
+            var contents = new string[PackageManifestRelativePaths.Length];
+            for (int i = 0; i < PackageManifestRelativePaths.Length; i++)
+            {
+                string path = Path.Combine(projectRoot, PackageManifestRelativePaths[i]);
+                try
+                {
+                    contents[i] = File.Exists(path) ? File.ReadAllText(path) : null;
+                }
+                catch
+                {
+                    contents[i] = null;
+                }
+            }
+            return contents;
+        }
+
+        /// <summary>
+        /// Pure comparison of two <see cref="ReadPackageManifests"/> snapshots,
+        /// exposed for unit testing. Ordinal, byte-exact content comparison: git
+        /// writes files verbatim, so any textual difference (including a git-URL
+        /// tag moving from #vX to #vY) means the package set may have changed and
+        /// a resolve is required.
+        /// </summary>
+        internal static bool PackageManifestsChanged(string[] before, string[] after)
+        {
+            if (before == null || after == null)
+                return false;                    // defensive: no snapshot → no resolve
+            if (before.Length != after.Length)
+                return true;
+            for (int i = 0; i < before.Length; i++)
+                if (!string.Equals(before[i], after[i], StringComparison.Ordinal))
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// package-resolve-on-sync (v4.3.2): AssetDatabase.Refresh() does NOT
+        /// trigger a UPM resolve, so when a sync changed Packages/manifest.json or
+        /// packages-lock.json (e.g. a git-URL package moved to a new tag) the
+        /// Worker kept running the old package until its Editor window was manually
+        /// focused (observed 2026-08-27: mtrVersion stuck at 4.2.0 after a sync
+        /// that pinned 4.2.1). Compares <paramref name="manifestsBefore"/> (taken
+        /// before the git operation) against the current on-disk state and calls
+        /// <see cref="Client.Resolve"/> when they differ.
+        ///
+        /// Main-thread only (Client.Resolve is a main-thread PackageManager API;
+        /// both callers run inside the git-sync MainThreadDispatcher lambda).
+        /// </summary>
+        private static void ResolvePackagesIfManifestsChanged(
+            string projectRoot, string[] manifestsBefore)
+        {
+            string[] manifestsAfter = ReadPackageManifests(projectRoot);
+            if (!PackageManifestsChanged(manifestsBefore, manifestsAfter))
+                return;
+
+            Debug.Log(
+                "[WorkerHttpListener] /git-sync: Packages/manifest.json or " +
+                "packages-lock.json changed by the sync — calling Client.Resolve() " +
+                "to update packages. Domain reload may follow.");
+            VersionChecker.InvalidateCache();
+            Client.Resolve();
         }
 
         private void HandleGetJob(HttpListenerContext ctx, string remoteIp,
