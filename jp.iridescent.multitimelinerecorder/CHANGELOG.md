@@ -7,6 +7,27 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.2.2] - 2026-08-27
+
+### Fixed
+- **Transient PackageManager failures no longer surface as a bogus version
+  mismatch.** When the local `com.unity.recorder` resolution (offline
+  `Client.List`) came back empty at dispatch time — observed right after
+  Editor startup on the Master — `VersionChecker.MatchesLocal` compared the
+  empty string as-is and dispatch failed with the misleading
+  "Version mismatch detected: Recorder: local=, remote=5.1.6" (the F9 fix
+  already kept the empty result out of the cache, but the in-flight
+  comparison still used it). `MatchesLocal` now retries once
+  (`InvalidateCache` + re-resolve) when the local value is empty and the
+  remote reports a real version; if the retry still comes back empty it
+  fails with a dedicated "Version check failed: could not resolve the local
+  com.unity.recorder version …" reason instead of a mismatch.
+  `JobDispatcher.ClassifyRejection` maps that reason (arriving as a Worker
+  409) to `DispatchFailReason.VersionMismatch` so the UI keeps offering the
+  re-dispatch path — a re-send re-runs the Worker-side resolution, which
+  typically succeeds once PackageManager has recovered. The empty-vs-empty
+  comparison (Recorder not installed on either side) is unchanged.
+
 ## [4.2.1] - 2026-08-27
 
 ### Fixed
