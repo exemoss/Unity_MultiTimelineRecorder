@@ -278,17 +278,38 @@ namespace Unity.MultiTimelineRecorder.Encoders
             Cleanup(audioFileName);
         }
 
-        static void Cleanup(string backupFileName)
+        static void Cleanup(string path)
         {
-            try
+            // SMB(共有ドライブ)出力では remux 直後にサーバ側のハンドル解放が間に合わず、
+            // 削除が共有違反で弾かれることがある（最終出力は完成しているのに .tmp/.mkv
+            // だけ残る）。単発で諦めず少し待って試し直し、それでも駄目なら残置を警告する。
+            for (var attempt = 1; ; attempt++)
             {
-                File.Delete(backupFileName);
-            }
-            catch (IOException ex)
-            {
-                Debug.LogError(ex.Data);
+                try
+                {
+                    File.Delete(path);
+                    return;
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    if (attempt >= CleanupRetryCount)
+                    {
+                        Debug.LogWarning(
+                            $"一時ファイルを削除できませんでした（{CleanupRetryCount} 回試行）: {path}\n" +
+                            $"最終出力ファイル自体は完成しています。残った一時ファイルは手動で削除してください。\n" +
+                            $"{ex.GetType().Name}: {ex.Message}");
+                        return;
+                    }
+
+                    System.Threading.Thread.Sleep(CleanupRetryDelayMs);
+                }
             }
         }
+
+        // 一時ファイル削除のリトライ回数と間隔。SMB のロック解放遅延は通常この合計
+        // （0.5 秒 x 4 回待ち = 2 秒）で解消する。超過時は削除を諦めて警告に切り替える
+        const int CleanupRetryCount = 5;
+        const int CleanupRetryDelayMs = 500;
 
         static void Log(string log)
         {
