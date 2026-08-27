@@ -7,6 +7,21 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.4.0] - 2026-08-27
+
+### Added
+- **Silent mode for the ffmpeg installer** (`FfmpegInstaller.InstallAsync(completed,
+  confirm, silent)`): with `silent = true` every modal dialog — the confirmation,
+  the already-installed notice, the winget-missing guidance, and the
+  completion/failure notices — is suppressed and logged to the Console instead.
+  Modal dialogs block the editor main thread, which on an unattended distributed
+  Worker froze the HTTP listener and the batch until someone clicked OK; silent
+  mode lets a consuming project auto-install ffmpeg when a render job arrives on
+  a machine that does not have it yet (observed 2026-08-27: a newly added Worker
+  failed every Movie pass with "ffmpeg.exe が見つかりません"). The winget process
+  itself already ran fully non-interactively; the non-modal progress bar (with
+  cancel) is kept. Default behavior (`silent = false`) is unchanged.
+
 ## [4.3.2] - 2026-08-27
 
 ### Fixed
