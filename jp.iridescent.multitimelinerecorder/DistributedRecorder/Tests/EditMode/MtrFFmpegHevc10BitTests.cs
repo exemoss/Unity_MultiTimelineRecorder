@@ -72,6 +72,37 @@ namespace DistributedRecorder.Tests
         }
 
         [Test]
+        public void GetOptions_AllCodecPaths_ContainFlushPackets()
+        {
+            // 低ビットレート出力(ほぼ黒い映像等)で mp4/mov がクローズまで 44 バイトの
+            // ままになり、Encoder Output Stall Guard が「ファイルが成長しない」と誤検知して
+            // 録画を中断する(v4.3.1 実事例)。-flush_packets 1 で毎パケットのフラッシュを
+            // 強制する(出力バイト列は不変。VP9/WebM は既存対策で付与済み)
+            foreach (var format in new[]
+                     {
+                         MtrFFmpegEncoderSettings.OutputFormat.H264Nvenc,
+                         MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc,
+                         MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc10Bit,
+                         MtrFFmpegEncoderSettings.OutputFormat.ProRes4444Mov,
+                         MtrFFmpegEncoderSettings.OutputFormat.ProRes422HqMov,
+                         MtrFFmpegEncoderSettings.OutputFormat.Vp9Webm,
+                     })
+            {
+                var settings = new MtrFFmpegEncoderSettings { Format = format };
+                StringAssert.Contains("-flush_packets 1", settings.GetOptions(),
+                    $"{format} の出力はフラッシュ強制が無いと停滞ガードに誤検知される");
+            }
+
+            var debandSettings = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc10Bit,
+                Deband = true,
+            };
+            StringAssert.Contains("-flush_packets 1", debandSettings.GetOptions(),
+                "deband 分岐(HEVC 10bit)にも同様に付与する");
+        }
+
+        [Test]
         public void Hevc10Bit_ExtensionAndAlpha()
         {
             IEncoderSettings settings = new MtrFFmpegEncoderSettings

@@ -207,7 +207,14 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 // ファイルが 0 バイトのままになる(実測)。録画が異常終了すると内容ごと失われ、
                 // Encoder Output Stall Guard も「ファイルが成長しない」と誤検知して録画を
                 // 中断してしまう。フラッシュ強制でファイルは録画開始 約2 秒後から連続的に
-                // 成長する(実測)。mp4 は mdat が逐次書き込まれるため NVENC 経路では不要。
+                // 成長する(実測)。
+                // (v4.3.1 訂正) mp4/mov も無縁ではない: ffmpeg は出力バッファが埋まるまで
+                // ディスクへ書かないため、低ビットレート出力(ほぼ黒い映像等。実測 ~4KB/s)では
+                // mp4 でもヘッダ 44 バイトのままクローズまで一切成長せず、同じ誤検知で
+                // 録画が中断される(実事例: キャラ登場前が暗転のみの曲の cast-focus 出力)。
+                // このため -flush_packets 1 は全コーデック経路に付与する(GetOptions 末尾)。
+                // 出力バイト列は不変(フラッシュ粒度のみ変わる。black 25s で最終サイズ
+                // 一致を実測)。-cluster_time_limit は matroska 専用のためここだけ。
                 string vp9RateControl = bitrateKbps > 0
                     ? $"-b:v {bitrateKbps}k"
                     : $"-crf {qp} -b:v 0";
@@ -226,10 +233,12 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 if (Format == OutputFormat.ProRes4444Mov)
                 {
                     return "-c:v prores_ks -profile:v 4444 -vendor apl0"
-                           + GetColorAndScaleArgs(inputContainsAlpha ? "yuva444p10le" : "yuv444p10le");
+                           + GetColorAndScaleArgs(inputContainsAlpha ? "yuva444p10le" : "yuv444p10le")
+                           + " -flush_packets 1";
                 }
                 return "-c:v prores_ks -profile:v hq -vendor apl0"
-                       + GetColorAndScaleArgs("yuv422p10le");
+                       + GetColorAndScaleArgs("yuv422p10le")
+                       + " -flush_packets 1";
             }
 
             bool isHevc = Format == OutputFormat.HevcNvenc || Format == OutputFormat.HevcNvenc10Bit;
@@ -254,14 +263,19 @@ namespace Unity.MultiTimelineRecorder.Encoders
             // deband(10bit のみ): フィルタが p010le(セミプレーナ)を受けないため、量子化を
             // planar の yuv420p10le で行って deband を挟む。エンコーダへは -pix_fmt p010le の
             // 自動変換(ビットシフトのみ・無損失)で渡るので出力は非 deband 時と同じ 10bit
+            // -flush_packets 1: 低ビットレート出力(ほぼ黒い映像等)で mp4 がクローズまで
+            // 44 バイトのままになり、Encoder Output Stall Guard が誤検知して録画を中断する
+            // ことを防ぐ(v4.3.1。上の VP9 分岐のコメント参照。出力バイト列は不変)
             if (Format == OutputFormat.HevcNvenc10Bit && deband)
             {
                 return $"-c:v {codec} -pix_fmt p010le {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
-                       + GetColorAndScaleArgs("yuv420p10le", DebandFilter);
+                       + GetColorAndScaleArgs("yuv420p10le", DebandFilter)
+                       + " -flush_packets 1";
             }
 
             return $"-c:v {codec} -pix_fmt {encodePixelFormat} {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
-                   + GetColorAndScaleArgs(encodePixelFormat);
+                   + GetColorAndScaleArgs(encodePixelFormat)
+                   + " -flush_packets 1";
         }
 
         /// <summary>
