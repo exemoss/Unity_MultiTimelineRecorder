@@ -8,7 +8,14 @@ using UnityEngine.SceneManagement;
 namespace Unity.MultiTimelineRecorder
 {
     /// <summary>
-    /// MultiTimelineRecorder用の設定データを保存するScriptableObject
+    /// MultiTimelineRecorder用の設定データを保存するScriptableObject。
+    ///
+    /// 【共有と個人の境界】この SO はリポジトリで共有される「チームの録画設定」の正。
+    /// テイク番号・タイムライン選択・列幅・デバッグ表示などの「個人の作業状態」と、
+    /// ffmpeg.exe のパスなどの「マシン固有の値」はここに保存しない
+    /// (個人状態は <see cref="MtrUserState"/> = EditorPrefs、ffmpeg は
+    /// Encoders.FfmpegLocator が録画のたびにマシン内で解決)。本クラスに残っている
+    /// 同名フィールドは旧データからの一度きりの移行にだけ読まれ、以後書き込まれない。
     /// </summary>
     public class MultiTimelineRecorderSettings : ScriptableObject
     {
@@ -18,8 +25,15 @@ namespace Unity.MultiTimelineRecorder
         public int height = 1080;
         public string fileName = "<Scene>_<Recorder>_<Take>";
         public OutputPathSettings globalOutputPath = new OutputPathSettings();
+
+        // 【移行用・書き込み禁止】既定テイク番号。実体は MtrUserState (EditorPrefs) へ移動済み
         public int takeNumber = 1;
         public int preRollFrames = 0;
+
+        [Tooltip("ON: 録画開始時に出力先へ同名ファイルが既にある場合、_001 _002 … を付けた" +
+                 "空き名へ自動リネームして上書きを防ぐ (リネーム時はコンソールへ通知)。" +
+                 "OFF: 従来どおり同名ファイルを黙って上書きする")]
+        public bool autoRenameOnCollision = true;
 
         // 音ズレ対策ギャップ（フレーム）。範囲録画で音声を録る Movie の録画開始を
         // セクション再生開始より手前に前倒しする量（AudioSafeGapPolicy 参照）。0 = 無効
@@ -59,9 +73,10 @@ namespace Unity.MultiTimelineRecorder
         public Camera imageTargetCamera = null;
         public RenderTexture imageRenderTexture = null;
         
-        // タイムライン選択状態
+        // 【移行用・書き込み禁止】タイムライン選択状態。実体は MtrUserState (EditorPrefs) へ移動済み
         public int selectedDirectorIndex = 0;
         public List<int> selectedDirectorIndices = new List<int>();
+
         public int timelineMarginFrames = 30;
         
         // PlayableDirectorの識別情報を保存するクラス
@@ -136,6 +151,9 @@ namespace Unity.MultiTimelineRecorder
                 takeNumber = take;
             }
         }
+
+        // 【移行用・書き込み禁止】実体は MtrUserState (EditorPrefs) へ移動済み。
+        // Get/Set/IncrementTimelineTakeNumber は MtrUserState を読み書きする
         public List<TimelineTakeNumberEntry> timelineTakeNumbers = new List<TimelineTakeNumberEntry>();
 
         // タイムライン固有の「排他ルート」明示上書き管理
@@ -163,11 +181,15 @@ namespace Unity.MultiTimelineRecorder
             public string scenePath;  // シーンのフルパス（Assets/Scenes/SampleScene.unity）
             public string sceneName;  // シーン名（SampleScene）
             public List<TimelineDirectorInfo> timelineDirectorInfos = new List<TimelineDirectorInfo>();
+
+            // 【移行用・書き込み禁止】選択状態とテイク番号は個人の作業状態のため
+            // MtrUserState (EditorPrefs) へ移動済み。以下 4 つは旧データの移行にだけ読む
             public List<int> selectedDirectorIndices = new List<int>();
             public int selectedDirectorIndex = 0;
             public int currentTimelineIndexForRecorder = 0;
-            public List<TimelineRecorderConfigEntry> timelineRecorderConfigEntries = new List<TimelineRecorderConfigEntry>();
             public List<TimelineTakeNumberEntry> timelineTakeNumbers = new List<TimelineTakeNumberEntry>();
+
+            public List<TimelineRecorderConfigEntry> timelineRecorderConfigEntries = new List<TimelineRecorderConfigEntry>();
             public List<TimelineExclusiveRootEntry> timelineExclusiveRootOverrides = new List<TimelineExclusiveRootEntry>();
 
             public SceneSpecificSettings(string path, string name)
@@ -180,19 +202,20 @@ namespace Unity.MultiTimelineRecorder
         [SerializeField]
         private List<SceneSpecificSettings> sceneSettings = new List<SceneSpecificSettings>();
         
-        // UIレイアウト設定
+        // 【移行用・書き込み禁止】UIレイアウト・デバッグ表示は個人の作業状態のため
+        // MtrUserState (EditorPrefs) へ移動済み
         public float leftColumnWidth = 250f;
         public float centerColumnWidth = 250f;
-        
-        // デバッグ設定
         public bool debugMode = false;
         public bool showStatusSection = true;
         public bool showDebugSettings = false;
-        
+
         // SignalEmitter設定 (TODO-282)
         public bool useSignalEmitterTiming = false;
         public string startTimingName = "pre";
         public string endTimingName = "post";
+
+        // 【移行用・書き込み禁止】表示単位の好み。実体は MtrUserState (EditorPrefs) へ移動済み
         public bool showTimingInFrames = false; // false=秒数表示, true=フレーム数表示
         
         // 設定ファイルのパス
@@ -258,36 +281,25 @@ namespace Unity.MultiTimelineRecorder
         }
         
         /// <summary>
-        /// 特定のTimelineのTake番号を取得
+        /// 特定のTimelineのTake番号を取得 (アクティブシーン単位)。
+        /// テイク番号は個人の作業状態のため MtrUserState (EditorPrefs) が正
+        /// (旧データはそこへの初回移行で引き継がれる)。エントリーが無ければ
+        /// グローバル既定テイク番号を返す。
         /// </summary>
         public int GetTimelineTakeNumber(int timelineIndex)
         {
-            var entry = timelineTakeNumbers.Find(e => e.timelineIndex == timelineIndex);
-            if (entry != null)
-            {
-                return entry.takeNumber;
-            }
-            // エントリーが存在しない場合は、グローバルのtakeNumberを返す
-            return takeNumber;
+            return MtrUserState.GetTimelineTake(ActiveScenePath, timelineIndex, this);
         }
-        
+
         /// <summary>
-        /// 特定のTimelineのTake番号を設定
+        /// 特定のTimelineのTake番号を設定 (アクティブシーン単位、EditorPrefs へ保存)。
+        /// 共有 SO には書き込まない (録画のたびにアセットが変更される事故防止)。
         /// </summary>
         public void SetTimelineTakeNumber(int timelineIndex, int take)
         {
-            var entry = timelineTakeNumbers.Find(e => e.timelineIndex == timelineIndex);
-            if (entry != null)
-            {
-                entry.takeNumber = take;
-            }
-            else
-            {
-                timelineTakeNumbers.Add(new TimelineTakeNumberEntry(timelineIndex, take));
-            }
-            Save();
+            MtrUserState.SetTimelineTake(ActiveScenePath, timelineIndex, take, this);
         }
-        
+
         /// <summary>
         /// 特定のTimelineのTake番号をインクリメント
         /// </summary>
@@ -296,19 +308,21 @@ namespace Unity.MultiTimelineRecorder
             int currentTake = GetTimelineTakeNumber(timelineIndex);
             SetTimelineTakeNumber(timelineIndex, currentTake + 1);
         }
-        
+
         /// <summary>
-        /// すべてのTimelineのTake番号をDictionaryとして取得
+        /// すべてのTimelineのTake番号をDictionaryとして取得 (アクティブシーン単位)
         /// </summary>
         public Dictionary<int, int> GetAllTimelineTakeNumbers()
         {
             var dict = new Dictionary<int, int>();
-            foreach (var entry in timelineTakeNumbers)
+            foreach (var entry in MtrUserState.LoadScene(ActiveScenePath, this).timelineTakeNumbers)
             {
                 dict[entry.timelineIndex] = entry.takeNumber;
             }
             return dict;
         }
+
+        private static string ActiveScenePath => SceneManager.GetActiveScene().path;
 
         /// <summary>
         /// 指定Timelineの「排他ルート」明示上書きを取得する（未設定なら null）。

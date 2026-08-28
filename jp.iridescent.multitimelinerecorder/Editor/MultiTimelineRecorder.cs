@@ -229,6 +229,8 @@ namespace Unity.MultiTimelineRecorder
         public string fileName = "<Scene>_<Recorder>_<Take>"; // File name with wildcard support
         public OutputPathSettings globalOutputPath = new OutputPathSettings(); // Global output path settings
         public int takeNumber = 1;
+        // 出力先の同名ファイルとの衝突時に _001 _002 … へ自動リネームするか (チーム共有の設定)
+        public bool autoRenameOnCollision = true;
         public int preRollFrames = 0; // Pre-roll frames for simulation warm-up
 
         // 音ズレ対策ギャップ（フレーム）。範囲録画（尺範囲 / SignalEmitter）で音声を録る
@@ -272,6 +274,7 @@ namespace Unity.MultiTimelineRecorder
         // UI折りたたみ用フラグ
         private bool showStatusSection = true;
         private bool showDebugSettings = false;
+        private bool showMachineSettings = false;
         
         
         // Recording objects
@@ -567,17 +570,52 @@ namespace Unity.MultiTimelineRecorder
 
             EditorGUILayout.EndHorizontal();
             
+            // 上書き防止 (自動リネーム)
+            EditorGUILayout.BeginHorizontal();
+            autoRenameOnCollision = EditorGUILayout.ToggleLeft(
+                new GUIContent("同名ファイルは自動リネーム (_001…) で上書きを防ぐ",
+                    "録画開始時に出力先へ同名ファイルが既にある場合、_001 _002 … を付けた空き名へ" +
+                    "自動リネームする (リネーム時はコンソールへ通知)。OFF にすると従来どおり黙って上書きする"),
+                autoRenameOnCollision);
+            EditorGUILayout.EndHorizontal();
+
             // SignalEmitter設定 (TODO-282)
             EditorGUILayout.Space(5);
-            
+
             // セパレーター線を描画
             Rect separatorRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(1), GUILayout.ExpandWidth(true));
             EditorGUI.DrawRect(separatorRect, new Color(0.5f, 0.5f, 0.5f, 0.3f));
             EditorGUILayout.Space(5);
-            
+
             DrawSignalEmitterSettings();
-            
-            
+
+
+            EditorGUILayout.EndVertical();
+
+            // マシン固有の設定は共有設定と混ざらないよう独立セクションに分ける
+            DrawMachineSettings();
+        }
+
+        /// <summary>
+        /// 「このマシンの設定」セクション。マシン固有の値 (ffmpeg.exe の場所) は共有 SO には
+        /// 保存せず EditorPrefs で扱うため、共有の Recording Settings とは箱を分けて描画する。
+        /// テイク番号・タイムライン選択・列幅・デバッグ表示も同様に個人設定 (EditorPrefs) だが、
+        /// それらは各操作 UI の場所で編集するためここには置かない。
+        /// </summary>
+        private void DrawMachineSettings()
+        {
+            EditorGUILayout.BeginVertical("HelpBox");
+            showMachineSettings = EditorGUILayout.Foldout(showMachineSettings,
+                "このマシンの設定（個人設定 — リポジトリに保存されません）", true);
+            if (showMachineSettings)
+            {
+                Unity.MultiTimelineRecorder.Encoders.FfmpegLocatorGUI.Draw(null);
+                EditorGUILayout.Space(2);
+                EditorGUILayout.LabelField(
+                    "テイク番号・タイムライン選択・列幅・デバッグ表示も個人設定として EditorPrefs に保存されます" +
+                    "（共有の設定アセットには書き込まれません）",
+                    EditorStyles.wordWrappedMiniLabel);
+            }
             EditorGUILayout.EndVertical();
         }
         
@@ -2281,7 +2319,8 @@ namespace Unity.MultiTimelineRecorder
                 {
                     MultiTimelineRecorderLogger.Log("[MultiTimelineRecorder] Incrementing take numbers as requested");
                     
-                    // Take番号をインクリメント
+                    // Take番号をインクリメント (MtrUserState = EditorPrefs へ保存されるため
+                    // 共有アセットの SetDirty / SaveAssets は不要)
                     if (settings != null && selectedDirectorIndices.Count > 0)
                     {
                         foreach (int idx in selectedDirectorIndices)
@@ -2289,12 +2328,7 @@ namespace Unity.MultiTimelineRecorder
                             settings.IncrementTimelineTakeNumber(idx);
                             MultiTimelineRecorderLogger.Log($"[MultiTimelineRecorder] Incremented take number for timeline index {idx}");
                         }
-                        
-                        // 設定を保存してUIを更新
-                        EditorUtility.SetDirty(settings);
-                        AssetDatabase.SaveAssets();
-                        SaveSettings();
-                        
+
                         // UI更新を強制
                         Repaint();
                     }
@@ -4537,14 +4571,14 @@ namespace Unity.MultiTimelineRecorder
         private void LoadSettings()
         {
             settings = MultiTimelineRecorderSettings.LoadOrCreateSettings();
-            
+
             // グローバル設定から値を復元
             frameRate = settings.frameRate;
             width = settings.width;
             height = settings.height;
             fileName = settings.fileName;
             globalOutputPath = settings.globalOutputPath;
-            takeNumber = settings.takeNumber;
+            autoRenameOnCollision = settings.autoRenameOnCollision;
             preRollFrames = settings.preRollFrames;
             audioSafeGapFrames = settings.audioSafeGapFrames;
             cameraTag = settings.cameraTag;
@@ -4555,8 +4589,12 @@ namespace Unity.MultiTimelineRecorder
             encoderStallCheckIntervalSec = settings.encoderStallCheckIntervalSec;
             encoderStallTimeoutSec = settings.encoderStallTimeoutSec;
 
-            selectedDirectorIndex = settings.selectedDirectorIndex;
-            selectedDirectorIndices = new List<int>(settings.selectedDirectorIndices);
+            // 個人の作業状態 (テイク番号・選択・列幅・デバッグ表示) は共有 SO ではなく
+            // MtrUserState (EditorPrefs) から復元する。旧データは SO から初回移行される
+            var userState = MtrUserState.LoadGlobal(settings);
+            takeNumber = userState.takeNumber;
+            selectedDirectorIndex = userState.selectedDirectorIndex;
+            selectedDirectorIndices = new List<int>(userState.selectedDirectorIndices);
             
             // NOTE: Validation of selectedDirectorIndices is moved to after recordingQueueDirectors is loaded
             
@@ -4610,12 +4648,12 @@ namespace Unity.MultiTimelineRecorder
                 }
             }
             
-            leftColumnWidth = settings.leftColumnWidth;
-            centerColumnWidth = settings.centerColumnWidth;
-            
-            debugMode = settings.debugMode;
-            showStatusSection = settings.showStatusSection;
-            showDebugSettings = settings.showDebugSettings;
+            leftColumnWidth = userState.leftColumnWidth;
+            centerColumnWidth = userState.centerColumnWidth;
+
+            debugMode = userState.debugMode;
+            showStatusSection = userState.showStatusSection;
+            showDebugSettings = userState.showDebugSettings;
             
             // グローバルのTimelineリストは読み込まない（シーン固有の設定を優先するため）
             // LoadSceneSpecificSettingsメソッドで、シーン固有の設定がない場合のみグローバル設定を読み込む
@@ -4648,7 +4686,7 @@ namespace Unity.MultiTimelineRecorder
             useSignalEmitterTiming = settings.useSignalEmitterTiming;
             startTimingName = settings.startTimingName;
             endTimingName = settings.endTimingName;
-            showTimingInFrames = settings.showTimingInFrames;
+            showTimingInFrames = userState.showTimingInFrames;
             
             // Validate selectedDirectorIndices after all directors are loaded
             if (selectedDirectorIndices != null && recordingQueueDirectors != null)
@@ -4702,13 +4740,13 @@ namespace Unity.MultiTimelineRecorder
                 }
             }
             
-            // 設定に値を保存
+            // 設定に値を保存 (チーム共有の録画設定のみ。個人の作業状態は後段の MtrUserState へ)
             settings.frameRate = frameRate;
             settings.width = width;
             settings.height = height;
             settings.fileName = fileName;
             settings.globalOutputPath = globalOutputPath;
-            settings.takeNumber = takeNumber;
+            settings.autoRenameOnCollision = autoRenameOnCollision;
             settings.preRollFrames = preRollFrames;
             settings.audioSafeGapFrames = audioSafeGapFrames;
             settings.cameraTag = cameraTag;
@@ -4719,8 +4757,6 @@ namespace Unity.MultiTimelineRecorder
             settings.encoderStallCheckIntervalSec = encoderStallCheckIntervalSec;
             settings.encoderStallTimeoutSec = encoderStallTimeoutSec;
 
-            settings.selectedDirectorIndex = selectedDirectorIndex;
-            settings.selectedDirectorIndices = new List<int>(selectedDirectorIndices);
             settings.timelineMarginFrames = timelineMarginFrames;
             
             settings.multiRecorderConfig = multiRecorderConfig;
@@ -4791,19 +4827,27 @@ namespace Unity.MultiTimelineRecorder
                 }
             }
             
-            settings.leftColumnWidth = leftColumnWidth;
-            settings.centerColumnWidth = centerColumnWidth;
-            
-            settings.debugMode = debugMode;
-            settings.showStatusSection = showStatusSection;
-            settings.showDebugSettings = showDebugSettings;
-            
             // SignalEmitter設定の保存 (TODO-282)
             settings.useSignalEmitterTiming = useSignalEmitterTiming;
             settings.startTimingName = startTimingName;
             settings.endTimingName = endTimingName;
-            settings.showTimingInFrames = showTimingInFrames;
-            
+
+            // 個人の作業状態 (テイク番号・選択・列幅・デバッグ表示) は共有 SO ではなく
+            // MtrUserState (EditorPrefs) へ保存する。共有アセットが録画・選択のたびに
+            // 変更されてコミットで他人の状態を上書きし合う事故を防ぐ
+            MtrUserState.SaveGlobal(new MtrUserState.GlobalState
+            {
+                takeNumber = takeNumber,
+                selectedDirectorIndex = selectedDirectorIndex,
+                selectedDirectorIndices = new List<int>(selectedDirectorIndices),
+                leftColumnWidth = leftColumnWidth,
+                centerColumnWidth = centerColumnWidth,
+                debugMode = debugMode,
+                showStatusSection = showStatusSection,
+                showDebugSettings = showDebugSettings,
+                showTimingInFrames = showTimingInFrames,
+            });
+
             // 保存
             settings.Save();
             
@@ -4944,26 +4988,21 @@ namespace Unity.MultiTimelineRecorder
                 }
             }
             
-            sceneSettings.selectedDirectorIndices = new List<int>(selectedDirectorIndices);
-            sceneSettings.selectedDirectorIndex = selectedDirectorIndex;
-            sceneSettings.currentTimelineIndexForRecorder = currentTimelineIndexForRecorder;
-            
+            // 選択状態は個人の作業状態のため共有 SO には保存しない
+            // (MtrUserState = EditorPrefs へ。テイク番号は SetTimelineTakeNumber が
+            // 都度 MtrUserState に書いているためここでの転記は不要)
+            var userSceneState = MtrUserState.LoadScene(scene.path, settings);
+            userSceneState.selectedDirectorIndices = new List<int>(selectedDirectorIndices);
+            userSceneState.selectedDirectorIndex = selectedDirectorIndex;
+            userSceneState.currentTimelineIndexForRecorder = currentTimelineIndexForRecorder;
+            MtrUserState.SaveScene(scene.path, userSceneState);
+
             // TimelineRecorderConfigsを保存
             sceneSettings.timelineRecorderConfigEntries.Clear();
             foreach (var kvp in timelineRecorderConfigs)
             {
                 sceneSettings.timelineRecorderConfigEntries.Add(
                     new MultiTimelineRecorderSettings.TimelineRecorderConfigEntry(kvp.Key, kvp.Value)
-                );
-            }
-            
-            // TimelineTakeNumbersを保存
-            sceneSettings.timelineTakeNumbers.Clear();
-            var allTakeNumbers = settings.GetAllTimelineTakeNumbers();
-            foreach (var kvp in allTakeNumbers)
-            {
-                sceneSettings.timelineTakeNumbers.Add(
-                    new MultiTimelineRecorderSettings.TimelineTakeNumberEntry(kvp.Key, kvp.Value)
                 );
             }
 
@@ -5012,24 +5051,22 @@ namespace Unity.MultiTimelineRecorder
                     }
                 }
                 
-                // 選択状態を復元
-                selectedDirectorIndices = new List<int>(sceneSettings.selectedDirectorIndices);
-                selectedDirectorIndex = sceneSettings.selectedDirectorIndex;
-                currentTimelineIndexForRecorder = sceneSettings.currentTimelineIndexForRecorder;
-                
+                // 選択状態を復元 (個人の作業状態のため MtrUserState = EditorPrefs が正。
+                // 旧データは共有 SO のシーン別ブロックから初回移行される)
+                var userSceneState = MtrUserState.LoadScene(scene.path, settings);
+                selectedDirectorIndices = new List<int>(userSceneState.selectedDirectorIndices);
+                selectedDirectorIndex = userSceneState.selectedDirectorIndex;
+                currentTimelineIndexForRecorder = userSceneState.currentTimelineIndexForRecorder;
+
                 // TimelineRecorderConfigsを復元
                 timelineRecorderConfigs.Clear();
                 foreach (var entry in sceneSettings.timelineRecorderConfigEntries)
                 {
                     timelineRecorderConfigs[entry.timelineIndex] = entry.config;
                 }
-                
-                // TimelineTakeNumbersを復元
-                settings.timelineTakeNumbers.Clear();
-                foreach (var entry in sceneSettings.timelineTakeNumbers)
-                {
-                    settings.timelineTakeNumbers.Add(entry);
-                }
+
+                // テイク番号は MtrUserState がシーン単位で保持しているため転記は不要
+                // (Get/SetTimelineTakeNumber がアクティブシーンのストアを直接読み書きする)
 
                 // 排他ルート明示上書きを復元 (Refs: mtr-batch-scene-activation)
                 settings.timelineExclusiveRootOverrides.Clear();
