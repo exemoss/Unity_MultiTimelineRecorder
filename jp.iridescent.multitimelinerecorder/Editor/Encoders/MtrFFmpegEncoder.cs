@@ -72,7 +72,11 @@ namespace Unity.MultiTimelineRecorder.Encoders
                     + " \"" + ctx.path + "\"";
 
                 _rawVideoFilename = ctx.path;
-                _ffmpegVideoPipe = new MtrFFmpegPipe(arguments, ffmpegSettings.FfmpegPath, "VideoPipe");
+                // ffmpeg.exe の場所はマシン固有のため、起動直前にもこのマシンで解決する
+                // (個人設定 → 設定値 → 自動検出)。MTR を経由せず素の Recorder アセットに
+                // 本設定を直接割り当てた場合もここで解決される
+                var ffmpegExe = FfmpegLocator.Resolve(ffmpegSettings.FfmpegPath);
+                _ffmpegVideoPipe = new MtrFFmpegPipe(arguments, ffmpegExe, "VideoPipe");
 
                 Log($"Video: {arguments}");
 
@@ -94,7 +98,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
                     var audioArgs = "  -loglevel error -y -ar " + audioSampleRate.numerator
                         + " -ac 2"
                         + " -f f32le -i - -c:a " + audioCodec + " " + fileNameAudio;
-                    _ffmpegAudioPipe = new MtrFFmpegPipe(audioArgs, ffmpegSettings.FfmpegPath, "AudioPipe");
+                    _ffmpegAudioPipe = new MtrFFmpegPipe(audioArgs, ffmpegExe, "AudioPipe");
 
                     Log($"Audio: {audioArgs}");
                 }

@@ -192,7 +192,9 @@ namespace Unity.MultiTimelineRecorder
                 settings.EncoderSettings = new MtrFFmpegEncoderSettings
                 {
                     Format = ffmpegFormat,
-                    FfmpegPath = ffmpegPath,
+                    // ffmpeg.exe の場所はマシンごとに違うため、シリアライズ値は候補の 1 つに
+                    // すぎない。録画のたびにこのマシンで解決する (個人設定 → 設定値 → 自動検出)
+                    FfmpegPath = FfmpegLocator.Resolve(ffmpegPath),
                     Qp = ffmpegQp,
                     BitrateKbps = ffmpegTargetBitrateKbps,
                     Deband = ffmpegDeband,
@@ -372,15 +374,12 @@ namespace Unity.MultiTimelineRecorder
                     return false;
                 }
 
-                if (string.IsNullOrEmpty(ffmpegPath))
+                // マシンごとに解決した実効パスで検証する (個人設定 → 設定値 → 自動検出)。
+                // シリアライズ値が他マシンのパスでも、このマシンで ffmpeg が見つかれば有効
+                if (!FfmpegLocator.IsResolved(ffmpegPath))
                 {
-                    errorMessage = "FFmpeg NVENC エンコーダを選択した場合は ffmpeg.exe のパスを指定してください。";
-                    return false;
-                }
-
-                if (!File.Exists(ffmpegPath))
-                {
-                    errorMessage = $"ffmpeg.exe が見つかりません: {ffmpegPath}";
+                    errorMessage = "ffmpeg.exe がこのマシンで見つかりません (個人設定・PATH・WinGet いずれも無し)。" +
+                                   "「このマシンの設定」でセットアップまたはパス指定をしてください。";
                     return false;
                 }
 

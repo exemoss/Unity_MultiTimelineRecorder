@@ -41,16 +41,10 @@ namespace Unity.MultiTimelineRecorder.Encoders
             // prefab override logic works on the entire property.
             EditorGUI.BeginProperty(position, label, property);
 
+            // ffmpeg.exe の場所はマシン固有のため、シリアライズ値へは書き込まず
+            // 解決状態の表示とこのマシン専用の指定 (EditorPrefs) のみ描画する
             var ffmpegPathProp = property.FindPropertyRelative("ffmpegPath");
-            EditorGUILayout.BeginHorizontal();
-            ffmpegPathProp.stringValue = EditorGUILayout.TextField(Styles.FfmpegPathLabel, ffmpegPathProp.stringValue);
-            if (GUILayout.Button(Styles.BrowseLabel, GUILayout.Width(28)))
-            {
-                var selected = EditorUtility.OpenFilePanel("ffmpeg.exe を選択", "", "exe");
-                if (!string.IsNullOrEmpty(selected))
-                    ffmpegPathProp.stringValue = selected;
-            }
-            EditorGUILayout.EndHorizontal();
+            FfmpegLocatorGUI.Draw(ffmpegPathProp.stringValue);
 
             var format = property.FindPropertyRelative("outputFormat");
             format.intValue = (int)(OutputFormat)EditorGUILayout.EnumPopup(Styles.FormatLabel, (OutputFormat)format.intValue);

@@ -237,15 +237,9 @@ namespace Unity.MultiTimelineRecorder.RecorderConfigEditors
             movieConfig.encoderType = (MovieEncoderType)EditorGUILayout.EnumPopup("Encoder", movieConfig.encoderType);
             if (movieConfig.encoderType != MovieEncoderType.CoreEncoder)
             {
-                EditorGUILayout.BeginHorizontal();
-                movieConfig.ffmpegPath = EditorGUILayout.TextField("FFmpeg Path", movieConfig.ffmpegPath);
-                if (GUILayout.Button("...", GUILayout.Width(28)))
-                {
-                    var selected = EditorUtility.OpenFilePanel("ffmpeg.exe を選択", "", "exe");
-                    if (!string.IsNullOrEmpty(selected))
-                        movieConfig.ffmpegPath = selected;
-                }
-                EditorGUILayout.EndHorizontal();
+                // ffmpeg.exe の場所はマシン固有のため、共有設定 (movieConfig.ffmpegPath) へは
+                // 書き込まない。解決状態の表示とこのマシン専用の指定 (EditorPrefs) のみ
+                Unity.MultiTimelineRecorder.Encoders.FfmpegLocatorGUI.Draw(movieConfig.ffmpegPath);
 
                 movieConfig.ffmpegTargetBitrateKbps = EditorGUILayout.IntField("Target Bitrate (kbps)", movieConfig.ffmpegTargetBitrateKbps);
                 using (new EditorGUI.DisabledScope(movieConfig.ffmpegTargetBitrateKbps > 0))

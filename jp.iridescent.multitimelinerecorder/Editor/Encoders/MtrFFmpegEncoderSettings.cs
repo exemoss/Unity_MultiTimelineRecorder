@@ -308,10 +308,10 @@ namespace Unity.MultiTimelineRecorder.Encoders
         /// <inheritdoc/>
         void IEncoderSettings.ValidateRecording(RecordingContext ctx, List<string> errors, List<string> warnings)
         {
-            if (string.IsNullOrEmpty(FfmpegPath))
-                errors.Add("ffmpeg.exe のパスが指定されていません。MTR の Movie 設定で明示指定してください。");
-            else if (!File.Exists(FfmpegPath))
-                errors.Add($"ffmpeg.exe が見つかりません: {FfmpegPath}");
+            // マシンごとに解決した実効パスで検証する (個人設定 → 設定値 → 自動検出)
+            if (!FfmpegLocator.IsResolved(FfmpegPath))
+                errors.Add("ffmpeg.exe がこのマシンで見つかりません (個人設定・PATH・WinGet いずれも無し)。" +
+                           "MTR の「このマシンの設定」でセットアップまたはパス指定をしてください。");
 
             if (ctx.doCaptureAlpha && !FormatSupportsAlpha)
                 errors.Add("MTR FFmpeg Encoder のアルファチャンネル対応は VP9(WebM) / ProRes 4444(MOV) のみです。");

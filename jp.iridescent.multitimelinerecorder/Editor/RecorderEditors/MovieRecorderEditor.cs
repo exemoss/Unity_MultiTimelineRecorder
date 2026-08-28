@@ -239,65 +239,9 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                 EditorGUILayout.HelpBox("FFmpeg NVENC エンコーダは MP4 コンテナのみ対応しています。上の Format を MP4 に設定してください。", MessageType.Error);
             }
 
-            EditorGUILayout.BeginHorizontal();
-            host.movieFfmpegPath = EditorGUILayout.TextField(
-                new GUIContent("FFmpeg Path", "ffmpeg.exe への絶対パス。リポジトリには同梱しないため、各マシンで導入したパスを明示指定すること。"),
-                host.movieFfmpegPath);
-            if (GUILayout.Button(new GUIContent("自動検出",
-                "この PC の定番の場所(PATH / WinGet / Chocolatey / Scoop / C:\\ffmpeg)から ffmpeg.exe を探して設定します"),
-                GUILayout.Width(64)))
-            {
-                var found = Unity.MultiTimelineRecorder.Encoders.FfmpegLocator.TryFindFfmpeg();
-                if (!string.IsNullOrEmpty(found))
-                {
-                    host.movieFfmpegPath = found;
-                    GUI.changed = true;
-                }
-                else if (Unity.MultiTimelineRecorder.Encoders.FfmpegInstaller.IsWingetAvailable())
-                {
-                    // 未検出はほぼ「未導入」なので、その場で winget セットアップへ誘導する
-                    if (EditorUtility.DisplayDialog("ffmpeg 自動検出",
-                        "ffmpeg.exe が見つかりませんでした。\n" +
-                        "winget でいまセットアップしますか？(ネットワーク経由のダウンロードを含みます)",
-                        "セットアップする", "閉じる"))
-                    {
-                        // このダイアログで確認済みのため、インストーラ側の確認はスキップする
-                        StartFfmpegSetup(confirm: false);
-                    }
-                }
-                else
-                {
-                    EditorUtility.DisplayDialog("ffmpeg 自動検出",
-                        "ffmpeg.exe が見つかりませんでした。\n" +
-                        "PATH への追加、または winget install Gyan.FFmpeg 等で導入してから再試行してください。",
-                        "OK");
-                }
-            }
-            using (new EditorGUI.DisabledScope(Unity.MultiTimelineRecorder.Encoders.FfmpegInstaller.IsRunning))
-            {
-                if (GUILayout.Button(new GUIContent("セットアップ",
-                    "winget (Windows 標準のパッケージマネージャ) で ffmpeg をこの PC に導入し、パスを自動設定します"),
-                    GUILayout.Width(80)))
-                {
-                    StartFfmpegSetup();
-                }
-            }
-            if (GUILayout.Button("...", GUILayout.Width(28)))
-            {
-                var selected = EditorUtility.OpenFilePanel("ffmpeg.exe を選択", "", "exe");
-                if (!string.IsNullOrEmpty(selected))
-                    host.movieFfmpegPath = selected;
-            }
-            EditorGUILayout.EndHorizontal();
-
-            if (string.IsNullOrEmpty(host.movieFfmpegPath))
-            {
-                EditorGUILayout.HelpBox("ffmpeg.exe のパスが未指定です。録画開始時にエラーになります。", MessageType.Warning);
-            }
-            else if (!System.IO.File.Exists(host.movieFfmpegPath))
-            {
-                EditorGUILayout.HelpBox($"ffmpeg.exe が見つかりません: {host.movieFfmpegPath}", MessageType.Warning);
-            }
+            // ffmpeg.exe の場所はマシン固有のため、共有設定 (host.movieFfmpegPath) へは
+            // 書き込まない。解決状態の表示とこのマシン専用の指定 (EditorPrefs) のみ
+            Unity.MultiTimelineRecorder.Encoders.FfmpegLocatorGUI.Draw(host.movieFfmpegPath);
 
             host.movieFfmpegBitrateKbps = EditorGUILayout.IntField(
                 new GUIContent("Target Bitrate (kbps)", "目標ビットレート(kbps)。0の場合はQP固定モードを使用する。0より大きい場合は可変ビットレートモードに切り替わる。"),
@@ -313,26 +257,6 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
             EditorGUILayout.HelpBox("FFmpeg エンコーダを選択した場合、上の Quality / Bitrate (Mbps) は使用されません(内蔵エンコーダ専用の設定です)。", MessageType.Info);
 
             EditorGUI.indentLevel--;
-        }
-
-        /// <summary>
-        /// winget による ffmpeg セットアップを開始し、完了時にパスを設定へ反映する。
-        /// 完了は OnGUI の変更検知の外（非同期コールバック）なので、値の書き込み後に
-        /// MTR 系ウィンドウを明示的に再描画する（保存は以降の通常の GUI 操作に乗る）。
-        /// </summary>
-        private void StartFfmpegSetup(bool confirm = true)
-        {
-            Unity.MultiTimelineRecorder.Encoders.FfmpegInstaller.InstallAsync(found =>
-            {
-                if (string.IsNullOrEmpty(found))
-                    return;
-                host.movieFfmpegPath = found;
-                foreach (var window in Resources.FindObjectsOfTypeAll<EditorWindow>())
-                {
-                    if (window.GetType().Assembly == typeof(MovieRecorderEditor).Assembly)
-                        window.Repaint();
-                }
-            }, confirm);
         }
 
         protected override string GetFileExtension()
@@ -442,15 +366,10 @@ namespace Unity.MultiTimelineRecorder.RecorderEditors
                     return false;
                 }
 
-                if (string.IsNullOrEmpty(host.movieFfmpegPath))
+                // マシンごとに解決した実効パスで検証する (個人設定 → 設定値 → 自動検出)
+                if (!Unity.MultiTimelineRecorder.Encoders.FfmpegLocator.IsResolved(host.movieFfmpegPath))
                 {
-                    errorMessage = "FFmpeg NVENC encoder requires ffmpeg path to be set";
-                    return false;
-                }
-
-                if (!System.IO.File.Exists(host.movieFfmpegPath))
-                {
-                    errorMessage = $"ffmpeg.exe not found at: {host.movieFfmpegPath}";
+                    errorMessage = "ffmpeg.exe がこのマシンで見つかりません。「このマシンの設定」でセットアップまたはパス指定をしてください";
                     return false;
                 }
             }
