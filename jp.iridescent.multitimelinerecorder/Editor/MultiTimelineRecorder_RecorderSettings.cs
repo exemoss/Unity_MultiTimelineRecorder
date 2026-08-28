@@ -675,8 +675,15 @@ namespace Unity.MultiTimelineRecorder
                         break;
                 }
                 
+                if (autoRenameOnCollision)
+                {
+                    // 上書き防止: 既存ファイルと衝突していれば _001 _002 … の空き名へ
+                    processedFileName = OutputFileUniquifier.EnsureUnique(
+                        processedFilePath, processedFileName, recorderItem);
+                }
+
                 MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Output path: {processedFilePath}, Filename: {processedFileName}");
-                
+
                 // Create recorder settings based on type
                 RecorderSettings recorderSettings = null;
             

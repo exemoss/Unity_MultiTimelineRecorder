@@ -611,6 +611,12 @@ namespace Unity.MultiTimelineRecorder
             
             var processedFileName = WildcardProcessor.ProcessWildcards(fileName, context);
             var processedFilePath = globalOutputPath.GetResolvedPath(context);
+            if (autoRenameOnCollision)
+            {
+                // 上書き防止: 既存ファイルと衝突していれば _001 _002 … の空き名へ
+                processedFileName = OutputFileUniquifier.EnsureUnique(
+                    processedFilePath, processedFileName, multiRecorderConfig.RecorderItems[0]);
+            }
             List<RecorderSettings> recorderSettingsList = new List<RecorderSettings>();
             
             // Create recorder settings (same as single timeline mode)
@@ -753,13 +759,20 @@ namespace Unity.MultiTimelineRecorder
             }
             
             var processedFileName = WildcardProcessor.ProcessWildcards(recorderItem.fileName, context);
-            
+
             // Use OutputPathManager to resolve the path
             string resolvedPath = OutputPathManager.ResolveRecorderPath(globalOutputPath, recorderItem.outputPath);
-            
+
             // Process wildcards in the resolved path
             string processedFilePath = WildcardProcessor.ProcessWildcards(resolvedPath, context);
-            
+
+            if (autoRenameOnCollision)
+            {
+                // 上書き防止: 既存ファイルと衝突していれば _001 _002 … の空き名へ
+                processedFileName = OutputFileUniquifier.EnsureUnique(
+                    processedFilePath, processedFileName, recorderItem);
+            }
+
             // Create recorder settings based on type
             RecorderSettings recorderSettings = null;
             List<RecorderSettings> settingsList = new List<RecorderSettings>();
@@ -1189,13 +1202,20 @@ namespace Unity.MultiTimelineRecorder
             
             // Use each recorder's individual file name
             var processedFileName = WildcardProcessor.ProcessWildcards(recorderItem.fileName, context);
-            
+
             // Use OutputPathManager to resolve the path
             string resolvedPath = OutputPathManager.ResolveRecorderPath(globalOutputPath, recorderItem.outputPath);
-            
+
             // Process wildcards in the resolved path
             string processedFilePath = WildcardProcessor.ProcessWildcards(resolvedPath, context);
-            
+
+            if (autoRenameOnCollision)
+            {
+                // 上書き防止: 既存ファイルと衝突していれば _001 _002 … の空き名へ
+                processedFileName = OutputFileUniquifier.EnsureUnique(
+                    processedFilePath, processedFileName, recorderItem);
+            }
+
             // Create recorder settings based on type
             RecorderSettings recorderSettings = null;
             List<RecorderSettings> settingsList = new List<RecorderSettings>();
