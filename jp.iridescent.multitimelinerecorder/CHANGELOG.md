@@ -7,6 +7,38 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [Unreleased]
+
+### Added
+- **同名ファイルの自動リネーム（上書き防止）。** テイク番号が増えないまま、あるいは
+  `<Take>` / `<Date>` の無いファイル名テンプレートで再録画すると、既存の出力が予告なく
+  上書きされていた。録画開始時に出力先の既存ファイルと照合し、衝突していれば
+  `_001` `_002` … を付けた空き名へ自動リネームする（リネーム時はコンソールへ通知。
+  連番 Image / AOV は前方一致で照合）。共有設定 `autoRenameOnCollision`（既定 ON）で
+  無効化できる。ON のままでも衝突が無ければ出力名は従来と同一。
+- **「このマシンの設定」セクション（MTR ウィンドウ）。** マシン固有の個人設定
+  （EditorPrefs）を共有の Recording Settings とは別の箱で描画する。現時点の内容は
+  ffmpeg.exe の解決状態表示と「指定... / 自動検出に戻す / セットアップ」。
+
+### Changed
+- **ffmpeg.exe のパスを共有設定に保存しない。** これまで各レコーダの FFmpeg Path は
+  共有 SO（MultiTimelineRecorderSettings.asset / MultiRecorderConfig）にシリアライズされ、
+  誰かのローカル絶対パス（例: `C:\Users\<name>\...`）がコミットされると他の全マシンで
+  バリデーションに落ちる → 各自が上書きコミットし合う事故になっていた（2026-08 実発生）。
+  以後は録画のたびに「個人設定（EditorPrefs）→ 設定に残っている旧パス（実在する場合のみ）→
+  自動検出（PATH / WinGet / Chocolatey / Scoop / C:\ffmpeg）」の順でマシン内解決する
+  （`FfmpegLocator.Resolve`。エンコーダ起動直前にも解決するため、素の Recorder アセットに
+  `MtrFFmpegEncoderSettings` を直接割り当てた場合も有効）。各 UI の FFmpeg Path 入力欄は
+  解決状態の表示と個人設定の編集に置き換わり、共有フィールドへは書き込まなくなった。
+- **個人の作業状態を共有 SO から EditorPrefs へ分離。** テイク番号（グローバル・
+  タイムライン別・シーン別）、タイムライン選択（selectedDirectorIndex / Indices /
+  currentTimelineIndexForRecorder）、列幅、デバッグ表示（debugMode / showStatusSection /
+  showDebugSettings / showTimingInFrames）は `MtrUserState`（EditorPrefs、プロジェクト・
+  シーン単位でスコープ）に保存する。録画・選択のたびに共有アセットが変更されて
+  コミットで他人の状態を上書きし合う問題の恒久対策。SO 側の旧フィールドは初回の
+  移行時にだけ読まれ、以後書き込まれない（既存データはそのまま引き継がれる）。
+  タイムラインのレコーダ構成・ロスター・排他ルート上書きは従来どおり共有 SO が正。
+
 ## [4.4.1] - 2026-08-27
 
 ### Fixed
