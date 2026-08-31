@@ -7,6 +7,18 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.4.3] - 2026-08-31
+
+### Fixed
+- **HEVC mp4 now plays in QuickTime / macOS / iOS.** ffmpeg's mp4 muxer stores
+  HEVC with the `hev1` sample-entry tag by default, which Apple's players refuse
+  to play; only `hvc1` is supported there. All HEVC paths (8bit, 10bit,
+  10bit+deband) now pass `-tag:v hvc1`. The encoded stream is bit-identical —
+  only the container fourcc changes (`hev1` → `hvc1`), so the picture, editing
+  compatibility, and concatenation with previously exported files are unaffected.
+  Verified that the tag also survives the `-c:v copy` audio remux step.
+  H.264 / VP9 / ProRes paths are unchanged.
+
 ## [4.4.2] - 2026-08-31
 
 ### Fixed
