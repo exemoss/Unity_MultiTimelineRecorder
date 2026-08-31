@@ -72,6 +72,40 @@ namespace DistributedRecorder.Tests
         }
 
         [Test]
+        public void GetOptions_HevcPaths_ContainHvc1Tag()
+        {
+            // ffmpeg の mp4 muxer は HEVC を既定で hev1 タグで格納するが、Apple 系
+            // (QuickTime / macOS / iOS)は hvc1 しか再生できない(v4.4.3)。
+            // ストリームは同一でサンプルエントリの fourcc だけが変わる
+            foreach (var format in new[]
+                     {
+                         MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc,
+                         MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc10Bit,
+                     })
+            {
+                var settings = new MtrFFmpegEncoderSettings { Format = format };
+                StringAssert.Contains("-tag:v hvc1", settings.GetOptions(),
+                    $"{format} は hvc1 タグが無いと Apple 系プレーヤーで再生できない");
+            }
+
+            var debandSettings = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.HevcNvenc10Bit,
+                Deband = true,
+            };
+            StringAssert.Contains("-tag:v hvc1", debandSettings.GetOptions(),
+                "deband 分岐(HEVC 10bit)にも同様に付与する");
+
+            // H.264 に hvc1 を付けると mp4 muxer がエラーになるため付かないこと
+            var h264 = new MtrFFmpegEncoderSettings
+            {
+                Format = MtrFFmpegEncoderSettings.OutputFormat.H264Nvenc,
+            };
+            StringAssert.DoesNotContain("-tag:v hvc1", h264.GetOptions(),
+                "hvc1 は HEVC 専用タグ");
+        }
+
+        [Test]
         public void GetOptions_AllCodecPaths_ContainFlushPackets()
         {
             // 低ビットレート出力(ほぼ黒い映像等)で mp4/mov がクローズまで 44 バイトの

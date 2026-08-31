@@ -260,6 +260,12 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 : "";
             string encodePixelFormat = Format == OutputFormat.HevcNvenc10Bit ? "p010le" : "yuv420p";
 
+            // -tag:v hvc1(HEVC のみ): ffmpeg の mp4 muxer は HEVC を既定で hev1 タグで
+            // 格納するが、Apple 系(QuickTime / macOS / iOS 標準プレーヤー)は hvc1 しか
+            // 再生できない。ストリーム自体は同一で、サンプルエントリの fourcc だけが変わる
+            // (再エンコードなし。音声結合の -c:v copy remux でもタグは維持される)
+            string hevcTag = isHevc ? " -tag:v hvc1" : "";
+
             // deband(10bit のみ): フィルタが p010le(セミプレーナ)を受けないため、量子化を
             // planar の yuv420p10le で行って deband を挟む。エンコーダへは -pix_fmt p010le の
             // 自動変換(ビットシフトのみ・無損失)で渡るので出力は非 deband 時と同じ 10bit
@@ -268,12 +274,12 @@ namespace Unity.MultiTimelineRecorder.Encoders
             // ことを防ぐ(v4.3.1。上の VP9 分岐のコメント参照。出力バイト列は不変)
             if (Format == OutputFormat.HevcNvenc10Bit && deband)
             {
-                return $"-c:v {codec} -pix_fmt p010le {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
+                return $"-c:v {codec} -pix_fmt p010le {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}{hevcTag}"
                        + GetColorAndScaleArgs("yuv420p10le", DebandFilter)
                        + " -flush_packets 1";
             }
 
-            return $"-c:v {codec} -pix_fmt {encodePixelFormat} {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}"
+            return $"-c:v {codec} -pix_fmt {encodePixelFormat} {rateControl} -preset p7 -tune hq -rc-lookahead 4{profileArg}{hevcTag}"
                    + GetColorAndScaleArgs(encodePixelFormat)
                    + " -flush_packets 1";
         }
