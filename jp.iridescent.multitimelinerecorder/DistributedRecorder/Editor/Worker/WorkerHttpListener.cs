@@ -752,7 +752,7 @@ namespace DistributedRecorder.Worker
         /// <c>git reset --hard origin/&lt;branch&gt;</c> on this Worker's current branch, or —
         /// when the request carries a validated <c>targetBranch</c>
         /// (git-sync-branch-switch, v4.3.0) —
-        /// <c>git checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c> to switch branches.
+        /// <c>git checkout -f -B &lt;branch&gt; origin/&lt;branch&gt;</c> to switch branches.
         ///
         /// Security requirements:
         ///  1. HMAC authentication (same pattern as /cancel, /align-recorder).
@@ -762,11 +762,11 @@ namespace DistributedRecorder.Worker
         ///     git-sync-branch-switch (v4.3.0): a non-empty <c>targetBranch</c> from the
         ///     authenticated request is honored ONLY after passing
         ///     <see cref="GitInfo.IsValidRefName"/> (rejected with 400 otherwise), and can
-        ///     only select the checkout -B operation — no more destructive than the
+        ///     only select the checkout -f -B operation — no more destructive than the
         ///     existing reset --hard.
         ///  4. Branch name is validated by <see cref="GitInfo.IsValidRefName"/>.
         ///  5. Only <c>git fetch</c>, <c>git reset --hard</c>, and
-        ///     <c>git checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c> are executed.
+        ///     <c>git checkout -f -B &lt;branch&gt; origin/&lt;branch&gt;</c> are executed.
         ///     No arbitrary git commands are possible.
         ///  6. All git calls use <see cref="GitInfo"/> (ArgumentList, no shell).
         ///  7. Returns 202 immediately; actual git operations run synchronously on the main
@@ -862,7 +862,7 @@ namespace DistributedRecorder.Worker
                 Debug.Log(
                     $"[WorkerHttpListener] /git-sync: main-thread dispatch requested by {remoteIp}");
 
-                // git-sync-branch-switch (v4.3.0): validated targetBranch → checkout -B path.
+                // git-sync-branch-switch (v4.3.0): validated targetBranch → checkout -f -B path.
                 if (!string.IsNullOrEmpty(capturedTargetBranch))
                 {
                     RunBranchSwitchSync(capturedProjectRoot, capturedTargetBranch);
@@ -951,13 +951,13 @@ namespace DistributedRecorder.Worker
 
         /// <summary>
         /// Branch-switch sync path (git-sync-branch-switch, v4.3.0): fetch the requested
-        /// branch, then <c>git checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c> (which
+        /// branch, then <c>git checkout -f -B &lt;branch&gt; origin/&lt;branch&gt;</c> (which
         /// positions the working tree exactly at the remote ref, so no separate reset is
         /// needed), then Refresh. Mirrors the legacy path's scene close/reopen handling.
         ///
         /// <paramref name="branch"/> has already passed <see cref="GitInfo.IsValidRefName"/>
         /// in HandleGitSync. Unlike the legacy path this works from a detached HEAD too
-        /// (checkout -B recovers it onto a real branch).
+        /// (checkout -f -B recovers it onto a real branch).
         ///
         /// Main-thread only (called from the git-sync MainThreadDispatcher lambda).
         /// </summary>
@@ -996,7 +996,7 @@ namespace DistributedRecorder.Worker
                         out _, out string switchSummary, out string checkoutErr))
                 {
                     Debug.LogError(
-                        $"[WorkerHttpListener] /git-sync: git checkout -B {branch} " +
+                        $"[WorkerHttpListener] /git-sync: git checkout -f -B {branch} " +
                         $"origin/{branch} failed: {checkoutErr}");
                     return;
                 }
@@ -1023,7 +1023,7 @@ namespace DistributedRecorder.Worker
 
         /// <summary>
         /// Relative paths (from the project root) of the files that define the
-        /// project's UPM package set. When a sync (reset --hard or checkout -B)
+        /// project's UPM package set. When a sync (reset --hard or checkout -f -B)
         /// changes either of them, the Worker must run <see cref="Client.Resolve"/> —
         /// otherwise the resolve only happens when the Editor window regains focus.
         /// </summary>

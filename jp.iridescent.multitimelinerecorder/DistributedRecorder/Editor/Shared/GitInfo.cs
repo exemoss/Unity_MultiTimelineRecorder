@@ -20,7 +20,7 @@ namespace DistributedRecorder.Shared
     ///    exception: <see cref="TryCheckoutBranch"/> (and the TryFetch preceding it) may
     ///    receive a branch name originating from an HMAC-authenticated Master request,
     ///    validated by <see cref="IsValidRefName"/> before use. The only reachable
-    ///    operation is <c>checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c> — no more
+    ///    operation is <c>checkout -f -B &lt;branch&gt; origin/&lt;branch&gt;</c> — no more
     ///    destructive than the existing fetch + reset --hard.
     ///  - Branch name is validated by <see cref="IsValidRefName"/> before use.
     ///  - The git binary path is "git" (resolved from PATH); no arbitrary binary is invoked.
@@ -336,10 +336,17 @@ namespace DistributedRecorder.Shared
         // ---------------------------------------------------------------------------
 
         /// <summary>
-        /// Runs <c>git -C &lt;projectRoot&gt; checkout -B &lt;branch&gt; origin/&lt;branch&gt;</c>,
+        /// Runs <c>git -C &lt;projectRoot&gt; checkout -f -B &lt;branch&gt; origin/&lt;branch&gt;</c>,
         /// switching the working tree to <paramref name="branch"/> positioned exactly at the
         /// remote-tracking ref (creates or resets the local branch — a reset --hard is
         /// therefore not needed afterwards).
+        ///
+        /// <c>-f</c> is required for the documented "discards local changes" contract:
+        /// without it, git ABORTS the checkout ("Your local changes ... would be
+        /// overwritten") whenever local modifications conflict with the target branch.
+        /// A Worker's tree is dirty by design after every dispatch (the settings-snapshot
+        /// SOs are overwritten in place), so a conflicting branch switch would otherwise
+        /// always fail, leaving the Worker on the old commit.
         ///
         /// Callers MUST run <see cref="TryFetch"/> for the same branch first so
         /// <c>origin/&lt;branch&gt;</c> exists and is current.
@@ -391,7 +398,7 @@ namespace DistributedRecorder.Shared
             // "origin/<branch>" is assembled in code; <branch> is validated above.
             // checkout writes the whole changed working tree — use the generous ResetTimeout.
             string remoteRef = "origin/" + branch;
-            if (!RunGit(new[] { "-C", projectRoot, "checkout", "-B", branch, remoteRef },
+            if (!RunGit(new[] { "-C", projectRoot, "checkout", "-f", "-B", branch, remoteRef },
                         ResetTimeout, out _, out error))
                 return false;
 
@@ -407,8 +414,8 @@ namespace DistributedRecorder.Shared
             bool hadDirty = !string.IsNullOrEmpty(preStatus);
             string newHeadShort = newHead.Length >= 8 ? newHead.Substring(0, 8) : newHead;
             summary = hadDirty
-                ? $"checkout -B {branch} origin/{branch}: {newHeadShort}… (discarded local changes)"
-                : $"checkout -B {branch} origin/{branch}: {newHeadShort}… (working tree was clean)";
+                ? $"checkout -f -B {branch} origin/{branch}: {newHeadShort}… (discarded local changes)"
+                : $"checkout -f -B {branch} origin/{branch}: {newHeadShort}… (working tree was clean)";
 
             return true;
         }
