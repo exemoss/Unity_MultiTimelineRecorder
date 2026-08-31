@@ -7,6 +7,25 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.4.4] - 2026-08-31
+
+### Fixed
+- **Dispatch no longer fails with "Version check failed: could not resolve the
+  local com.unity.recorder version" after a manifest-changing git-sync.**
+  Root cause (observed 2026-08-31, both Workers of a 3-PC run): /git-sync
+  invalidated the VersionChecker cache and started Client.Resolve(); when the
+  job POST arrived before the next domain reload, HandlePostJob re-resolved
+  the recorder version on the HttpListener thread — where the main-thread-only
+  Client.List can never succeed — so every dispatch failed 409 until an Editor
+  restart. The Master-side DispatchAsync continuation (ThreadPool after
+  ConfigureAwait(false)) had the same exposure. Two-layer fix:
+  Client.List is now only called on the main thread, with a thread-safe
+  fallback that reads the resolved version from Packages/packages-lock.json
+  (then manifest.json, semver-validated); and Events.registeredPackages now
+  triggers InvalidateCache + a main-thread re-warm so the cache is fresh right
+  after any package resolve. EditMode tests cover the lock/manifest parsers
+  and the file-level resolution order (full suite: 1232 passed / 0 failed).
+
 ## [4.4.3] - 2026-08-31
 
 ### Fixed
