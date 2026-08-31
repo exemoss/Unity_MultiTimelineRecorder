@@ -7,6 +7,31 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [Unreleased]
+
+### Fixed
+- **Recordings can no longer silently lose all audio for the rest of the Editor
+  session after one aborted recording (digital-silence bug).**
+  Root cause (observed 2026-08-31/09-01, distributed-render Workers producing
+  mean_volume −91 dB outputs with intact AAC streams): Unity Recorder's
+  `AudioRendererWrapper` is a `ScriptableSingleton` whose `s_StartCount`
+  survives domain reloads, and `RecordingSession.BeginRecording` /
+  input-EndRecording failure paths can leave the count unbalanced without ever
+  calling `AudioInput.EndRecording`. Once leaked, `AudioRenderer.Start()` is
+  never called again for the whole Editor session, so every subsequent
+  recording captures pure zero samples until the Editor is restarted.
+  `AudioRendererLeakGuard` now detects and repairs a leaked count (with a
+  warning) at the start of every render pass, before Play Mode is entered.
+
+### Added
+- **Silent-audio detection (`AudioSilenceSentinel`).** `MtrFFmpegEncoder` now
+  tracks the absolute peak of all audio samples pushed to the audio pipe and
+  reports it per output at the end of the pass (SessionState-backed). A
+  recording whose captured audio is exactly all-zero (≥ 0.5 s of samples)
+  logs a clear error naming the output file and the suspected leak, and batch
+  tools can query `AudioSilenceSentinel.GetLastPassResults()` to fail such
+  jobs instead of delivering silent files.
+
 ## [4.4.4] - 2026-08-31
 
 ### Fixed

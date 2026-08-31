@@ -3720,7 +3720,13 @@ namespace Unity.MultiTimelineRecorder
             MultiTimelineRecorderLogger.LogVerbose("[MultiTimelineRecorder] RenderTimelineCoroutine started");
             MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Selected directors count: {recordingQueueDirectors.Count}");
             MultiTimelineRecorderLogger.LogVerbose($"[MultiTimelineRecorder] Selected index: {selectedDirectorIndex}");
-            
+
+            // 録画セッションがまだ無いこの時点で、AudioRenderer の参照カウントリークを
+            // 修復する（リークが残っていると、このパス以降の録画音声がすべて無音になる。
+            // 詳細は AudioRendererLeakGuard 参照）。あわせて無音検出の前パス記録を消す
+            Utilities.AudioRendererLeakGuard.EnsureCleanState("RenderTimelineCoroutine");
+            Utilities.AudioSilenceSentinel.BeginPass();
+
             currentState = RecordState.Preparing;
             statusMessage = "Preparing...";
             renderProgress = 0f;

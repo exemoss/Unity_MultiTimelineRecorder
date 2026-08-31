@@ -34,10 +34,18 @@ namespace Unity.MultiTimelineRecorder.Encoders
         int _videoFramesToSkip;
         long _audioFloatsToSkip; // interleaved float 数（サンプル数 x チャンネル数）
 
+        // 無音検出（AudioSilenceSentinel）: 音声パイプへ実際に流したサンプルの絶対値ピークと
+        // 総数。全サンプルが厳密に 0.0 なら AudioRenderer が起動していない疑い
+        //（AudioRendererLeakGuard のリーク症状）で、録画終了時に報告する。
+        float _audioAbsPeak;
+        long _audioSamplesPushed;
+
         public void OpenStream(IEncoderSettings settings, RecordingContext ctx)
         {
             var ffmpegSettings = settings as MtrFFmpegEncoderSettings;
             _hasAudio = ctx.doCaptureAudio;
+            _audioAbsPeak = 0f;
+            _audioSamplesPushed = 0;
 
             // 頭落とし量を確定する。音声は映像と同じ実時間分を float 数へ換算して捨てる
             // （音声パイプは常にステレオ -ac 2 のため x2）。ブロック境界とは無関係に
@@ -156,6 +164,10 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
             if (_hasAudio)
             {
+                // 無音検出の報告（remux の成否と無関係に、キャプチャ段階の実サンプルで判定する）
+                Unity.MultiTimelineRecorder.Utilities.AudioSilenceSentinel.Report(
+                    _rawVideoFilename, _audioSamplesPushed, _audioAbsPeak);
+
                 // Begin remux
                 PostProcessAudioRemuxing(_rawVideoFilename, _rawAudioFilename);
             }
@@ -204,6 +216,17 @@ namespace Unity.MultiTimelineRecorder.Encoders
                     (int)_audioFloatsToSkip, interleavedSamples.Length - (int)_audioFloatsToSkip);
                 _audioFloatsToSkip = 0;
             }
+
+            // 無音検出用のピーク追跡（エンコード処理に比べ十分軽い線形走査）
+            for (var i = 0; i < interleavedSamples.Length; i++)
+            {
+                var abs = Math.Abs(interleavedSamples[i]);
+                if (abs > _audioAbsPeak)
+                {
+                    _audioAbsPeak = abs;
+                }
+            }
+            _audioSamplesPushed += interleavedSamples.Length;
 
             _ffmpegAudioPipe.PushFrameData(interleavedSamples);
             _ffmpegAudioPipe.SyncFrameData();
