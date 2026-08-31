@@ -7,6 +7,27 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.4.2] - 2026-08-31
+
+### Fixed
+- **git-sync branch switch no longer aborts when the Worker's tree is dirty.**
+  `GitInfo.TryCheckoutBranch` (git-sync-branch-switch, v4.3.0) ran
+  `checkout -B <branch> origin/<branch>` without `-f`. The documented contract —
+  and the Master-side UI wording — promise that the Worker's local changes are
+  discarded (same destructive class as `reset --hard`), but a non-forced
+  checkout ABORTS with "Your local changes ... would be overwritten by
+  checkout" whenever local modifications conflict with the target branch.
+  A Worker's tree is dirty by design after every dispatch (the settings-snapshot
+  SOs are overwritten in place), so switching to a branch that changes those
+  files always failed: the Master saw only "sync started" while the Worker
+  silently stayed on the old commit. The command is now
+  `checkout -f -B <branch> origin/<branch>`, which discards conflicting local
+  changes and clobbers conflicting untracked files — the behavior the docs
+  always claimed. New real-git integration tests
+  (`GitSyncBranchSwitchCheckoutTests`, local throw-away repos, no network)
+  cover the dirty-tracked-file conflict, the untracked-file conflict, and the
+  clean switch; the two conflict cases fail against the pre-fix code.
+
 ## [4.4.1] - 2026-08-27
 
 ### Fixed
