@@ -54,15 +54,19 @@ namespace Unity.MultiTimelineRecorder.Utilities
             }
 
             field.SetValue(wrapper, 0);
-            try
+            if (count > 0)
             {
-                // ネイティブ側が起動しっぱなしのリークだった場合に停止へ揃える
-                // （未起動なら false を返すだけで無害）
-                AudioRenderer.Stop();
-            }
-            catch (Exception)
-            {
-                // ネイティブ状態と無関係にカウントの修復だけで目的は果たせている
+                try
+                {
+                    // Start 過多（ネイティブ側が起動しっぱなし）のリークは停止へ揃える。
+                    // Stop 過多（負のカウント）はネイティブが既に止まっているので呼ばない
+                    // （未録音中の Stop は Unity がエラーログを出す）
+                    AudioRenderer.Stop();
+                }
+                catch (Exception)
+                {
+                    // ネイティブ状態と無関係にカウントの修復だけで目的は果たせている
+                }
             }
 
             Debug.LogWarning(

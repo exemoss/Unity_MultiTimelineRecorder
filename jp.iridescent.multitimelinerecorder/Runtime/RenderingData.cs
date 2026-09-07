@@ -75,6 +75,14 @@ namespace Unity.MultiTimelineRecorder
         public int encoderStallCheckIntervalSec = 2;
         public int encoderStallTimeoutSec = 120;
 
+        /// <summary>
+        /// レンダー Timeline 上で RecorderClip が終わる時刻（秒）。0 = 不明。
+        /// 停滞ガードはこの時刻を過ぎたら監視をやめる（エンコーダは閉じられ、出力ファイルが
+        /// 成長しないのが正常な区間。範囲録画では再生窓がクリップより長く続き得る）。
+        /// 不明なときは進捗 99% で代用する。
+        /// </summary>
+        public double recordingEndTime = 0;
+
         [Header("Runtime Status")]
         public PlayableDirector renderingDirector;
         public float progress = 0f;

@@ -41,6 +41,9 @@ namespace Unity.MultiTimelineRecorder.Tests
         public void EnsureCleanState_PositiveLeak_ResetsAndWarns()
         {
             Assert.IsTrue(AudioRendererLeakGuard.SetStartCountForTest(2));
+            // 正のリークではネイティブ側も停止させる。テストでは AudioRenderer が起動していない
+            // ため、Unity が「未録音中の Stop」をエラーとして出す（実リーク時は起動中なので出ない）
+            LogAssert.Expect(LogType.Error, new Regex(@"AudioRender\.Stop\(\) called while system was not recording"));
             LogAssert.Expect(LogType.Warning,
                 new Regex("AudioRenderer の参照カウントリークを検出し修復しました"));
             Assert.IsTrue(AudioRendererLeakGuard.EnsureCleanState("test"));
@@ -50,7 +53,8 @@ namespace Unity.MultiTimelineRecorder.Tests
         [Test]
         public void EnsureCleanState_NegativeLeak_ResetsAndWarns()
         {
-            // Stop 過多（Begin されずに End された）方向のリークも修復対象
+            // Stop 過多（Begin されずに End された）方向のリークも修復対象。
+            // ネイティブ側は起動していない（Stop 過多）ので AudioRenderer.Stop() は呼ばれない
             Assert.IsTrue(AudioRendererLeakGuard.SetStartCountForTest(-1));
             LogAssert.Expect(LogType.Warning,
                 new Regex("AudioRenderer の参照カウントリークを検出し修復しました"));

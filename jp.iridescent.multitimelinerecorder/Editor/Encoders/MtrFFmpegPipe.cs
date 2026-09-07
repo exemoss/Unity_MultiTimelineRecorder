@@ -102,6 +102,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
             // メモリ増大と後続の SyncFrameData 待ちを避けるためにここで捨てる。
             if (_terminate)
             {
+                DroppedPushCount++;
                 LogTerminationOnce();
                 return;
             }
@@ -117,6 +118,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
         {
             if (_terminate)
             {
+                DroppedPushCount++;
                 LogTerminationOnce();
                 return;
             }
@@ -215,6 +217,14 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
         internal string CloseAndGetOutput()
         {
+            // 終了処理の各段階の所要時間を計る。ffmpeg が出力先（共有ドライブ等）への書き込みで
+            // 詰まっていると、ここが数分単位でメインスレッドを止める（2026-09-06 分散 Worker で
+            // 音声パイプの終了に 3 分かかり、その間 Update が止まって停滞ガードが誤発動した実例）。
+            // 「どの段階で・どれだけ待ったか」を Console に残さないと、Worker 側の Editor.log を
+            // 取りに行けない分散実行では原因に辿り着けない
+            var total = Stopwatch.StartNew();
+            var stage = Stopwatch.StartNew();
+
             // Terminate the subthreads.
             _cancellationToken.Cancel();
             _terminate = true;
@@ -223,10 +233,37 @@ namespace Unity.MultiTimelineRecorder.Encoders
             _pipePing.Set();
 
             _copyThread.Join();
-            _pipeThread.Join();
+            var copyJoinMs = stage.ElapsedMilliseconds;
+
+            // PipeThread は ffmpeg の stdin へ同期書き込みしているため、ffmpeg が stdin を
+            // 読まなくなっている（出力先の書き込みで詰まっている等）と Write から戻らず、
+            // 無期限の Join はメインスレッドごと固まる。有限で待ち、超えたら stdin を閉じる →
+            // それでも戻らなければ ffmpeg を強制終了して書き込みを失敗させ、スレッドを回収する
+            stage.Restart();
+            var pipeJoined = _pipeThread.Join(_pipeJoinTimeoutMs);
+            if (!pipeJoined)
+            {
+                Debug.LogWarning(
+                    $"[MtrFFmpegPipe:{_name}] ffmpeg への書き込みスレッドが {_pipeJoinTimeoutMs / 1000} 秒以内に" +
+                    $"終了しませんでした（ffmpeg が stdin を消費していません。exited={HasSubprocessExited()}）。" +
+                    "stdin を閉じて打ち切ります。出力先（共有ドライブ）の書き込み停滞の疑いがあります。");
+                TryCloseStandardInput();
+                pipeJoined = _pipeThread.Join(_pipeJoinRetryTimeoutMs);
+            }
+
+            if (!pipeJoined)
+            {
+                Debug.LogError(
+                    $"[MtrFFmpegPipe:{_name}] stdin を閉じても書き込みスレッドが戻らないため ffmpeg を強制終了します。" +
+                    "この出力は未完成（コンテナ終端処理なし）になります。");
+                TryKillSubprocess();
+                _pipeThread.Join(_pipeJoinRetryTimeoutMs);
+            }
+            var pipeJoinMs = stage.ElapsedMilliseconds;
 
             // Close FFmpeg subprocess.
-            _subprocess.StandardInput.Close();
+            stage.Restart();
+            TryCloseStandardInput();
 
             // ffmpeg は stdin の EOF を受けてからコンテナの終端処理（Matroska の cues 書き出し等）
             // を行う。この所要時間は出力サイズに比例し、フレーム投入用の _timeoutValue(0.5 秒)
@@ -236,12 +273,24 @@ namespace Unity.MultiTimelineRecorder.Encoders
             // (MtrFFmpegEncoder.PostProcessAudioRemuxing) が「ロックされている」と判断して諦め、
             // 映像だけのファイルと音声だけの中間ファイルが残る（= 納品物に音が入らない）。
             // 終端処理は進捗を観測できないため、パイプ用の短いタイムアウトとは分けて、
-            // 実用上の上限としての長い専用値で待つ。
+            // 実用上の上限としての長い専用値で待つ。超えたら掴んだままにせず強制終了する
             if (!_subprocess.WaitForExit(_exitTimeoutValue))
             {
                 Debug.LogWarning(
-                    $"ffmpeg が {_exitTimeoutValue / 1000} 秒以内に終了しませんでした。" +
-                    "出力ファイルが未完成、または音声の多重化に失敗する可能性があります。");
+                    $"[MtrFFmpegPipe:{_name}] ffmpeg が {_exitTimeoutValue / 1000} 秒以内に終了しませんでした。" +
+                    "出力ファイルが未完成、または音声の多重化に失敗する可能性があります。強制終了します。");
+                TryKillSubprocess();
+                _subprocess.WaitForExit(_pipeJoinRetryTimeoutMs);
+            }
+            var exitMs = stage.ElapsedMilliseconds;
+
+            if (total.ElapsedMilliseconds >= _closeReportThresholdMs)
+            {
+                Debug.LogWarning(
+                    $"[MtrFFmpegPipe:{_name}] 終了処理に {total.ElapsedMilliseconds / 1000.0:F1} 秒かかりました" +
+                    $"（コピースレッド回収 {copyJoinMs}ms / 書き込みスレッド回収 {pipeJoinMs}ms / ffmpeg 終了待ち {exitMs}ms" +
+                    $" / 停止後に破棄したフレーム {DroppedPushCount} / 停止理由: {TerminationReason ?? "なし"}）。" +
+                    "ffmpeg が出力先（共有ドライブ等）への書き込みで詰まっていた可能性があります。");
             }
 
             _subprocess.Close();
@@ -258,6 +307,60 @@ namespace Unity.MultiTimelineRecorder.Encoders
             _pipeQueue = _freeBuffer = null;
 
             return "";
+        }
+
+        /// <summary>
+        /// パイプが録画中に停止（_terminate）した後に捨てたフレーム数。
+        /// 音声パイプなら「音声がどこから欠けたか」の直接の証拠になる。
+        /// </summary>
+        internal long DroppedPushCount { get; private set; }
+
+        /// <summary>録画中にパイプが停止したか（以降の PushFrameData は捨てられる）。</summary>
+        internal bool IsTerminated => _terminate;
+
+        /// <summary>
+        /// 録画中にパイプが停止した理由（正常終了なら null）。エンコーダ側の音声欠落診断で
+        /// 「ffmpeg が死んだ」「消費が追いつかず打ち切った」を区別するために持つ。
+        /// </summary>
+        internal string TerminationReason { get; private set; }
+
+        bool HasSubprocessExited()
+        {
+            try
+            {
+                return _subprocess == null || _subprocess.HasExited;
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+        }
+
+        void TryCloseStandardInput()
+        {
+            try
+            {
+                _subprocess.StandardInput.Close();
+            }
+            catch (Exception)
+            {
+                // 既に閉じている / ffmpeg 側が先に落ちている場合は何もしない
+            }
+        }
+
+        void TryKillSubprocess()
+        {
+            try
+            {
+                if (!_subprocess.HasExited)
+                {
+                    _subprocess.Kill();
+                }
+            }
+            catch (Exception)
+            {
+                // 終了間際の競合は無視（回収は呼び出し側の Join / WaitForExit が行う）
+            }
         }
 
         #endregion
@@ -307,6 +410,13 @@ namespace Unity.MultiTimelineRecorder.Encoders
         // ping/pong 用で、コンテナ終端処理の待ちには短すぎるため分離している
         // （通常は待たずに返るので、実質「異常時の最終安全弁」）
         int _exitTimeoutValue = 600000; // 10 min
+        // 終了処理で PipeThread（ffmpeg への書き込み）の回収を待つ上限。ffmpeg が stdin を
+        // 読まなくなっている場合の無期限ハング防止（超えたら stdin を閉じ、さらに ffmpeg を
+        // 強制終了して回収する）。健全な終了では数百 ms で戻る
+        int _pipeJoinTimeoutMs = 60000; // 60 sec
+        int _pipeJoinRetryTimeoutMs = 10000; // 10 sec
+        // 終了処理の所要時間がこれを超えたら内訳を Console に残す（分散 Worker の事後診断用）
+        int _closeReportThresholdMs = 5000; // 5 sec
         // SyncFrameData() 1回あたりの累計待ち時間の上限（ffmpegが生きたまま異常に遅い/
         // 詰まっているケースの恒久ハング防止。mtr-nvenc-encoder イテレーション3で追加）。
         int _syncStallTimeoutMs = 60000; // 60 sec
@@ -327,6 +437,10 @@ namespace Unity.MultiTimelineRecorder.Encoders
         {
             if (_terminationLogged) return;
             _terminationLogged = true;
+            if (TerminationReason == null)
+            {
+                TerminationReason = "ffmpeg プロセスの停止（書き込み失敗）";
+            }
             Debug.LogError(
                 $"[MtrFFmpegPipe:{_name}] ffmpeg プロセスが停止したため、これ以降のフレームは破棄されます。" +
                 "ffmpegPath の指定・NVENC 対応 GPU ドライバ・ディスク空き容量を確認してください。");
@@ -338,6 +452,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
         void LogSyncStallTimeoutAndTerminate(string queueDetail)
         {
             _terminate = true;
+            TerminationReason = $"消費停滞の打ち切り（{_syncStallTimeoutMs / 1000} 秒、{queueDetail}、exited={HasSubprocessExited()}）";
             Debug.LogError(
                 $"[MtrFFmpegPipe:{_name}] キューのドレイン待ちが{_syncStallTimeoutMs / 1000}秒を超えました" +
                 $"（{queueDetail}）。ffmpeg プロセスは生存していますが、消費が構造的に追いついていない" +
