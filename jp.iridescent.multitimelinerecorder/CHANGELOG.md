@@ -7,6 +7,18 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.4.6] - 2026-09-07
+
+### Fixed
+- **Workers no longer report an empty `mtrVersion` (and get excluded from
+  dispatch) after a git-sync that changes `manifest.json` / `packages-lock.json`
+  without changing the installed package set.** `/git-sync` invalidated the
+  version cache before `Client.Resolve()`, relying on `Events.registeredPackages`
+  to re-warm it — but that event does not fire when nothing is re-registered
+  (observed 2026-09-07 after a lock-file-only commit: both Workers answered
+  `mtrVersion: ""` until their next domain reload). The handler now re-warms
+  the cache on the main thread right after invalidating it.
+
 ## [4.4.5] - 2026-09-07
 
 ### Fixed
