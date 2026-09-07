@@ -1101,6 +1101,20 @@ namespace DistributedRecorder.Worker
                 "packages-lock.json changed by the sync — calling Client.Resolve() " +
                 "to update packages. Domain reload may follow.");
             VersionChecker.InvalidateCache();
+
+            // Re-warm immediately on this (main) thread. Events.registeredPackages
+            // only fires when the resolve actually changes the registered package
+            // set; a sync that touches manifest.json / packages-lock.json without
+            // changing what is installed (e.g. a lock-file-only commit, observed
+            // 2026-09-07) leaves the cache empty, and the next reader is /health on
+            // the listener thread, where PackageInfo.FindForAssembly cannot resolve.
+            // The Worker then reports mtrVersion "" until its next domain reload and
+            // the Master excludes it from dispatch. The values read here are those of
+            // the currently loaded packages; if the resolve does change them,
+            // registeredPackages re-warms again afterwards.
+            _ = VersionChecker.RecorderVersion;
+            _ = VersionChecker.MtrPackageVersion;
+
             Client.Resolve();
         }
 
