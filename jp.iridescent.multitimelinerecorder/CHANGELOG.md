@@ -7,7 +7,7 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
-## [Unreleased]
+## [4.4.5] - 2026-09-07
 
 ### Fixed
 - **Recordings can no longer silently lose all audio for the rest of the Editor
@@ -32,9 +32,6 @@ unchanged, PATCH for fixes.
   tools can query `AudioSilenceSentinel.GetLastPassResults()` to fail such
   jobs instead of delivering silent files.
 
-## [Unreleased]
-
-### Fixed
 - **Audio that stops part-way through a recording no longer goes unexplained,
   and the encoder close can no longer hang the Editor.** Observed 2026-09-06 on
   a distributed Worker (S13, two passes in a row): the video reached all 17275
