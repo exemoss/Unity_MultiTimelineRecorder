@@ -7,6 +7,65 @@ Version numbers follow the rules in [VERSIONING.md](../VERSIONING.md): MAJOR whe
 existing settings produce different output, MINOR for features that leave output
 unchanged, PATCH for fixes.
 
+## [4.4.5] - 2026-09-07
+
+### Fixed
+- **Recordings can no longer silently lose all audio for the rest of the Editor
+  session after one aborted recording (digital-silence bug).**
+  Root cause (observed 2026-08-31/09-01, distributed-render Workers producing
+  mean_volume −91 dB outputs with intact AAC streams): Unity Recorder's
+  `AudioRendererWrapper` is a `ScriptableSingleton` whose `s_StartCount`
+  survives domain reloads, and `RecordingSession.BeginRecording` /
+  input-EndRecording failure paths can leave the count unbalanced without ever
+  calling `AudioInput.EndRecording`. Once leaked, `AudioRenderer.Start()` is
+  never called again for the whole Editor session, so every subsequent
+  recording captures pure zero samples until the Editor is restarted.
+  `AudioRendererLeakGuard` now detects and repairs a leaked count (with a
+  warning) at the start of every render pass, before Play Mode is entered.
+
+- **Audio that stops part-way through a recording (full-length video, AAC
+  that ends after ~80 s) is fixed at its root, and the encoder close can no
+  longer hang the Editor.** Root cause, reproduced 2026-09-07 on two Workers
+  with a 2.4 GB output on an SMB share: the audio remux was only waited for
+  10 s and ran on as an orphan after the pass was reported complete; the batch
+  tool inspected the half-written mp4, judged it unreadable and retook the
+  same pass; the retake's `ffmpeg -y` truncated the `.mkv` the remux was still
+  reading and wrote into the same mp4, and the stall guard then aborted the
+  retake after ~2.5 min (≈ 80 s of content). Changes:
+  - `MtrFFmpegPipe.CloseAndGetOutput` now bounds the writer-thread join
+    (60 s → close stdin → 10 s → kill ffmpeg), kills ffmpeg if it does not
+    exit within the exit timeout, and logs a per-stage breakdown (copy join /
+    pipe join / ffmpeg exit / frames dropped after termination / termination
+    reason) whenever closing takes more than 5 s.
+  - `MtrFFmpegEncoder` counts video frames, audio frames, empty (0-sample)
+    audio frames and frames dropped after a pipe termination, and logs an
+    error at close when the audio is shorter than the video, naming the
+    likely side (Unity AudioRenderer produced no samples vs. the ffmpeg audio
+    pipe stopped) — `AudioCoverageCheck`, covered by EditMode tests.
+  - The audio remux now waits for ffmpeg to finish (up to 20 min) instead of
+    10 s, reports a non-zero exit code with ffmpeg's stderr, only deletes the
+    `.tmp` / `.mkv` intermediates after a successful remux, and removes a stale
+    `.tmp` left by an interrupted attempt instead of throwing from
+    `File.Move`. This closes the root cause above: the pass is only reported
+    complete once the final mp4 exists.
+  - `AudioRendererLeakGuard` no longer calls `AudioRenderer.Stop()` for a
+    negative (Stop-heavy) count, which only produced Unity's "called while
+    system was not recording" error.
+  - `PlayModeTimelineRenderer`'s Encoder Output Stall Guard stops checking
+    once the render timeline has reached its end (the encoder is closed and
+    the file legitimately stops growing during the completion grace period),
+    and does not count intervals in which the main thread was blocked
+    (≥ 30 s between checks) as encoder stall time.
+
+### Added
+- **Silent-audio detection (`AudioSilenceSentinel`).** `MtrFFmpegEncoder` now
+  tracks the absolute peak of all audio samples pushed to the audio pipe and
+  reports it per output at the end of the pass (SessionState-backed). A
+  recording whose captured audio is exactly all-zero (≥ 0.5 s of samples)
+  logs a clear error naming the output file and the suspected leak, and batch
+  tools can query `AudioSilenceSentinel.GetLastPassResults()` to fail such
+  jobs instead of delivering silent files.
+
 ## [4.4.4] - 2026-08-31
 
 ### Fixed

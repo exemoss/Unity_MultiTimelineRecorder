@@ -640,6 +640,8 @@ namespace Unity.MultiTimelineRecorder
             renderingData.renderTimeline = savedTimeline;
             renderingData.duration       = (float)timelineDuration;
             renderingData.frameRate      = (int)System.Math.Round(frameRate);
+            // RecorderClip の終端（音ズレ対策の前倒し反映後）。停滞ガードの監視終了時刻
+            renderingData.recordingEndTime = timelineClip.start + timelineClip.duration;
 
             var rendererGO = new UnityEngine.GameObject("[PlayModeTimelineRenderer]");
             rendererGO.AddComponent<Unity.MultiTimelineRecorder.PlayModeTimelineRenderer>();

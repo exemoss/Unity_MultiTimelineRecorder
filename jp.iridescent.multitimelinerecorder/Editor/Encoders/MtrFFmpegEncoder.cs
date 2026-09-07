@@ -8,10 +8,12 @@ using System;
 using System.IO;
 using System.Collections.Generic;
 using System.Linq;
+using System.Diagnostics;
 using Unity.Collections;
 using UnityEditor.Media;
 using UnityEditor.Recorder.Encoder;
 using UnityEngine;
+using Debug = UnityEngine.Debug;
 
 namespace Unity.MultiTimelineRecorder.Encoders
 {
@@ -34,10 +36,35 @@ namespace Unity.MultiTimelineRecorder.Encoders
         int _videoFramesToSkip;
         long _audioFloatsToSkip; // interleaved float 数（サンプル数 x チャンネル数）
 
+        // 無音検出（AudioSilenceSentinel）: 音声パイプへ実際に流したサンプルの絶対値ピークと
+        // 総数。全サンプルが厳密に 0.0 なら AudioRenderer が起動していない疑い
+        //（AudioRendererLeakGuard のリーク症状）で、録画終了時に報告する。
+        float _audioAbsPeak;
+        long _audioSamplesPushed;
+
+        // 音声欠落診断（AudioCoverageCheck）: 映像・音声それぞれ実際にパイプへ流した量と、
+        // 音声が空（0 サンプル）だった回数、最後に音声が届いた時点の映像フレーム番号。
+        // 「音声だけが途中で途切れた」出力（2026-09-06 分散 Worker の S13）が、Unity 側の
+        // AudioRenderer が止まったのか、ffmpeg の音声パイプが止まったのかを録画終了時に切り分ける
+        int _videoFramesPushed;
+        long _audioFramesPushed;
+        long _audioEmptyFrames;
+        int _videoFrameAtLastAudio;
+        double _fps;
+        int _audioSampleRate;
+
         public void OpenStream(IEncoderSettings settings, RecordingContext ctx)
         {
             var ffmpegSettings = settings as MtrFFmpegEncoderSettings;
             _hasAudio = ctx.doCaptureAudio;
+            _audioAbsPeak = 0f;
+            _audioSamplesPushed = 0;
+            _videoFramesPushed = 0;
+            _audioFramesPushed = 0;
+            _audioEmptyFrames = 0;
+            _videoFrameAtLastAudio = 0;
+            _fps = DoubleFromRational(ctx.fps);
+            _audioSampleRate = AudioSettings.outputSampleRate;
 
             // 頭落とし量を確定する。音声は映像と同じ実時間分を float 数へ換算して捨てる
             // （音声パイプは常にステレオ -ac 2 のため x2）。ブロック境界とは無関係に
@@ -138,6 +165,8 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 _ffmpegVideoPipe = null;
             }
 
+            long audioDropped = 0;
+            string audioTermination = null;
             if (_ffmpegAudioPipe != null)
             {
                 var error = _ffmpegAudioPipe.CloseAndGetOutput();
@@ -150,12 +179,29 @@ namespace Unity.MultiTimelineRecorder.Encoders
                     );
                 }
 
+                audioDropped = _ffmpegAudioPipe.DroppedPushCount;
+                audioTermination = _ffmpegAudioPipe.TerminationReason;
                 _ffmpegAudioPipe.Dispose();
                 _ffmpegAudioPipe = null;
             }
 
             if (_hasAudio)
             {
+                // 無音検出の報告（remux の成否と無関係に、キャプチャ段階の実サンプルで判定する）
+                Unity.MultiTimelineRecorder.Utilities.AudioSilenceSentinel.Report(
+                    _rawVideoFilename, _audioSamplesPushed, _audioAbsPeak);
+
+                // 音声欠落診断: 映像より音声が短く終わっていれば、内訳（空フレーム / パイプ停止後の
+                // 破棄）つきでエラーに残す。remux 前に出すことで、多重化の成否と独立に判定できる
+                var coverage = Unity.MultiTimelineRecorder.Utilities.AudioCoverageCheck.Describe(
+                    _videoFramesPushed, _fps, _audioSamplesPushed, 2, _audioSampleRate,
+                    _audioFramesPushed, _audioEmptyFrames, _videoFrameAtLastAudio,
+                    audioDropped, audioTermination);
+                if (coverage != null)
+                {
+                    Debug.LogError($"[MtrFFmpegEncoder] {coverage}: {_rawVideoFilename}");
+                }
+
                 // Begin remux
                 PostProcessAudioRemuxing(_rawVideoFilename, _rawAudioFilename);
             }
@@ -178,6 +224,7 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 return;
             }
 
+            _videoFramesPushed++;
             _ffmpegVideoPipe.PushFrameData(bytes);
             _ffmpegVideoPipe.SyncFrameData();
         }
@@ -203,6 +250,34 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 interleavedSamples = interleavedSamples.GetSubArray(
                     (int)_audioFloatsToSkip, interleavedSamples.Length - (int)_audioFloatsToSkip);
                 _audioFloatsToSkip = 0;
+            }
+
+            _audioFramesPushed++;
+
+            // パイプが録画中に停止していれば以降は捨てられる（パイプ側が破棄数を数える）。
+            // 実際に流れた分だけを無音・欠落の統計に載せる
+            if (!_ffmpegAudioPipe.IsTerminated)
+            {
+                // 無音検出用のピーク追跡（エンコード処理に比べ十分軽い線形走査）
+                for (var i = 0; i < interleavedSamples.Length; i++)
+                {
+                    var abs = Math.Abs(interleavedSamples[i]);
+                    if (abs > _audioAbsPeak)
+                    {
+                        _audioAbsPeak = abs;
+                    }
+                }
+                _audioSamplesPushed += interleavedSamples.Length;
+                if (interleavedSamples.Length == 0)
+                {
+                    // AudioRenderer.GetSampleCountForCaptureFrame() が 0 = Unity 側が音声を
+                    // 生成していない（AudioRenderer 停止・オーディオデバイス喪失等）
+                    _audioEmptyFrames++;
+                }
+                else
+                {
+                    _videoFrameAtLastAudio = _videoFramesPushed;
+                }
             }
 
             _ffmpegAudioPipe.PushFrameData(interleavedSamples);
@@ -240,6 +315,25 @@ namespace Unity.MultiTimelineRecorder.Encoders
                 return;
             }
 
+            // 前回の多重化が中断されたときの映像退避（.tmp）が残っていると File.Move が
+            // 例外になり、今回の音声が結合されないまま終わる（2026-09-07 実測: 録り直しの
+            // 終了処理で "既に存在するファイルを作成することはできません"）。いま閉じた mp4 が
+            // 正なので、残骸は消してから退避する
+            if (File.Exists(backupFileName))
+            {
+                Debug.LogWarning(
+                    $"前回の多重化の残骸 {backupFileName} が残っていたため削除して続行します（今回の録画が正）。");
+                Cleanup(backupFileName);
+                if (File.Exists(backupFileName))
+                {
+                    Debug.LogError(
+                        $"{backupFileName} を削除できないため音声を多重化できません。" +
+                        $"音声は {audioFileName} に分離保存されています。次のコマンドで再エンコードなしに結合できます:" +
+                        $" ffmpeg -i \"{videoFileName}\" -i \"{audioFileName}\" -c copy -map 0:v:0 -map 1:a:0 出力先");
+                    return;
+                }
+            }
+
             File.Move(videoFileName, backupFileName);
 
             var process = MtrFFmpegPipe.LaunchFFMPEG(
@@ -269,14 +363,71 @@ namespace Unity.MultiTimelineRecorder.Encoders
 
             // Close FFmpeg subprocess.
             process.StandardInput.Close();
-            process.WaitForExit(10000);
+
+            // remux（-c copy）は出力サイズに比例して時間がかかる（共有ドライブ上の 2.4GB で分単位）。
+            // 以前は 10 秒だけ待って抜けていたため、ffmpeg が孤児プロセスとして書き続ける間に
+            // (a) .tmp/.mkv の削除が共有違反で失敗して残骸になる、(b) 呼び出し側（バッチ）が
+            // 未完成の mp4 を検査・納品扱いする、(c) 同一パスの録り直しが読み込み中の .tmp を
+            // 消す、という事故が起きた。完了までメインスレッドで待つ（元から同期処理の延長）。
+            // 上限を超えたら掴んだままにせず強制終了し、音声が .mkv に残っていることを案内する
+            var remuxWatch = Stopwatch.StartNew();
+            var remuxExited = process.WaitForExit(RemuxExitTimeoutMs);
+            if (!remuxExited)
+            {
+                Debug.LogError(
+                    $"音声の多重化（remux）が {RemuxExitTimeoutMs / 60000} 分以内に終わらないため強制終了します: {videoFileName}。" +
+                    $"映像は {backupFileName}、音声は {audioFileName} に残っています。次のコマンドで結合できます:" +
+                    $" ffmpeg -i \"{backupFileName}\" -i \"{audioFileName}\" -c copy -map 0:v:0 -map 1:a:0 出力先");
+                try
+                {
+                    process.Kill();
+                }
+                catch (Exception)
+                {
+                    // 終了間際の競合は無視
+                }
+            }
+
+            // 非同期 stderr の取りこぼし防止（WaitForExit(ms) はストリーム完了を待たない）
+            process.WaitForExit();
+            var remuxExitCode = -1;
+            try
+            {
+                remuxExitCode = process.ExitCode;
+            }
+            catch (Exception)
+            {
+                // Kill 直後などで取得できない場合はそのまま
+            }
+
+            if (remuxExited && remuxExitCode != 0)
+            {
+                Debug.LogError(
+                    $"音声の多重化（remux）が失敗しました（exit code {remuxExitCode}）: {videoFileName}\n" +
+                    string.Join("\n", processLog.Where(line => !string.IsNullOrEmpty(line))) +
+                    $"\n映像は {backupFileName}、音声は {audioFileName} に残っています。");
+            }
+            else if (remuxWatch.ElapsedMilliseconds >= RemuxReportThresholdMs)
+            {
+                Debug.Log(
+                    $"[MtrFFmpegEncoder] 音声の多重化に {remuxWatch.ElapsedMilliseconds / 1000.0:F1} 秒かかりました" +
+                    $"（大きな出力・共有ドライブでは正常）: {videoFileName}");
+            }
 
             process.Close();
             process.Dispose();
 
-            Cleanup(backupFileName);
-            Cleanup(audioFileName);
+            // remux が失敗・打ち切りのときは素材（映像 .tmp / 音声 .mkv）を消さずに残す
+            if (remuxExited && remuxExitCode == 0)
+            {
+                Cleanup(backupFileName);
+                Cleanup(audioFileName);
+            }
         }
+
+        // remux の完了待ち上限と、所要時間を Console に残すしきい値
+        const int RemuxExitTimeoutMs = 1200000; // 20 min
+        const int RemuxReportThresholdMs = 10000; // 10 sec
 
         static void Cleanup(string path)
         {

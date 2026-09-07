@@ -72,6 +72,9 @@ namespace Unity.MultiTimelineRecorder
         private long lastKnownOutputFileBytes = -1;
         private double lastOutputGrowthRealtime = -1;
         private double lastStallCheckRealtime = -1;
+        // 停滞ガードのチェック間隔がこれ以上空いていたら「メインスレッドが止まっていた」とみなし、
+        // その区間を停滞時間に数えない（チェック間隔は既定 2 秒なので十分に離した値）
+        private const double MainThreadBlockResetSec = 30.0;
         #endif
 
         void Start()
@@ -307,10 +310,43 @@ namespace Unity.MultiTimelineRecorder
             if (string.IsNullOrEmpty(renderingData.expectedOutputFilePath))
                 return; // Start() で無効化済み（Movie Recorder Track が無い等）。
 
+            // 録画（RecorderClip）が終端に達した後は、出力ファイルが成長しないのが正常
+            //（エンコーダは閉じられ、以降は完了判定の猶予フレームを回しているだけ）。
+            // ここで監視を続けると、終了処理（音声パイプの回収・remux）に時間がかかった直後や
+            // 完了猶予の間に「停滞」と誤判定して、完成済みの録画を失敗扱いにする
+            //（2026-09-06 分散 Worker の S13: 全フレーム書き出し済みなのに
+            // "Error: Encoder output stalled" で失敗記録され、自動リトライも掛からなかった）。
+            // RecorderClip の終端（分かっていれば）または進捗 99% に達していたら以降のチェックはしない
+            if (director != null)
+            {
+                if (renderingData.recordingEndTime > 0)
+                {
+                    if (director.time >= renderingData.recordingEndTime - 0.5)
+                        return;
+                }
+                else if (renderingData.renderTimeline != null &&
+                         renderingData.renderTimeline.duration > 0 &&
+                         director.time / renderingData.renderTimeline.duration >= 0.99)
+                {
+                    return;
+                }
+            }
+
             double now = EditorApplication.timeSinceStartup;
             double intervalSec = Mathf.Max(0.5f, renderingData.encoderStallCheckIntervalSec);
             if (lastStallCheckRealtime >= 0 && now - lastStallCheckRealtime < intervalSec)
                 return;
+
+            // 前回チェックから異常に間が空いた = メインスレッドが止まっていた（エンコーダの
+            // 同期待ち・終了処理・モーダル等）。その間は Update 自体が回っていないので
+            // 「エンコーダが消費していない」証拠にはならない。停滞の起算点を今に置き直す
+            double blockedSec = lastStallCheckRealtime >= 0 ? now - lastStallCheckRealtime : 0;
+            if (blockedSec >= MainThreadBlockResetSec)
+            {
+                Debug.Log($"[PlayModeTimelineRenderer] Encoder output stall guard: 前回チェックから {blockedSec:F0} 秒空いたため" +
+                    "（メインスレッドの停止中）、停滞の起算点をリセットします。");
+                lastOutputGrowthRealtime = now;
+            }
             lastStallCheckRealtime = now;
 
             long currentBytes;
